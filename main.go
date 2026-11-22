@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	pathpkg "path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -101,17 +102,10 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 			r.SetURL(target)
 			r.Out.URL.Path, r.Out.URL.RawPath = route.path, ""
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
-			settings := g.bindings.Authorization
-			for header := range r.Out.Header {
-				if slices.ContainsFunc(settings.StripHeaderPrefixes, func(prefix string) bool {
-					return len(header) >= len(prefix) && strings.EqualFold(header[:len(prefix)], prefix)
-				}) {
-					r.Out.Header.Del(header)
-				}
-			}
-			for _, names := range [][]string{forwardedMetadata, settings.ResponseHeaders, settings.RequestHeaders} {
-				for _, name := range names {
-					r.Out.Header.Del(name)
+			stripForwardedIdentity(r.Out.Header, g.bindings.Authorization)
+			for _, header := range g.bindings.UpstreamRequestHeaders {
+				if values := r.In.Header.Values(header); len(values) > 0 {
+					r.Out.Header[header] = values
 				}
 			}
 			r.Out.Header.Del("Authorization")
@@ -121,6 +115,16 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 				r.Out.Header[name] = values
 			}
 		},
+		ModifyResponse: func(response *http.Response) error {
+			if len(g.bindings.BrowserOrigins) > 0 {
+				for header := range response.Header {
+					if strings.HasPrefix(header, "Access-Control-") {
+						response.Header.Del(header)
+					}
+				}
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
 			writeStatus(w, http.StatusBadGateway)
 		},
@@ -128,13 +132,16 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 }
 
 type snapshot struct {
-	revision string
-	specYAML []byte
-	specJSON []byte
-	routes   map[operationKey]registeredRoute
+	deniedTemplates []operationKey
+	denied          map[operationKey]bool
+	revision        string
+	specYAML        []byte
+	specJSON        []byte
+	routes          map[operationKey]registeredRoute
 }
 
 type gateway struct {
+	ingressRoutes  map[string]*httputil.ReverseProxy
 	bindings       upstreamBindings
 	targets        map[string]*url.URL
 	transport      *http.Transport
@@ -150,6 +157,7 @@ func newGateway(bindings upstreamBindings) *gateway {
 		targets[name], _ = url.Parse(binding.Origin)
 	}
 	return &gateway{
+		ingressRoutes:  newIngressProxies(bindings),
 		bindings:       bindings,
 		targets:        targets,
 		transport:      newTransport(),
@@ -163,10 +171,18 @@ func newGateway(bindings upstreamBindings) *gateway {
 
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
+		denied:   make(map[operationKey]bool, len(compiled.denied)),
 		revision: compiled.revision,
 		specYAML: compiled.specYAML,
 		specJSON: compiled.specJSON,
 		routes:   make(map[operationKey]registeredRoute, len(compiled.routes)),
+	}
+	for _, key := range compiled.denied {
+		if strings.Contains(key.path, "{") {
+			active.deniedTemplates = append(active.deniedTemplates, key)
+		} else {
+			active.denied[key] = true
+		}
 	}
 	for _, route := range compiled.routes {
 		binding := g.bindings.Services[route.service]
@@ -212,11 +228,42 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	route, ok := active.routes[operationKey{r.Method, path}]
-	if !ok {
+	method := r.Method
+	preflight := len(g.bindings.BrowserOrigins) > 0 && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+	if preflight {
+		method = r.Header.Get("Access-Control-Request-Method")
+	}
+	contractPath := path
+	if g.ingressRoutes[ingressRoutePrefix(path)] != nil {
+		// Apply contract policy even when the downstream ingress would normalize
+		// the spelling of a path before routing it.
+		contractPath = pathpkg.Clean(r.URL.Path)
+		if ingressRoutePrefix(contractPath) != ingressRoutePrefix(path) {
+			writeStatus(w, http.StatusNotFound)
+			return
+		}
+	}
+	key := operationKey{method, contractPath}
+	if active.denied[key] {
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
+	route, ok := active.routes[key]
+	if !ok {
+		for _, blocked := range active.deniedTemplates {
+			if blocked.method == method && matchesPathTemplate(blocked.path, contractPath) {
+				writeStatus(w, http.StatusNotFound)
+				return
+			}
+		}
+		g.serveIngress(w, r, path)
+		return
+	}
+	if preflight {
+		g.servePreflight(w, r, method)
+		return
+	}
+	g.applyBrowserCORS(w, r)
 	var caller identity
 	if len(route.credentials) != 0 {
 		credentials := r.Header.Values("Authorization")

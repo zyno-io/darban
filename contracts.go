@@ -64,14 +64,17 @@ func (b serviceBinding) publicPath(path string) (string, bool) {
 }
 
 type upstreamBindings struct {
-	Hostname          string
-	Authz             string
-	Authorization     authorizationConfig
-	Debug             debugConfig
-	ContractAPIGroup  string
-	Services          map[string]serviceBinding
-	DefaultVisibility *operationVisibility
-	OpenAPI           openAPIConfig
+	IngressRoutes          map[string]string
+	BrowserOrigins         []string
+	UpstreamRequestHeaders []string
+	Hostname               string
+	Authz                  string
+	Authorization          authorizationConfig
+	Debug                  debugConfig
+	ContractAPIGroup       string
+	Services               map[string]serviceBinding
+	DefaultVisibility      *operationVisibility
+	OpenAPI                openAPIConfig
 }
 
 type openAPIConfig struct {
@@ -186,6 +189,7 @@ type compiledOperation struct {
 }
 
 type candidate struct {
+	denied   []operationKey
 	routes   []compiledOperation
 	specYAML []byte
 	specJSON []byte
@@ -217,6 +221,9 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 		return bindings, err
 	}
 	if err := bindings.Debug.validate(bindings.Authorization); err != nil {
+		return bindings, err
+	}
+	if err := bindings.validateIngressRoutes(local); err != nil {
 		return bindings, err
 	}
 	if (!local || bindings.ContractAPIGroup != "") && !dnsName.MatchString(bindings.ContractAPIGroup) {
@@ -434,7 +441,7 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 	}
 }
 
-func readOperations(reg registration, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation) error {
+func readOperations(reg registration, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied *[]operationKey) error {
 	var source sourceDoc
 	raw, err := yaml.YAMLToJSONStrict([]byte(reg.openAPI))
 	if err != nil || json.Unmarshal(raw, &source) != nil {
@@ -455,7 +462,9 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 	for path, item := range source.Paths {
 		for key, value := range item {
 			legacy, included := selected[operationKey{key, path}]
-			if len(selected) != 0 && !included {
+			excluded := len(selected) != 0 && !included
+			_, delegated := bindings.IngressRoutes[binding.Prefix]
+			if excluded && !delegated {
 				continue
 			}
 			if key == "parameters" || key == "servers" || key == "summary" || key == "description" || strings.HasPrefix(key, "x-") {
@@ -468,11 +477,19 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			if !ok {
 				return fmt.Errorf("invalid operation %s %s", key, path)
 			}
-			matched++
 			visibility, err := readVisibility(op, fallback)
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
+			if visibility == visibilityInternal && delegated {
+				if suffix, ok := strings.CutPrefix(path, binding.Mount); ok {
+					*denied = append(*denied, operationKey{strings.ToUpper(key), binding.Prefix + suffix})
+				}
+			}
+			if excluded {
+				continue
+			}
+			matched++
 			publicPath, mapped := binding.publicPath(path)
 			if !mapped {
 				if visibility == visibilityInternal {
@@ -573,7 +590,7 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			}
 			fallback = *reg.defaultVisibility
 		}
-		if err := readOperations(reg, binding, fallback, bindings, native); err != nil {
+		if err := readOperations(reg, binding, fallback, bindings, native, &out.denied); err != nil {
 			return out, fmt.Errorf("service %s: %w", reg.serviceName, err)
 		}
 		var rules []rewriteRule
@@ -597,7 +614,9 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
 	for key, op := range native {
-		if op.visibility != visibilityInternal {
+		if op.visibility == visibilityInternal {
+			out.denied = append(out.denied, key)
+		} else {
 			published[key] = op
 		}
 	}
@@ -606,6 +625,7 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		target, exists := native[to]
 		if original.visibility == visibilityInternal || target.visibility == visibilityInternal {
 			delete(published, from)
+			out.denied = append(out.denied, from)
 			continue
 		}
 		_, targetRewritten := aliases[to]
@@ -692,6 +712,18 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 	for _, route := range out.routes {
 		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.credentials)
 	}
+	slices.SortFunc(out.denied, compareOperationKeys)
+	out.denied = slices.Compact(out.denied)
+	for _, key := range out.denied {
+		fmt.Fprintf(hash, "internal %s %s\n", key.method, key.path)
+	}
 	out.revision = hex.EncodeToString(hash.Sum(nil))
 	return out, nil
+}
+
+func compareOperationKeys(a, b operationKey) int {
+	if cmp := strings.Compare(a.method, b.method); cmp != 0 {
+		return cmp
+	}
+	return strings.Compare(a.path, b.path)
 }

@@ -94,6 +94,26 @@ extensions from published operations.
 }
 ```
 
+## Routing through an existing ingress
+
+`ingressRoutes` maps a single-segment path prefix to a fixed HTTPS origin.
+Darban removes the prefix and passes the request to that ingress, which
+continues to handle its own authorization, CORS, and streaming protocols.
+Contract operations and internal-route exclusions take precedence. The combined
+OpenAPI document continues to describe operations from registered contracts.
+
+`browserOrigins` is an exact origin allowlist for CORS on contract operations.
+`upstreamRequestHeaders` allows explicit request headers that would otherwise
+be stripped before forwarding. Trusted identity headers still come from the
+authorizer on contract operations or from the existing ingress on delegated
+routes.
+
+Darban prefixes same-origin redirect destinations and cookie paths so they
+continue to work at the gateway origin. Delegated cookies are host-only and
+`__Host-` cookies are omitted since their root path cannot be scoped to a
+service prefix. The private status endpoint lists the configured ingress
+prefixes.
+
 ## Kubernetes discovery and status
 
 Install the [GatewayContract CRD](deploy/gateway-contract-crd.yaml) before
