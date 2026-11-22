@@ -290,7 +290,11 @@ func stripForwardedIdentity(headers http.Header, settings authorizationConfig) {
 	}
 	for _, names := range [][]string{forwardedMetadata, settings.ResponseHeaders, settings.RequestHeaders} {
 		for _, name := range names {
-			headers.Del(name)
+			// Auth may use the content type to validate a signed request. The
+			// backend must still receive the content type of the original body.
+			if name != "Content-Type" {
+				headers.Del(name)
+			}
 		}
 	}
 }

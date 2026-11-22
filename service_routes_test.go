@@ -164,7 +164,7 @@ func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T
 	}))
 	defer upstream.Close()
 	authz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer example" || r.Header.Get("X-Original-Uri") != "/catalog/items/123" {
+		if r.Header.Get("Authorization") != "Bearer example" || r.Header.Get("X-Original-Uri") != "/catalog/items/123" || r.Header.Get("Content-Type") != "application/json" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -176,7 +176,7 @@ func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authz: authz.URL,
 		Authorization: authorizationConfig{
-			Path: "/authorize", ResponseHeaders: []string{"X-Identity"},
+			Path: "/authorize", RequestHeaders: []string{"Content-Type"}, ResponseHeaders: []string{"X-Identity"},
 			Profiles: map[string]credentialProfile{"account": {Scheme: "bearer", RequiredHeaders: []string{"X-Identity"}}},
 		},
 		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, AuthProfiles: []string{"account"}}},
@@ -186,6 +186,7 @@ func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T
 		req := httptest.NewRequest(http.MethodGet, "/catalog/items/123", nil)
 		req.Host = bindings.Hostname
 		req.Header.Set("X-Identity", "spoofed")
+		req.Header.Set("Content-Type", "application/json")
 		if authorized {
 			req.Header.Set("Authorization", "Bearer example")
 		} else {
@@ -201,7 +202,7 @@ func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T
 			continue
 		}
 		if res.Code != 204 || receivedURI != "/items/123" || received.Get("Authorization") != "" ||
-			received.Get("X-Identity") != "verified" {
+			received.Get("X-Identity") != "verified" || received.Get("Content-Type") != "application/json" {
 			t.Fatalf("incorrect protected upstream request, status %d", res.Code)
 		}
 	}
