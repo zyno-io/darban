@@ -110,6 +110,19 @@ routes receive the identity returned by the authorizer. Backend-authenticated
 routes receive the original credentials and request metadata.
 Same-service redirects and cookie paths are scoped to the gateway prefix.
 
+During a hostname migration, set a service route's `legacyHosts` to the
+exact DNS names it previously served. Each name belongs to one service.
+Requests on a legacy host use the same path rules and authorization
+as the equivalent prefixed route. Darban uses the original URL for
+authorization and preserves the legacy hostname. Direct Service routes also
+preserve the upstream cookie scope, path, and redirects. The combined OpenAPI
+stays on the canonical hostname.
+
+For long-running service requests, set `longResponsePaths` and
+`longResponseHeaderTimeout` together. The timeout covers the wait for the
+upstream's response headers after sending the request body. Other paths
+keep the regular timeout.
+
 ## Kubernetes discovery and status
 
 Install the [GatewayContract CRD](deploy/gateway-contract-crd.yaml) before

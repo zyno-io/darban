@@ -15,16 +15,20 @@ import (
 )
 
 type serviceRoute struct {
-	Origin       string
-	UpstreamHost string
-	AuthProfiles []string
-	BackendAuth  bool
-	PublicPaths  []string
-	AllowedPaths []string
-	DeniedPaths  []string
+	Origin                    string
+	UpstreamHost              string
+	LegacyHosts               []string
+	AuthProfiles              []string
+	BackendAuth               bool
+	PublicPaths               []string
+	AllowedPaths              []string
+	DeniedPaths               []string
+	LongResponsePaths         []string
+	LongResponseHeaderTimeout string
 }
 
 func (b *upstreamBindings) validateServiceRoutes(local bool) error {
+	hosts := map[string]bool{b.Hostname: true}
 	for prefix, route := range b.ServiceRoutes {
 		if !prefixPath.MatchString(prefix) || route.BackendAuth == (len(route.AuthProfiles) > 0) {
 			return fmt.Errorf("service route %q requires a prefix and exactly one authorization policy", prefix)
@@ -35,12 +39,24 @@ func (b *upstreamBindings) validateServiceRoutes(local bool) error {
 		if route.UpstreamHost != "" && !dnsName.MatchString(route.UpstreamHost) {
 			return fmt.Errorf("invalid upstream host for %q", prefix)
 		}
+		for _, host := range route.LegacyHosts {
+			if !dnsName.MatchString(host) || hosts[host] {
+				return fmt.Errorf("invalid or duplicate legacy host %q for %q", host, prefix)
+			}
+			hosts[host] = true
+		}
 		for _, profile := range route.AuthProfiles {
 			if _, found := b.Authorization.Profiles[profile]; !found {
 				return fmt.Errorf("unknown credential profile %q for %q", profile, prefix)
 			}
 		}
-		for _, paths := range [][]string{route.PublicPaths, route.AllowedPaths, route.DeniedPaths} {
+		if route.LongResponseHeaderTimeout != "" || len(route.LongResponsePaths) > 0 {
+			timeout, err := time.ParseDuration(route.LongResponseHeaderTimeout)
+			if err != nil || timeout <= 0 || len(route.LongResponsePaths) == 0 {
+				return fmt.Errorf("service route %q requires a positive duration and paths for extended responses", prefix)
+			}
+		}
+		for _, paths := range [][]string{route.PublicPaths, route.AllowedPaths, route.DeniedPaths, route.LongResponsePaths} {
 			for _, pattern := range paths {
 				value := strings.TrimSuffix(pattern, "/*")
 				if !strings.HasPrefix(value, "/") || path.Clean(value) != value ||
@@ -93,15 +109,31 @@ func newServiceProxies(bindings upstreamBindings) map[string]*httputil.ReversePr
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	for prefix, route := range bindings.ServiceRoutes {
 		target, _ := url.Parse(route.Origin)
-		proxies[prefix] = serviceProxy(prefix, route, target, transport, bindings)
+		var roundTripper http.RoundTripper = transport
+		if len(route.LongResponsePaths) > 0 {
+			longResponse := transport.Clone()
+			longResponse.ResponseHeaderTimeout, _ = time.ParseDuration(route.LongResponseHeaderTimeout)
+			roundTripper = serviceTransport{normal: transport, longResponse: longResponse, longPaths: route.LongResponsePaths}
+		}
+		proxies[prefix] = serviceProxy(prefix, route, target, roundTripper, bindings)
 	}
 	return proxies
 }
 
-func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, rawPath, contractPath string, preflight bool, method string) {
-	prefix := routePrefix(rawPath)
+type serviceTransport struct {
+	normal, longResponse *http.Transport
+	longPaths            []string
+}
+
+func (t serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if matchesServicePaths(t.longPaths, path.Clean(r.URL.Path)) {
+		return t.longResponse.RoundTrip(r)
+	}
+	return t.normal.RoundTrip(r)
+}
+
+func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix, servicePath string, preflight bool, method string) {
 	route, found := g.bindings.ServiceRoutes[prefix]
-	servicePath := stripServicePrefix(contractPath, prefix)
 	if !found {
 		writeStatus(w, http.StatusNotFound)
 		return
@@ -121,7 +153,7 @@ func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, rawPath, 
 			return
 		}
 	}
-	state := serviceRequest{identity: caller, backendAuthorization: backendAuthorization, originAllowed: originAllowed}
+	state := serviceRequest{identity: caller, backendAuthorization: backendAuthorization, originAllowed: originAllowed, legacy: r.Host != g.bindings.Hostname}
 	g.serviceProxies[prefix].ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), serviceRequestKey{}, state)))
 }
 
@@ -131,6 +163,7 @@ type serviceRequest struct {
 	identity             identity
 	backendAuthorization bool
 	originAllowed        bool
+	legacy               bool
 }
 
 func (r serviceRoute) allowsPath(value string) bool {
@@ -160,12 +193,18 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
-			if route.UpstreamHost != "" {
-				r.Out.Host = route.UpstreamHost
-			}
-			r.Out.URL.Path = stripServicePrefix(r.In.URL.Path, prefix)
-			if r.In.URL.RawPath != "" {
-				r.Out.URL.RawPath = stripServicePrefix(r.In.URL.RawPath, prefix)
+			state := r.In.Context().Value(serviceRequestKey{}).(serviceRequest)
+			if state.legacy {
+				r.Out.Host = r.In.Host
+				r.Out.URL.RawQuery = r.In.URL.RawQuery
+			} else {
+				if route.UpstreamHost != "" {
+					r.Out.Host = route.UpstreamHost
+				}
+				r.Out.URL.Path = stripServicePrefix(r.In.URL.Path, prefix)
+				if r.In.URL.RawPath != "" {
+					r.Out.URL.RawPath = stripServicePrefix(r.In.URL.RawPath, prefix)
+				}
 			}
 			stripForwardedIdentity(r.Out.Header, bindings.Authorization)
 			for _, header := range requestHeaders {
@@ -175,7 +214,6 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 			}
 			r.Out.Header.Del("X-Real-Ip")
 			r.Out.Header.Del(bindings.Debug.RequestHeader)
-			state := r.In.Context().Value(serviceRequestKey{}).(serviceRequest)
 			if !state.backendAuthorization {
 				r.Out.Header.Del("Authorization")
 				for header, values := range state.identity.headers {
@@ -183,7 +221,7 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 				}
 			}
 			if route.BackendAuth {
-				setOriginalRequestHeaders(r.Out.Header, r.In, bindings.Hostname)
+				setOriginalRequestHeaders(r.Out.Header, r.In)
 			}
 		},
 		ModifyResponse: func(response *http.Response) error {
@@ -193,8 +231,10 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 					response.Header.Del(name)
 				}
 			}
-			rewriteServiceLocation(response, prefix, target, route.UpstreamHost)
-			rewriteServiceCookies(response.Header, prefix)
+			if !state.legacy {
+				rewriteServiceLocation(response, prefix, target, route.UpstreamHost)
+				rewriteServiceCookies(response.Header, prefix)
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {

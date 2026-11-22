@@ -106,7 +106,7 @@ func (g *gateway) authorize(ctx context.Context, profile credentialProfile, auth
 		}
 	}
 	req.Header.Set("Authorization", authorization)
-	setOriginalRequestHeaders(req.Header, original, g.bindings.Hostname)
+	setOriginalRequestHeaders(req.Header, original)
 	res, err := g.authClient.Do(req)
 	if err != nil {
 		return identity{}, http.StatusServiceUnavailable, ""
@@ -138,10 +138,10 @@ func (g *gateway) authorize(ctx context.Context, profile credentialProfile, auth
 	return identity{}, http.StatusServiceUnavailable, ""
 }
 
-func setOriginalRequestHeaders(headers http.Header, r *http.Request, hostname string) {
+func setOriginalRequestHeaders(headers http.Header, r *http.Request) {
 	headers.Set("X-Original-Method", r.Method)
 	headers.Set("X-Original-URI", r.RequestURI)
-	headers.Set("X-Original-URL", "https://"+hostname+r.RequestURI)
+	headers.Set("X-Original-URL", "https://"+r.Host+r.RequestURI)
 }
 
 func (g *gateway) authorizeRequest(w http.ResponseWriter, r *http.Request, credentials []string) (identity, bool) {

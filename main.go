@@ -99,6 +99,9 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
+			if r.In.Host != g.bindings.Hostname {
+				r.Out.Host = r.In.Host
+			}
 			r.Out.URL.Path, r.Out.URL.RawPath = route.path, ""
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
 			stripForwardedIdentity(r.Out.Header, g.bindings.Authorization)
@@ -141,6 +144,7 @@ type snapshot struct {
 
 type gateway struct {
 	serviceProxies map[string]*httputil.ReverseProxy
+	legacyPrefixes map[string]string
 	bindings       upstreamBindings
 	targets        map[string]*url.URL
 	transport      *http.Transport
@@ -155,8 +159,15 @@ func newGateway(bindings upstreamBindings) *gateway {
 		// loadBindings already validated the URL.
 		targets[name], _ = url.Parse(binding.Origin)
 	}
+	legacyPrefixes := make(map[string]string)
+	for prefix, route := range bindings.ServiceRoutes {
+		for _, host := range route.LegacyHosts {
+			legacyPrefixes[host] = prefix
+		}
+	}
 	return &gateway{
 		serviceProxies: newServiceProxies(bindings),
+		legacyPrefixes: legacyPrefixes,
 		bindings:       bindings,
 		targets:        targets,
 		transport:      newTransport(),
@@ -201,7 +212,8 @@ func (g *gateway) build(compiled candidate) *snapshot {
 
 func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request) {
 	path, _, _ := strings.Cut(r.RequestURI, "?")
-	if r.Host != g.bindings.Hostname {
+	legacyPrefix := g.legacyPrefixes[r.Host]
+	if r.Host != g.bindings.Hostname && legacyPrefix == "" {
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
@@ -209,7 +221,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		writeStatus(w, http.StatusServiceUnavailable)
 		return
 	}
-	if path != "" && (path == g.bindings.OpenAPI.YAMLPath || path == g.bindings.OpenAPI.JSONPath) {
+	if legacyPrefix == "" && path != "" && (path == g.bindings.OpenAPI.YAMLPath || path == g.bindings.OpenAPI.JSONPath) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			writeStatus(w, http.StatusMethodNotAllowed)
@@ -234,10 +246,18 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	}
 	contractPath := path
 	prefix := routePrefix(path)
+	if legacyPrefix != "" {
+		prefix = legacyPrefix
+	}
+	servicePath := ""
 	if service, found := g.bindings.ServiceRoutes[prefix]; found {
 		// Apply the same policy to alternate spellings of the same path.
 		contractPath = pathpkg.Clean(r.URL.Path)
-		if routePrefix(contractPath) != prefix || !service.allowsPath(stripServicePrefix(contractPath, prefix)) {
+		if legacyPrefix != "" {
+			contractPath = prefix + contractPath
+		}
+		servicePath = stripServicePrefix(contractPath, prefix)
+		if routePrefix(contractPath) != prefix || !service.allowsPath(servicePath) {
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
@@ -255,7 +275,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
-		g.serveService(w, r, path, contractPath, preflight, method)
+		g.serveService(w, r, prefix, servicePath, preflight, method)
 		return
 	}
 	if preflight {

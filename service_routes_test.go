@@ -114,6 +114,68 @@ func TestServiceRouteCannotOverrideManagedOperationOrInternalPath(t *testing.T) 
 	}
 }
 
+func TestLegacyHostPreservesRequestAndEnforcesRoutePolicy(t *testing.T) {
+	const host = "catalog.example.net"
+	const uri = "/items/%31?ref=a%2Bb"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != host || r.RequestURI != uri || r.Header.Get("X-Identity") != "verified" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Location", "/items/next")
+		w.Header().Set("Set-Cookie", "example=1; Domain=example.net; Path=/items; Secure")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+	authz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Original-URL") != "https://"+host+uri {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Identity", "verified")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer authz.Close()
+	bindings := upstreamBindings{
+		Hostname: "api.example.net", Authz: authz.URL,
+		Authorization: authorizationConfig{
+			ResponseHeaders: []string{"X-Identity"},
+			Profiles: map[string]credentialProfile{
+				"account": {Scheme: "bearer", RequiredHeaders: []string{"X-Identity"}},
+			},
+		},
+		OpenAPI: openAPIConfig{JSONPath: "/openapi.json"},
+		ServiceRoutes: map[string]serviceRoute{
+			"/catalog": {Origin: upstream.URL, LegacyHosts: []string{host}, AllowedPaths: []string{"/items/*"}, AuthProfiles: []string{"account"}},
+		},
+	}
+	gw := newGateway(bindings)
+	active := &snapshot{denied: map[operationKey]bool{{http.MethodGet, "/catalog/items/private"}: true}}
+	for _, tc := range []struct {
+		host, path, authorization string
+		want                      int
+	}{
+		{host, uri, "Bearer example", 307},
+		{host, uri, "", 401},
+		{host, "/items/%70rivate", "Bearer example", 404},
+		{host, "/openapi.json", "", 404},
+		{"other.example.net", uri, "Bearer example", 404},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req.Host = tc.host
+		req.Header.Set("Authorization", tc.authorization)
+		res := httptest.NewRecorder()
+		gw.serve(active, res, req)
+		if res.Code != tc.want {
+			t.Errorf("%s%s returned %d, want %d", tc.host, tc.path, res.Code, tc.want)
+		}
+		if tc.want == 307 && (res.Header().Get("Location") != "/items/next" ||
+			res.Header().Get("Set-Cookie") != "example=1; Domain=example.net; Path=/items; Secure") {
+			t.Errorf("changed legacy response headers: %v", res.Header())
+		}
+	}
+}
+
 func TestServiceRouteBlocksInternalOperationsOutsideSelection(t *testing.T) {
 	bindings := upstreamBindings{
 		Hostname: "api.example.net",
