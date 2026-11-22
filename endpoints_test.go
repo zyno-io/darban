@@ -66,7 +66,7 @@ func TestDebugServiceSelection(t *testing.T) {
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, network, debug.Listener.Addr().String())
 	}
-	const path = "/observatory/v1/objects"
+	const path = "/observatory/objects"
 	active := g.build(candidate{routes: []compiledOperation{{
 		key: operationKey{"POST", path}, service: "observatory", path: "/observatory/objects", credentials: []string{"sessionBearer"},
 	}}})

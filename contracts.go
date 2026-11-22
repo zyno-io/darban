@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"sigs.k8s.io/yaml"
 )
@@ -52,7 +54,7 @@ type legacySecurity struct {
 }
 
 // Some backends already mount routes under their module name. Map that
-// upstream mount to the versioned public prefix once.
+// upstream mount to the public service prefix.
 func (b serviceBinding) publicPath(path string) (string, bool) {
 	suffix, ok := strings.CutPrefix(path, b.Mount)
 	if !ok || !literalPath.MatchString(suffix) {
@@ -104,6 +106,30 @@ func readVisibility(op map[string]any, fallback operationVisibility) (operationV
 	return operationVisibility(text), nil
 }
 
+func readOperationID(op map[string]any, service string) (string, error) {
+	value, exists := op["operationId"]
+	if !exists {
+		return "", nil
+	}
+	upstream, ok := value.(string)
+	if !ok || strings.TrimSpace(upstream) == "" {
+		return "", errors.New("operationId must be a non-empty string")
+	}
+	parts := strings.Split(service, "-")
+	var id strings.Builder
+	id.WriteString(parts[0])
+	for _, part := range parts[1:] {
+		id.WriteString(uppercaseFirst(part))
+	}
+	id.WriteString(uppercaseFirst(upstream))
+	return id.String(), nil
+}
+
+func uppercaseFirst(value string) string {
+	first, width := utf8.DecodeRuneInString(value)
+	return string(unicode.ToUpper(first)) + value[width:]
+}
+
 type securityRequirements []map[string][]string
 
 type sourceDoc struct {
@@ -118,6 +144,7 @@ type sourceOperation struct {
 	path         string
 	credentials  []string
 	visibility   operationVisibility
+	operationID  string
 	doc          map[string]any
 	requirements securityRequirements
 	source       *sourceDoc
@@ -139,7 +166,7 @@ type candidate struct {
 
 var (
 	serviceName = regexp.MustCompile("^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
-	prefixPath  = regexp.MustCompile("^/[a-z][a-z0-9-]*/v[1-9][0-9]*$")
+	prefixPath  = regexp.MustCompile("^/[a-z][a-z0-9-]*$")
 	docPath     = regexp.MustCompile(`^(/[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*)+$`)
 	apiVersion  = regexp.MustCompile(`^3\.1\.[0-9]+$`)
 	componentID = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
@@ -440,6 +467,10 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			if responses, ok := op["responses"].(map[string]any); !ok || len(responses) == 0 {
 				return fmt.Errorf("responses required for %s %s", key, path)
 			}
+			operationID, err := readOperationID(op, reg.serviceName)
+			if err != nil {
+				return fmt.Errorf("%s %s: %w", key, path, err)
+			}
 			// Preserve path-item parameters wherever the operation can be published,
 			// including at an alias. Operation-level declarations override them.
 			contract := make(map[string]any)
@@ -450,7 +481,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			}
 			for field, val := range op {
 				switch field {
-				case "servers", "security", visibilityExtension, policyExtension:
+				case "servers", "security", "operationId", visibilityExtension, policyExtension:
 				default:
 					if !slices.ContainsFunc(bindings.OpenAPI.OmitOperationExtensionPrefixes, func(prefix string) bool {
 						return strings.HasPrefix(field, prefix)
@@ -470,6 +501,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 				path:         path,
 				credentials:  profiles,
 				visibility:   visibility,
+				operationID:  operationID,
 				doc:          contract,
 				requirements: requirements,
 				source:       &source,
@@ -550,9 +582,12 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		if original.visibility == visibilityUnlisted {
 			target.visibility = visibilityUnlisted
 		}
+		// A rewrite keeps the SDK identity of the original public route.
+		target.operationID = original.operationID
 		published[from] = target
 	}
 	paths := make(map[string]map[string]any)
+	operationIDs := make(map[string]operationKey)
 	unlistedComponents := make(map[string]map[string]any)
 	for key, source := range published {
 		if key.path == bindings.OpenAPI.YAMLPath || key.path == bindings.OpenAPI.JSONPath {
@@ -585,9 +620,13 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			}
 		}
 		operation["security"] = security
-		digest := sha256.Sum256([]byte(key.method + " " + key.path))
-		name := strings.NewReplacer("/", "_", "-", "_").Replace(key.path)
-		operation["operationId"] = strings.ToLower(key.method) + name + "_" + hex.EncodeToString(digest[:6])
+		if id := source.operationID; id != "" {
+			if other, exists := operationIDs[id]; exists {
+				return out, fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)
+			}
+			operationIDs[id] = key
+			operation["operationId"] = id
+		}
 		paths[key.path][strings.ToLower(key.method)] = operation
 	}
 

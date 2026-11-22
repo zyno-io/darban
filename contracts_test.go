@@ -66,9 +66,9 @@ components:
     HiddenResponse: {type: string}
 `
 	const rewrites = `
-- from: {method: POST, path: /observatory/v1/alias}
+- from: {method: POST, path: /observatory/alias}
   to: {serviceName: observatory, path: /objects}
-- from: {method: GET, path: /observatory/v1/legacy-objects}
+- from: {method: GET, path: /observatory/legacy-objects}
   to: {serviceName: observatory, path: /objects}
 `
 	authz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,19 +93,19 @@ components:
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(),
 		Authz:    authz.URL,
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory/v1", Origin: backend.URL}},
+		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Origin: backend.URL}},
 	}
 	reg := registration{serviceName: "observatory", openAPI: raw, rewrites: rewrites}
 	compiled, err := compile([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, hidden := range []string{"post:", "/observatory/v1/alias", "/observatory/v1/legacy-objects", "/observatory/v1/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility"} {
+	for _, hidden := range []string{"post:", "/observatory/alias", "/observatory/legacy-objects", "/observatory/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility", "operationId:"} {
 		if strings.Contains(string(compiled.specYAML), hidden) {
 			t.Fatalf("combined OpenAPI exposed %s", hidden)
 		}
 	}
-	if !strings.Contains(string(compiled.specYAML), "/observatory/v1/objects:") {
+	if !strings.Contains(string(compiled.specYAML), "/observatory/objects:") {
 		t.Fatal("listed operation on the same path disappeared")
 	}
 
@@ -115,14 +115,14 @@ components:
 		method, path, authorization string
 		status                      int
 	}{
-		{"POST", "/observatory/v1/objects", "", 401},
-		{"POST", "/observatory/v1/objects", "Bearer fixture", 200},
-		{"POST", "/observatory/v1/objects", "Bearer incomplete", 503},
-		{"POST", "/observatory/v1/alias", "", 401},
-		{"POST", "/observatory/v1/alias", "Bearer fixture", 200},
-		{"GET", "/observatory/v1/legacy-objects", "Bearer fixture", 401},
-		{"GET", "/observatory/v1/legacy-objects", "Basic fixture", 200},
-		{"GET", "/observatory/v1/internal", "Bearer fixture", 404},
+		{"POST", "/observatory/objects", "", 401},
+		{"POST", "/observatory/objects", "Bearer fixture", 200},
+		{"POST", "/observatory/objects", "Bearer incomplete", 503},
+		{"POST", "/observatory/alias", "", 401},
+		{"POST", "/observatory/alias", "Bearer fixture", 200},
+		{"GET", "/observatory/legacy-objects", "Bearer fixture", 401},
+		{"GET", "/observatory/legacy-objects", "Basic fixture", 200},
+		{"GET", "/observatory/internal", "Bearer fixture", 404},
 	} {
 		req := httptest.NewRequest(request.method, request.path, nil)
 		req.Host = bindings.Hostname
@@ -167,7 +167,7 @@ paths:
         '200': {description: OK}
 `
 	binding := serviceBinding{
-		Prefix: "/observatory/v1",
+		Prefix: "/observatory",
 		Operations: []operationSelection{{
 			Method: "get", Path: "/sky/objects",
 			Legacy: &legacySecurity{Profiles: []string{"sessionBearer"}},
@@ -182,7 +182,7 @@ paths:
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := compiledOperation{operationKey{"GET", "/observatory/v1/sky/objects"}, "observatory", "/sky/objects", []string{"sessionBearer"}}
+	want := compiledOperation{operationKey{"GET", "/observatory/sky/objects"}, "observatory", "/sky/objects", []string{"sessionBearer"}}
 	if !reflect.DeepEqual(got.routes, []compiledOperation{want}) {
 		t.Fatalf("unexpected routes: %+v", got.routes)
 	}
@@ -273,7 +273,7 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 		cancel()
 		<-done
 	}()
-	path := operationKey{"GET", "/herbarium/v1/specimens/leaves"}
+	path := operationKey{"GET", "/herbarium/specimens/leaves"}
 	waitPolicy := func(profile string) {
 		t.Helper()
 		timer := time.NewTimer(5 * time.Second)
@@ -293,7 +293,11 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 		}
 	}
 	waitPolicy("clientBasic")
-	old := active.Load().revision
+	initial := active.Load()
+	if !strings.Contains(string(initial.specYAML), "/observatory/sky/v2/objects:") {
+		t.Fatal("the upstream version segment disappeared")
+	}
+	old := initial.revision
 	updated, err := os.ReadFile(filepath.Join("testdata", "rewrite.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -306,8 +310,12 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitPolicy("sessionBearer")
-	if active.Load().revision == old {
+	updatedSnapshot := active.Load()
+	if updatedSnapshot.revision == old {
 		t.Fatal("policy changed without a new snapshot")
+	}
+	if !strings.Contains(string(updatedSnapshot.specYAML), "operationId: herbariumReadLeafSpecimens") {
+		t.Fatal("rewrite changed the source SDK name")
 	}
 }
 
@@ -320,6 +328,7 @@ paths:
       responses: {'200': {description: Inherited}}
   /listed:
     get:
+      operationId: readListed
       x-darban-visibility: public
       x-publisher-private: hidden-metadata
       x-documentation-note: public-metadata
@@ -338,15 +347,15 @@ components:
     sessionBearer: {type: http, scheme: bearer}
 `
 	const rewrites = `
-- from: {method: GET, path: /observatory/v1/private-alias}
+- from: {method: GET, path: /observatory/private-alias}
   to: {serviceName: observatory, path: /listed}
-- from: {method: GET, path: /observatory/v1/old-private}
+- from: {method: GET, path: /observatory/old-private}
   to: {serviceName: observatory, path: /private}
 `
 	internal, unlisted := visibilityInternal, visibilityUnlisted
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(), DefaultVisibility: &internal,
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory/v1"}, "herbarium": {Prefix: "/herbarium/v1"}},
+		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory"}, "herbarium": {Prefix: "/herbarium"}},
 	}
 	regs := []registration{
 		{serviceName: "observatory", openAPI: raw, rewrites: rewrites, defaultVisibility: &unlisted},
@@ -382,13 +391,18 @@ components:
 	if !reflect.DeepEqual(yamlDoc, jsonDoc) || len(jsonDoc["paths"].(map[string]any)) != 2 {
 		t.Fatal("expected two listed operations in equivalent YAML and JSON documents")
 	}
+	for _, expected := range []string{"observatoryReadListed", "herbariumReadListed"} {
+		if !strings.Contains(string(compiled.specYAML), "operationId: "+expected) {
+			t.Errorf("missing operationId %s", expected)
+		}
+	}
 	if strings.Contains(string(compiled.specJSON), "hidden-metadata") || !strings.Contains(string(compiled.specJSON), "public-metadata") {
 		t.Fatal("expected only configured extension prefixes to be omitted")
 	}
 	for path, want := range map[string]int{
-		"/observatory/v1/listed": 401, "/herbarium/v1/listed": 401, "/observatory/v1/inherited": 401,
-		"/herbarium/v1/inherited": 404, "/observatory/v1/private": 404, "/observatory/v1/private-alias": 404,
-		"/observatory/v1/old-private": 404, "/openapi.yaml": 404,
+		"/observatory/listed": 401, "/herbarium/listed": 401, "/observatory/inherited": 401,
+		"/herbarium/inherited": 404, "/observatory/private": 404, "/observatory/private-alias": 404,
+		"/observatory/old-private": 404, "/openapi.yaml": 404,
 	} {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.Host = bindings.Hostname
@@ -419,8 +433,32 @@ components:
 			}
 		}
 	}
-	bindings.OpenAPI.YAMLPath = "/observatory/v1/listed"
+	bindings.OpenAPI.YAMLPath = "/observatory/listed"
 	if _, err := compile(regs, bindings); err == nil {
 		t.Fatal("accepted an OpenAPI endpoint that would shadow an operation")
+	}
+}
+
+func TestRejectsDuplicateOperationIDsAfterPrefixing(t *testing.T) {
+	const raw = `openapi: 3.1.0
+paths:
+  /objects:
+    get:
+      operationId: listObjects
+      security: []
+      x-gateway-policy: anonymous
+      responses: {'200': {description: OK}}
+  /catalog:
+    get:
+      operationId: ListObjects
+      security: []
+      x-gateway-policy: anonymous
+      responses: {'200': {description: OK}}
+`
+	regs := []registration{{serviceName: "night-sky", openAPI: raw, rewrites: "[]"}}
+	bindings := upstreamBindings{Services: map[string]serviceBinding{"night-sky": {Prefix: "/night-sky"}}}
+	_, err := compile(regs, bindings)
+	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "nightSkyListObjects"`) {
+		t.Fatalf("expected a prefixed operationId collision, got %v", err)
 	}
 }

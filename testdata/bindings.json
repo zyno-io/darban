@@ -14,17 +14,17 @@
   "services": {
     "discovery": {
       "mount": "",
-      "prefix": "/discovery/v1",
+      "prefix": "/discovery",
       "origin": "http://fixture-discovery.darban-fixtures.svc.cluster.local:3000"
     },
     "herbarium": {
       "mount": "",
-      "prefix": "/herbarium/v1",
+      "prefix": "/herbarium",
       "origin": "http://fixture-herbarium.darban-fixtures.svc.cluster.local:3000"
     },
     "observatory": {
       "mount": "/observatory",
-      "prefix": "/observatory/v1",
+      "prefix": "/observatory",
       "debugOrigin": "http://fixture-alternate.darban-fixtures.svc.cluster.local:3000",
       "origin": "http://fixture-observatory.darban-fixtures.svc.cluster.local:3000"
     }

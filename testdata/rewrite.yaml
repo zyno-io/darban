@@ -1,6 +1,6 @@
 - from:
     method: GET
-    path: /herbarium/v1/specimens/leaves
+    path: /herbarium/specimens/leaves
   to:
     serviceName: observatory
-    path: /observatory/sky/objects
+    path: /observatory/sky/v2/objects
