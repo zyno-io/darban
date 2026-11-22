@@ -32,8 +32,6 @@ Set `x-darban-visibility` on the OpenAPI operation, such as `paths./example.get`
 An operation tag overrides `GatewayContract.spec.defaultVisibility` or the
 local contract entry's `defaultVisibility`. The service setting overrides
 `defaultVisibility` in the proxy bindings, which defaults to `public`.
-Darban reads `x-gateway-visibility` as a compatibility alias when the
-operation has no `x-darban-visibility` tag.
 
 ### Authorization and debug routing
 

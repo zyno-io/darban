@@ -81,12 +81,11 @@ type openAPIConfig struct {
 type operationVisibility string
 
 const (
-	visibilityPublic          operationVisibility = "public"
-	visibilityUnlisted        operationVisibility = "unlisted"
-	visibilityInternal        operationVisibility = "internal"
-	visibilityExtension                           = "x-darban-visibility"
-	legacyVisibilityExtension                     = "x-gateway-visibility"
-	policyExtension                               = "x-gateway-policy"
+	visibilityPublic    operationVisibility = "public"
+	visibilityUnlisted  operationVisibility = "unlisted"
+	visibilityInternal  operationVisibility = "internal"
+	visibilityExtension                     = "x-darban-visibility"
+	policyExtension                         = "x-gateway-policy"
 )
 
 func (v operationVisibility) valid() bool {
@@ -94,18 +93,13 @@ func (v operationVisibility) valid() bool {
 }
 
 func readVisibility(op map[string]any, fallback operationVisibility) (operationVisibility, error) {
-	field := visibilityExtension
-	value, exists := op[field]
-	if !exists {
-		field = legacyVisibilityExtension
-		value, exists = op[field]
-	}
+	value, exists := op[visibilityExtension]
 	if !exists {
 		return fallback, nil
 	}
 	text, ok := value.(string)
 	if !ok || !operationVisibility(text).valid() {
-		return "", fmt.Errorf("%s must be public, unlisted, or internal", field)
+		return "", fmt.Errorf("%s must be public, unlisted, or internal", visibilityExtension)
 	}
 	return operationVisibility(text), nil
 }
@@ -456,7 +450,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			}
 			for field, val := range op {
 				switch field {
-				case "servers", "security", visibilityExtension, legacyVisibilityExtension, policyExtension:
+				case "servers", "security", visibilityExtension, policyExtension:
 				default:
 					if !slices.ContainsFunc(bindings.OpenAPI.OmitOperationExtensionPrefixes, func(prefix string) bool {
 						return strings.HasPrefix(field, prefix)

@@ -37,7 +37,6 @@ paths:
   /objects:
     get:
       x-darban-visibility: public
-      x-gateway-visibility: internal
       security: [{clientBasic: []}]
       responses:
         '200': {description: Public}
@@ -52,7 +51,7 @@ paths:
               schema: {$ref: '#/components/schemas/HiddenResponse'}
   /legacy-objects:
     get:
-      x-gateway-visibility: unlisted
+      x-darban-visibility: unlisted
       security: [{sessionBearer: []}]
       responses:
         '200': {description: Legacy}
@@ -101,7 +100,7 @@ components:
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, hidden := range []string{"post:", "/observatory/v1/alias", "/observatory/v1/legacy-objects", "/observatory/v1/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility", "x-gateway-visibility"} {
+	for _, hidden := range []string{"post:", "/observatory/v1/alias", "/observatory/v1/legacy-objects", "/observatory/v1/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility"} {
 		if strings.Contains(string(compiled.specYAML), hidden) {
 			t.Fatalf("combined OpenAPI exposed %s", hidden)
 		}
