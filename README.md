@@ -19,7 +19,7 @@ certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
 namespaced `GatewayContract` resources under `contractAPIGroup`.
 
-## Public paths and operation IDs
+## Public paths and SDK names
 
 Set `prefix` to one public service segment, such as `/catalog`. If the
 upstream already uses a mount, set `mount` to strip it before adding the
@@ -27,12 +27,17 @@ prefix. For example, `mount: /inventory` and `prefix: /catalog` publish
 `/inventory/v2/items` as `/catalog/v2/items`. Upstream paths determine the
 version segments.
 
-For SDK generation, Darban prefixes an upstream `operationId` with the
-lower-camel-case service name and capitalizes the first letter of the
-upstream ID. For example, `listItems` in `book-catalog` becomes
-`bookCatalogListItems`. Darban rejects duplicate resulting IDs in the
-combined OpenAPI. An operation without an upstream ID is published without
-one. A rewrite keeps the ID of the original route when it has one.
+The composed OpenAPI preserves upstream `operationId` values and rejects
+duplicates among published operations. A rewrite keeps the ID of the
+original route when it has one.
+
+`openapi.prefixTags` controls how Darban groups operations for SDK generation.
+The default `all` prefixes every tag with the lower-camel-case service name
+and capitalizes the first letter of the upstream tag. For example, `items`
+in `book-catalog` becomes `bookCatalogItems`. Set `firstOnly` to prefix the
+first tag and leave the rest as written. Set `openapi.populateEmptyTags` to
+`true` to add the service name as the tag when an operation has none. This
+setting defaults to `false`.
 
 ## Operation visibility
 

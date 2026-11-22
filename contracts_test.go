@@ -314,7 +314,7 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 	if updatedSnapshot.revision == old {
 		t.Fatal("policy changed without a new snapshot")
 	}
-	if !strings.Contains(string(updatedSnapshot.specYAML), "operationId: herbariumReadLeafSpecimens") {
+	if !strings.Contains(string(updatedSnapshot.specYAML), "operationId: readLeafSpecimens") {
 		t.Fatal("rewrite changed the source SDK name")
 	}
 }
@@ -329,6 +329,7 @@ paths:
   /listed:
     get:
       operationId: readListed
+      tags: [catalog, secondary]
       x-darban-visibility: public
       x-publisher-private: hidden-metadata
       x-documentation-note: public-metadata
@@ -359,7 +360,7 @@ components:
 	}
 	regs := []registration{
 		{serviceName: "observatory", openAPI: raw, rewrites: rewrites, defaultVisibility: &unlisted},
-		{serviceName: "herbarium", openAPI: raw, rewrites: "[]"},
+		{serviceName: "herbarium", openAPI: strings.Replace(raw, "readListed", "ReadHerbarium", 1), rewrites: "[]"},
 	}
 	withoutDocs, err := compile(regs, bindings)
 	if err != nil {
@@ -391,9 +392,14 @@ components:
 	if !reflect.DeepEqual(yamlDoc, jsonDoc) || len(jsonDoc["paths"].(map[string]any)) != 2 {
 		t.Fatal("expected two listed operations in equivalent YAML and JSON documents")
 	}
-	for _, expected := range []string{"observatoryReadListed", "herbariumReadListed"} {
+	for _, expected := range []string{"readListed", "ReadHerbarium"} {
 		if !strings.Contains(string(compiled.specYAML), "operationId: "+expected) {
 			t.Errorf("missing operationId %s", expected)
+		}
+	}
+	for _, expected := range []string{"observatoryCatalog", "observatorySecondary", "herbariumCatalog", "herbariumSecondary"} {
+		if !strings.Contains(string(compiled.specJSON), expected) {
+			t.Errorf("missing tag %s", expected)
 		}
 	}
 	if strings.Contains(string(compiled.specJSON), "hidden-metadata") || !strings.Contains(string(compiled.specJSON), "public-metadata") {
@@ -439,7 +445,7 @@ components:
 	}
 }
 
-func TestRejectsDuplicateOperationIDsAfterPrefixing(t *testing.T) {
+func TestRejectsDuplicatePublishedOperationIDs(t *testing.T) {
 	const raw = `openapi: 3.1.0
 paths:
   /objects:
@@ -448,17 +454,45 @@ paths:
       security: []
       x-gateway-policy: anonymous
       responses: {'200': {description: OK}}
-  /catalog:
-    get:
-      operationId: ListObjects
-      security: []
-      x-gateway-policy: anonymous
-      responses: {'200': {description: OK}}
 `
-	regs := []registration{{serviceName: "night-sky", openAPI: raw, rewrites: "[]"}}
-	bindings := upstreamBindings{Services: map[string]serviceBinding{"night-sky": {Prefix: "/night-sky"}}}
+	regs := []registration{
+		{serviceName: "night-sky", openAPI: raw, rewrites: "[]"},
+		{serviceName: "catalog", openAPI: raw, rewrites: "[]"},
+	}
+	bindings := upstreamBindings{Services: map[string]serviceBinding{
+		"night-sky": {Prefix: "/night-sky"},
+		"catalog":   {Prefix: "/catalog"},
+	}}
 	_, err := compile(regs, bindings)
-	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "nightSkyListObjects"`) {
-		t.Fatalf("expected a prefixed operationId collision, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "listObjects"`) {
+		t.Fatalf("expected duplicate upstream operationId to be rejected, got %v", err)
+	}
+}
+
+func TestTagOptions(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings openAPIConfig
+		tags     any
+		want     any
+	}{
+		{"default prefixes all", openAPIConfig{}, []any{"objects", "DeepSky"}, []any{"nightSkyObjects", "nightSkyDeepSky"}},
+		{"first only", openAPIConfig{PrefixTags: firstTagOnly}, []any{"objects", "DeepSky"}, []any{"nightSkyObjects", "DeepSky"}},
+		{"preserve absent tags", openAPIConfig{}, nil, nil},
+		{"populate absent tags", openAPIConfig{PopulateEmptyTags: true}, nil, []string{"night-sky"}},
+		{"populate empty tags", openAPIConfig{PopulateEmptyTags: true}, []any{}, []string{"night-sky"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			operation := make(map[string]any)
+			if test.tags != nil {
+				operation["tags"] = test.tags
+			}
+			if err := applyTagOptions(operation, "night-sky", test.settings); err != nil {
+				t.Fatal(err)
+			}
+			if actual := operation["tags"]; !reflect.DeepEqual(actual, test.want) {
+				t.Errorf("expected tags %#v, got %#v", test.want, actual)
+			}
+		})
 	}
 }

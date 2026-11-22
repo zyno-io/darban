@@ -77,6 +77,8 @@ type upstreamBindings struct {
 type openAPIConfig struct {
 	YAMLPath                       string
 	JSONPath                       string
+	PrefixTags                     string
+	PopulateEmptyTags              bool
 	OmitOperationExtensionPrefixes []string
 }
 
@@ -88,6 +90,7 @@ const (
 	visibilityInternal  operationVisibility = "internal"
 	visibilityExtension                     = "x-darban-visibility"
 	policyExtension                         = "x-gateway-policy"
+	firstTagOnly                            = "firstOnly"
 )
 
 func (v operationVisibility) valid() bool {
@@ -106,7 +109,7 @@ func readVisibility(op map[string]any, fallback operationVisibility) (operationV
 	return operationVisibility(text), nil
 }
 
-func readOperationID(op map[string]any, service string) (string, error) {
+func readOperationID(op map[string]any) (string, error) {
 	value, exists := op["operationId"]
 	if !exists {
 		return "", nil
@@ -115,14 +118,39 @@ func readOperationID(op map[string]any, service string) (string, error) {
 	if !ok || strings.TrimSpace(upstream) == "" {
 		return "", errors.New("operationId must be a non-empty string")
 	}
-	parts := strings.Split(service, "-")
-	var id strings.Builder
-	id.WriteString(parts[0])
-	for _, part := range parts[1:] {
-		id.WriteString(uppercaseFirst(part))
+	return upstream, nil
+}
+
+func applyTagOptions(operation map[string]any, service string, settings openAPIConfig) error {
+	value := operation["tags"]
+	tags, ok := value.([]any)
+	if value != nil && !ok {
+		return errors.New("tags must be an array of strings")
 	}
-	id.WriteString(uppercaseFirst(upstream))
-	return id.String(), nil
+	if len(tags) == 0 {
+		if settings.PopulateEmptyTags {
+			operation["tags"] = []string{service}
+		}
+		return nil
+	}
+
+	parts := strings.Split(service, "-")
+	var prefix strings.Builder
+	prefix.WriteString(parts[0])
+	for _, part := range parts[1:] {
+		prefix.WriteString(uppercaseFirst(part))
+	}
+	servicePrefix := prefix.String()
+	for i, tag := range tags {
+		name, ok := tag.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			return errors.New("each tag must be a non-empty string")
+		}
+		if i == 0 || settings.PrefixTags != firstTagOnly {
+			tags[i] = servicePrefix + uppercaseFirst(name)
+		}
+	}
+	return nil
 }
 
 func uppercaseFirst(value string) string {
@@ -201,6 +229,11 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	}
 	if bindings.OpenAPI.YAMLPath != "" && bindings.OpenAPI.YAMLPath == bindings.OpenAPI.JSONPath {
 		return bindings, errors.New("OpenAPI endpoints need distinct paths")
+	}
+	switch bindings.OpenAPI.PrefixTags {
+	case "", "all", firstTagOnly:
+	default:
+		return bindings, errors.New("openapi.prefixTags must be firstOnly or all")
 	}
 	if bindings.DefaultVisibility != nil && !bindings.DefaultVisibility.valid() {
 		return bindings, errors.New("defaultVisibility must be public, unlisted, or internal")
@@ -467,7 +500,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			if responses, ok := op["responses"].(map[string]any); !ok || len(responses) == 0 {
 				return fmt.Errorf("responses required for %s %s", key, path)
 			}
-			operationID, err := readOperationID(op, reg.serviceName)
+			operationID, err := readOperationID(op)
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
@@ -609,6 +642,9 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			paths[key.path] = make(map[string]any)
 		}
 		operation := normalized.(map[string]any)
+		if err := applyTagOptions(operation, source.service, bindings.OpenAPI); err != nil {
+			return out, fmt.Errorf("%s %s: %w", key.method, key.path, err)
+		}
 		security := make(securityRequirements, 0, len(source.requirements))
 		for _, alternative := range source.requirements {
 			for profile, scopes := range alternative {
