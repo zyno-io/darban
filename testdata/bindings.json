@@ -1,0 +1,32 @@
+{
+  "hostname": "api.example.net",
+  "authz": "http://fixture-authorizer.darban-fixtures.svc.cluster.local:3000",
+  "authorization": {
+    "path": "/authorize",
+    "responseHeaders": ["X-Auth-Subject", "X-Auth-Account", "X-Auth-Debug-Allowed"],
+    "stripHeaderPrefixes": ["X-Auth-"],
+    "profiles": {
+      "sessionBearer": {"scheme": "bearer", "requiredHeaders": ["X-Auth-Subject", "X-Auth-Account"]},
+      "clientBasic": {"scheme": "basic", "requiredHeaders": ["X-Auth-Subject"]}
+    }
+  },
+  "debug": {"requestHeader": "X-Debug-Backend", "requiredHeader": "X-Auth-Debug-Allowed", "requiredValue": "true"},
+  "services": {
+    "discovery": {
+      "mount": "",
+      "prefix": "/discovery/v1",
+      "origin": "http://fixture-discovery.darban-fixtures.svc.cluster.local:3000"
+    },
+    "herbarium": {
+      "mount": "",
+      "prefix": "/herbarium/v1",
+      "origin": "http://fixture-herbarium.darban-fixtures.svc.cluster.local:3000"
+    },
+    "observatory": {
+      "mount": "/observatory",
+      "prefix": "/observatory/v1",
+      "debugOrigin": "http://fixture-alternate.darban-fixtures.svc.cluster.local:3000",
+      "origin": "http://fixture-observatory.darban-fixtures.svc.cluster.local:3000"
+    }
+  }
+}

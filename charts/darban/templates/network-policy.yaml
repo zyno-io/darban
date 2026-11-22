@@ -1,0 +1,22 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "ingress.namespace is required" .Values.ingress.namespace | quote }}
+          podSelector:
+            matchLabels:
+              gateway.networking.k8s.io/gateway-name: {{ required "ingress.gatewayName is required" .Values.ingress.gatewayName | quote }}
+      ports:
+        - protocol: TCP
+          port: 8443
+{{- end }}

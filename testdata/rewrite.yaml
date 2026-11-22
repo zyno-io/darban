@@ -1,0 +1,6 @@
+- from:
+    method: GET
+    path: /herbarium/v1/specimens/leaves
+  to:
+    serviceName: observatory
+    path: /observatory/sky/objects

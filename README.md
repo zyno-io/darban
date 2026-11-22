@@ -1,0 +1,135 @@
+# Darban
+
+Darban is an OpenAPI-driven HTTP reverse proxy by Zyno Consulting. It routes
+HTTP APIs through one hostname. It watches service
+contracts, compiles routes and combined OpenAPI into one immutable snapshot,
+and keeps the last accepted snapshot if an update fails validation.
+
+## Development
+
+```bash
+go test ./...
+go vet ./...
+go run . -manifest testdata/local.yaml -bindings testdata/bindings.json -print-spec
+```
+
+Set `-namespace` for Kubernetes discovery or `-manifest` for local files.
+The gateway reads bindings JSON from `/config/bindings.json` and its TLS
+certificate and key from `/tls/` by default. The local manifest points to
+OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
+namespaced `GatewayContract` resources under `contractAPIGroup`.
+
+## Operation visibility
+
+Set `x-darban-visibility` on the OpenAPI operation, such as `paths./example.get`.
+
+| Value | Routing | Combined OpenAPI |
+| --- | --- | --- |
+| `public` | Callable with the operation's credential policy | Included |
+| `unlisted` | Callable with the operation's credential policy | Omitted |
+| `internal` | Excluded from the gateway's route table | Omitted |
+
+An operation tag overrides `GatewayContract.spec.defaultVisibility` or the
+local contract entry's `defaultVisibility`. The service setting overrides
+`defaultVisibility` in the proxy bindings, which defaults to `public`.
+Darban reads `x-gateway-visibility` as a compatibility alias when the
+operation has no `x-darban-visibility` tag.
+
+### Authorization and debug routing
+
+Use `authz` for the private origin and `authorization.path` for the HTTP
+authorizer path. Each `authorization.profiles` entry names an OpenAPI HTTP
+security scheme and specifies its `scheme` and `requiredHeaders`. The gateway
+forwards credentials, original request metadata, and `authorization.requestHeaders`
+to the authorizer. It projects only `authorization.responseHeaders` upstream
+and requires the configured identity headers before forwarding. It strips
+caller-supplied copies and any `authorization.stripHeaderPrefixes`.
+
+Use `security` to select the credential policy on each operation. To allow
+anonymous requests, set `security: []` and `x-gateway-policy: anonymous`.
+Rewrites use the destination's credentials and schema. An internal source or
+destination suppresses the alias. An unlisted source or destination keeps it
+out of the document.
+
+To enable an alternate backend, configure the service's `debugOrigin` and
+`debug.requestHeader`, `debug.requiredHeader`, and `debug.requiredValue` in the
+bindings. A request opts in by setting the debug header to `true`. The
+authorizer must return the required value in a projected header. The
+alternate Service must have a ready EndpointSlice. Otherwise the gateway
+uses the primary Service. A failure after dispatch is returned to the caller.
+
+### Combined OpenAPI endpoints
+
+Each configured endpoint serves bytes generated when the gateway accepts a
+contract snapshot. `GET` returns the document and `HEAD` returns its headers.
+Omit `openapi` to disable publication or configure either path independently.
+Configure `omitOperationExtensionPrefixes` to remove selected source vendor
+extensions from published operations.
+
+```json
+{
+  "defaultVisibility": "public",
+  "openapi": {
+    "yamlPath": "/openapi.yaml",
+    "jsonPath": "/openapi.json"
+  }
+}
+```
+
+## Kubernetes discovery and status
+
+Install the [GatewayContract CRD](deploy/gateway-contract-crd.yaml) before
+deploying Darban. The Helm chart and CRD use `darban.zyno.io` by default.
+For a different group, install the same CRD with that group and set
+`bindings.contractAPIGroup` to match. Name each contract
+`api-contract-<serviceName>`. Specify `spec.serviceName`, `spec.rewrites`, and
+one of `spec.openapi.yaml` or `spec.openapi.gzipBase64`. Set `spec.openapi.sha256`
+to the SHA-256 of the original YAML. The gateway caps the inline field at
+1,400,000 bytes and decoded gzip at 16 MiB. Kubernetes and Helm storage limits
+also apply. Legacy ConfigMaps can register contracts using the
+`<contractAPIGroup>/contract=true` label. A `GatewayContract` takes precedence.
+
+### Installing the chart
+
+Build the image from the repository's Dockerfile and make it available to
+your cluster. Supply the TLS certificate and key in a Secret named
+`<release-name>-backend-tls`. Use Helm values to supply the image and
+bindings. This example configures a catalog API and publishes both
+OpenAPI formats.
+
+```yaml
+image: registry.example.net/darban:dev
+bindings:
+  hostname: api.example.net
+  openapi:
+    yamlPath: /openapi.yaml
+    jsonPath: /openapi.json
+  services:
+    catalog:
+      origin: http://catalog.darban.svc.cluster.local:8080
+      prefix: /catalog/v1
+```
+
+```bash
+kubectl apply --server-side -f deploy/gateway-contract-crd.yaml
+helm upgrade --install darban ./charts/darban --namespace darban -f values.local.yaml
+```
+
+Register `api-contract-catalog` in the same namespace. The example API
+must declare anonymous operations explicitly. To serve protected operations,
+configure an authorizer and credential profiles as described above. The
+chart creates a ClusterIP Service. Set `ingress.enabled`, `ingress.namespace`,
+and `ingress.gatewayName` to restrict its traffic port to a Gateway API
+controller's labeled pods.
+
+### Status
+
+`GET /status` on the private admin port (8081) reports the active revision,
+route count, and EndpointSlice state for the authorizer and each backend.
+The endpoint returns `503` during startup or drain. Allow the gateway's
+ServiceAccount to list and watch EndpointSlices in every namespace named in
+its bindings.
+
+## License
+
+Darban is available under the [MIT License](LICENSE).

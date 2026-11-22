@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-bindings
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  bindings.json: {{ required "bindings are required" .Values.bindings | toJson | quote }}

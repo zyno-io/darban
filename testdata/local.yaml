@@ -1,0 +1,10 @@
+contracts:
+- serviceName: discovery
+  openapi.yaml: contracts/discovery/openapi.yaml
+  rewrites.yaml: contracts/discovery/rewrites.yaml
+- serviceName: herbarium
+  openapi.yaml: contracts/herbarium/openapi.yaml
+  rewrites.yaml: contracts/herbarium/rewrites.yaml
+- serviceName: observatory
+  openapi.yaml: contracts/observatory/openapi.yaml
+  rewrites.yaml: contracts/observatory/rewrites.yaml

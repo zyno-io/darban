@@ -1,0 +1,49 @@
+openapi: 3.1.0
+info:
+  title: observatory fixture
+  version: '1'
+servers:
+- url: http://fixture-observatory.darban-fixtures.svc.cluster.local:3000
+security:
+- sessionBearer: []
+paths:
+  /observatory/sky/objects:
+    get:
+      operationId: readSkyObjects
+      responses:
+        '200':
+          description: observatory response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicResponse'
+      security:
+      - sessionBearer: []
+  /maintenance/snapshot:
+    get:
+      x-darban-visibility: internal
+      responses:
+        '200':
+          description: Internal endpoint
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalRecord'
+components:
+  securitySchemes:
+    sessionBearer:
+      type: http
+      scheme: bearer
+  schemas:
+    PublicResponse:
+      type: object
+      required:
+      - backend
+      properties:
+        backend:
+          const: observatory
+        catalog:
+          const: fixture-starchart
+    InternalRecord:
+      type: object
+      description: private marker

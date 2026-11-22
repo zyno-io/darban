@@ -1,0 +1,82 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gatewaycontracts.darban.zyno.io
+spec:
+  group: darban.zyno.io
+  scope: Namespaced
+  names:
+    plural: gatewaycontracts
+    singular: gatewaycontract
+    kind: GatewayContract
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          x-kubernetes-validations:
+            - rule: "self.metadata.name == 'api-contract-' + self.spec.serviceName"
+              message: name must match the registered service
+          properties:
+            spec:
+              type: object
+              required: [serviceName, openapi, rewrites]
+              properties:
+                serviceName:
+                  type: string
+                  maxLength: 63
+                  pattern: '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+                defaultVisibility:
+                  description: Visibility of operations that do not declare their own. If omitted, inherit the gateway default.
+                  type: string
+                  enum: [public, unlisted, internal]
+                openapi:
+                  type: object
+                  required: [sha256]
+                  x-kubernetes-validations:
+                    - rule: 'has(self.yaml) != has(self.gzipBase64)'
+                      message: set exactly one of yaml or gzipBase64
+                  properties:
+                    yaml:
+                      description: The complete generated OpenAPI YAML as plain text.
+                      type: string
+                      minLength: 1
+                      maxLength: 1400000
+                    gzipBase64:
+                      description: Base64-encoded gzip of the complete generated OpenAPI YAML.
+                      type: string
+                      minLength: 1
+                      maxLength: 1400000
+                    sha256:
+                      description: SHA-256 of the uncompressed OpenAPI YAML.
+                      type: string
+                      pattern: '^[a-f0-9]{64}$'
+                rewrites:
+                  type: array
+                  items:
+                    type: object
+                    required: [from, to]
+                    properties:
+                      from:
+                        type: object
+                        required: [method, path]
+                        properties:
+                          method:
+                            type: string
+                            enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE]
+                          path:
+                            type: string
+                            pattern: '^/'
+                      to:
+                        type: object
+                        required: [serviceName, path]
+                        properties:
+                          serviceName:
+                            type: string
+                            pattern: '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+                          path:
+                            type: string
+                            pattern: '^/'

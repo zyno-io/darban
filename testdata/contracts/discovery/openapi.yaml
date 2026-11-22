@@ -1,0 +1,43 @@
+openapi: 3.1.0
+info:
+  title: discovery fixture
+  version: '1'
+servers:
+- url: http://fixture-discovery.darban-fixtures.svc.cluster.local:3000
+security: []
+paths:
+  /capabilities:
+    get:
+      operationId: readCapabilities
+      responses:
+        '200':
+          description: discovery response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicResponse'
+      security: []
+      x-gateway-policy: anonymous
+  /maintenance/snapshot:
+    get:
+      x-darban-visibility: internal
+      responses:
+        '200':
+          description: Internal endpoint
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalRecord'
+components:
+  securitySchemes: {}
+  schemas:
+    PublicResponse:
+      type: object
+      required:
+      - backend
+      properties:
+        backend:
+          const: discovery-api
+    InternalRecord:
+      type: object
+      description: private marker
