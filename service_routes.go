@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"path"
 	"slices"
@@ -20,6 +21,8 @@ type serviceRoute struct {
 	LegacyHosts               []string
 	AuthProfiles              []string
 	BackendAuth               bool
+	BackendCORS               bool
+	ForwardTrustedClientIP    bool
 	PublicPaths               []string
 	AllowedPaths              []string
 	DeniedPaths               []string
@@ -139,12 +142,29 @@ func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix, s
 		return
 	}
 	backendAuthorization := route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath)
-	originAllowed := slices.Contains(g.bindings.BrowserOrigins, r.Header.Get("Origin"))
-	if preflight && (!backendAuthorization || originAllowed) {
-		g.servePreflight(w, r, method)
-		return
+	originAllowed := false
+	if !route.BackendCORS {
+		originAllowed = slices.Contains(g.bindings.BrowserOrigins, r.Header.Get("Origin"))
+		if preflight && (!backendAuthorization || originAllowed) {
+			g.servePreflight(w, r, method)
+			return
+		}
+		g.applyBrowserCORS(w, r)
 	}
-	g.applyBrowserCORS(w, r)
+	var clientIP string
+	if route.ForwardTrustedClientIP {
+		values := r.Header.Values("X-Real-IP")
+		if len(values) != 1 {
+			writeStatus(w, http.StatusServiceUnavailable)
+			return
+		}
+		address, err := netip.ParseAddr(strings.TrimSpace(values[0]))
+		if err != nil || address.Zone() != "" {
+			writeStatus(w, http.StatusServiceUnavailable)
+			return
+		}
+		clientIP = address.Unmap().String()
+	}
 	var caller identity
 	if !backendAuthorization {
 		var ok bool
@@ -153,7 +173,10 @@ func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix, s
 			return
 		}
 	}
-	state := serviceRequest{identity: caller, backendAuthorization: backendAuthorization, originAllowed: originAllowed, legacy: r.Host != g.bindings.Hostname}
+	state := serviceRequest{
+		identity: caller, backendAuthorization: backendAuthorization, originAllowed: originAllowed,
+		legacy: r.Host != g.bindings.Hostname, clientIP: clientIP,
+	}
 	g.serviceProxies[prefix].ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), serviceRequestKey{}, state)))
 }
 
@@ -164,6 +187,7 @@ type serviceRequest struct {
 	backendAuthorization bool
 	originAllowed        bool
 	legacy               bool
+	clientIP             string
 }
 
 func (r serviceRoute) allowsPath(value string) bool {
@@ -213,6 +237,9 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 				}
 			}
 			r.Out.Header.Del("X-Real-Ip")
+			if state.clientIP != "" {
+				r.Out.Header.Set("X-Real-Ip", state.clientIP)
+			}
 			r.Out.Header.Del(bindings.Debug.RequestHeader)
 			if !state.backendAuthorization {
 				r.Out.Header.Del("Authorization")
@@ -226,7 +253,7 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 		},
 		ModifyResponse: func(response *http.Response) error {
 			state := response.Request.Context().Value(serviceRequestKey{}).(serviceRequest)
-			if state.originAllowed || !state.backendAuthorization && len(bindings.BrowserOrigins) != 0 {
+			if !route.BackendCORS && (state.originAllowed || !state.backendAuthorization && len(bindings.BrowserOrigins) != 0) {
 				for _, name := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Credentials"} {
 					response.Header.Del(name)
 				}

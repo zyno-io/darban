@@ -110,6 +110,12 @@ routes receive the identity returned by the authorizer. Backend-authenticated
 routes receive the original credentials and request metadata.
 Same-service redirects and cookie paths are scoped to the gateway prefix.
 
+Set `backendCORS` to let a direct Service handle its own CORS responses,
+including preflight. Set `forwardTrustedClientIP` only when the HTTP listener
+is reachable exclusively through an ingress that overwrites `X-Real-IP` with
+the verified connection address. On those Service routes, Darban forwards a
+single valid IP address and returns 503 if the header is missing or invalid.
+
 During a hostname migration, set a service route's `legacyHosts` to the
 exact DNS names it previously served. Each name belongs to one service.
 Requests on a legacy host use the same path rules and authorization

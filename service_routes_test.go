@@ -176,6 +176,57 @@ func TestLegacyHostPreservesRequestAndEnforcesRoutePolicy(t *testing.T) {
 	}
 }
 
+func TestDirectServiceCanUseTrustedClientIPAndBackendPreflight(t *testing.T) {
+	const origin = "https://app.example.net"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodOptions || r.URL.Path != "/v1/check" ||
+			r.Header.Get("X-Real-IP") != "192.0.2.25" || r.Header.Get("X-Forwarded-For") != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST,OPTIONS")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	bindings := upstreamBindings{
+		Hostname: "api.example.net", BrowserOrigins: []string{origin},
+		ServiceRoutes: map[string]serviceRoute{
+			"/proof": {Origin: upstream.URL, BackendAuth: true, BackendCORS: true, ForwardTrustedClientIP: true, LegacyHosts: []string{"proof.example.net"}},
+		},
+	}
+	gw := newGateway(bindings)
+	for _, tc := range []struct {
+		host, path string
+		ips        []string
+		want       int
+	}{
+		{"api.example.net", "/proof/v1/check", []string{"::ffff:192.0.2.25"}, 204},
+		{"proof.example.net", "/v1/check", []string{"192.0.2.25"}, 204},
+		{"proof.example.net", "/v1/check", []string{"192.0.2.25, 192.0.2.26"}, 503},
+		{"proof.example.net", "/v1/check", []string{"192.0.2.25", "192.0.2.26"}, 503},
+		{"proof.example.net", "/v1/check", nil, 503},
+	} {
+		req := httptest.NewRequest(http.MethodOptions, tc.path, nil)
+		req.Host = tc.host
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("X-Forwarded-For", "192.0.2.99")
+		for _, ip := range tc.ips {
+			req.Header.Add("X-Real-IP", ip)
+		}
+		res := httptest.NewRecorder()
+		gw.serve(&snapshot{}, res, req)
+		if res.Code != tc.want {
+			t.Errorf("%s%s with %v returned %d, want %d", tc.host, tc.path, tc.ips, res.Code, tc.want)
+		}
+		if res.Code == 204 && (res.Header().Get("Access-Control-Allow-Origin") != origin ||
+			res.Header().Get("Access-Control-Allow-Methods") != "POST,OPTIONS" || res.Header().Get("Access-Control-Allow-Credentials") != "") {
+			t.Errorf("unexpected CORS response: %v", res.Header())
+		}
+	}
+}
+
 func TestServiceRouteBlocksInternalOperationsOutsideSelection(t *testing.T) {
 	bindings := upstreamBindings{
 		Hostname: "api.example.net",
