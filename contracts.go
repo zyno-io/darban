@@ -64,7 +64,7 @@ func (b serviceBinding) publicPath(path string) (string, bool) {
 }
 
 type upstreamBindings struct {
-	IngressRoutes          map[string]string
+	ServiceRoutes          map[string]serviceRoute
 	BrowserOrigins         []string
 	UpstreamRequestHeaders []string
 	Hostname               string
@@ -223,7 +223,7 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	if err := bindings.Debug.validate(bindings.Authorization); err != nil {
 		return bindings, err
 	}
-	if err := bindings.validateIngressRoutes(local); err != nil {
+	if err := bindings.validateServiceRoutes(local); err != nil {
 		return bindings, err
 	}
 	if (!local || bindings.ContractAPIGroup != "") && !dnsName.MatchString(bindings.ContractAPIGroup) {
@@ -463,8 +463,8 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 		for key, value := range item {
 			legacy, included := selected[operationKey{key, path}]
 			excluded := len(selected) != 0 && !included
-			_, delegated := bindings.IngressRoutes[binding.Prefix]
-			if excluded && !delegated {
+			_, direct := bindings.ServiceRoutes[binding.Prefix]
+			if excluded && !direct {
 				continue
 			}
 			if key == "parameters" || key == "servers" || key == "summary" || key == "description" || strings.HasPrefix(key, "x-") {
@@ -481,7 +481,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
-			if visibility == visibilityInternal && delegated {
+			if visibility == visibilityInternal && direct {
 				if suffix, ok := strings.CutPrefix(path, binding.Mount); ok {
 					*denied = append(*denied, operationKey{strings.ToUpper(key), binding.Prefix + suffix})
 				}

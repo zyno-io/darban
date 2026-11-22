@@ -15,7 +15,6 @@ type upstreamStatus struct {
 }
 
 type statusResponse struct {
-	IngressPrefixes  []string         `json:"ingressPrefixes,omitempty"`
 	Status           string           `json:"status"`
 	Ready            bool             `json:"ready"`
 	ContractRevision string           `json:"contractRevision,omitempty"`
@@ -27,7 +26,7 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 	return func(w http.ResponseWriter, _ *http.Request) {
 		snapshot := active.Load()
 		stopping := draining.Load()
-		report := statusResponse{Status: "ready", Ready: snapshot != nil && !stopping, IngressPrefixes: slices.Sorted(maps.Keys(g.bindings.IngressRoutes))}
+		report := statusResponse{Status: "ready", Ready: snapshot != nil && !stopping}
 		report.Upstreams = append(report.Upstreams, upstreamStatus{"authz", "authorization", g.endpoints.state(g.bindings.Authz)})
 		for _, name := range slices.Sorted(maps.Keys(g.bindings.Services)) {
 			binding := g.bindings.Services[name]
@@ -35,6 +34,10 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 				upstreamStatus{name, "primary", g.endpoints.state(binding.Origin)},
 				upstreamStatus{name, "debug", g.endpoints.state(binding.DebugOrigin)},
 			)
+		}
+		for _, prefix := range slices.Sorted(maps.Keys(g.bindings.ServiceRoutes)) {
+			route := g.bindings.ServiceRoutes[prefix]
+			report.Upstreams = append(report.Upstreams, upstreamStatus{prefix, "service", g.endpoints.state(route.Origin)})
 		}
 		if snapshot != nil {
 			report.ContractRevision = snapshot.revision

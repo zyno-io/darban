@@ -44,6 +44,9 @@ func newEndpointCatalog(config *rest.Config, bindings upstreamBindings) (endpoin
 	for _, binding := range bindings.Services {
 		origins = append(origins, binding.Origin, binding.DebugOrigin)
 	}
+	for _, route := range bindings.ServiceRoutes {
+		origins = append(origins, route.Origin)
+	}
 	for _, origin := range origins {
 		name, namespace := serviceReference(origin)
 		if name == "" {

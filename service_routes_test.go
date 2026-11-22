@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestIngressRoutePreservesMethodQueryAndCredentials(t *testing.T) {
+func TestServiceRoutePreservesMethodQueryAndCredentials(t *testing.T) {
 	var receivedURI, receivedMethod string
 	var receivedHeaders http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -21,13 +21,13 @@ func TestIngressRoutePreservesMethodQueryAndCredentials(t *testing.T) {
 	defer upstream.Close()
 
 	bindings := upstreamBindings{
-		Hostname: "api.example.net", IngressRoutes: map[string]string{"/auth": upstream.URL},
+		Hostname: "api.example.net", ServiceRoutes: map[string]serviceRoute{"/auth": {Origin: upstream.URL, BackendAuth: true}},
 		Authorization: authorizationConfig{
 			RequestHeaders: []string{"X-Tenant"}, ResponseHeaders: []string{"X-Identity"},
 			StripHeaderPrefixes: []string{"X-Identity-"},
 		},
 	}
-	if err := bindings.validateIngressRoutes(true); err != nil {
+	if err := bindings.validateServiceRoutes(true); err != nil {
 		t.Fatal(err)
 	}
 	gw := newGateway(bindings)
@@ -46,7 +46,7 @@ func TestIngressRoutePreservesMethodQueryAndCredentials(t *testing.T) {
 	}
 	for key, want := range map[string]string{
 		"Authorization": "Bearer example", "Cookie": "session=example", "X-Tenant": "tenant",
-		"X-Identity": "", "X-Identity-Extra": "", "X-Original-Uri": "",
+		"X-Identity": "", "X-Identity-Extra": "", "X-Original-Uri": "/auth/login/%6eext?one=a%2Bb&one=c",
 	} {
 		if got := receivedHeaders.Get(key); got != want {
 			t.Errorf("forwarded %s = %q, want %q", key, got, want)
@@ -61,14 +61,14 @@ func TestIngressRoutePreservesMethodQueryAndCredentials(t *testing.T) {
 	}
 }
 
-func TestIngressCannotOverrideManagedOperationOrInternalPath(t *testing.T) {
+func TestServiceRouteCannotOverrideManagedOperationOrInternalPath(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ingress")
 	}))
 	defer upstream.Close()
 
 	bindings := upstreamBindings{
-		Hostname: "api.example.net", IngressRoutes: map[string]string{"/catalog": upstream.URL},
+		Hostname: "api.example.net", ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, AuthProfiles: []string{"account"}, PublicPaths: []string{"/tabs/*"}, DeniedPaths: []string{"/technician-rpc/*"}}},
 		BrowserOrigins: []string{"https://app.example.net"},
 	}
 	gw := newGateway(bindings)
@@ -82,6 +82,8 @@ func TestIngressCannotOverrideManagedOperationOrInternalPath(t *testing.T) {
 		want                 int
 	}{
 		{"GET", "/catalog/tabs/123", "", 200},
+		{"GET", "/catalog/tabs-other/123", "", 401},
+		{"GET", "/catalog/technician-rpc", "", 404},
 		{"GET", "/catalog/prices", "", 401},
 		{"GET", "/catalog/%70rices/", "", 401},
 		{"GET", "/catalog/private", "", 404},
@@ -112,13 +114,13 @@ func TestIngressCannotOverrideManagedOperationOrInternalPath(t *testing.T) {
 	}
 }
 
-func TestIngressFallbackBlocksInternalOperationsOutsideSelection(t *testing.T) {
+func TestServiceRouteBlocksInternalOperationsOutsideSelection(t *testing.T) {
 	bindings := upstreamBindings{
 		Hostname: "api.example.net",
 		Services: map[string]serviceBinding{
 			"catalog": {Prefix: "/catalog", Operations: []operationSelection{{Method: "get", Path: "/prices"}}},
 		},
-		IngressRoutes: map[string]string{"/catalog": "https://catalog.example.net"},
+		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: "http://catalog.default.svc.cluster.local:3000"}},
 	}
 	reg := registration{
 		serviceName: "catalog",
@@ -150,5 +152,66 @@ paths:
 	}
 	if compiled.revision == withoutDenial.revision {
 		t.Fatal("internal fallback exclusions must affect the runtime revision")
+	}
+}
+
+func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T) {
+	var received http.Header
+	var receivedURI string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, receivedURI = r.Header.Clone(), r.RequestURI
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	authz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer example" || r.Header.Get("X-Original-Uri") != "/catalog/items/123" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("X-Identity", "verified")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer authz.Close()
+
+	bindings := upstreamBindings{
+		Hostname: "api.example.net", Authz: authz.URL,
+		Authorization: authorizationConfig{
+			Path: "/authorize", ResponseHeaders: []string{"X-Identity"},
+			Profiles: map[string]credentialProfile{"account": {Scheme: "bearer", RequiredHeaders: []string{"X-Identity"}}},
+		},
+		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, AuthProfiles: []string{"account"}}},
+	}
+	gw := newGateway(bindings)
+	for _, authorized := range []bool{false, true} {
+		req := httptest.NewRequest(http.MethodGet, "/catalog/items/123", nil)
+		req.Host = bindings.Hostname
+		req.Header.Set("X-Identity", "spoofed")
+		if authorized {
+			req.Header.Set("Authorization", "Bearer example")
+		} else {
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Connection", "Upgrade")
+		}
+		res := httptest.NewRecorder()
+		gw.serve(&snapshot{}, res, req)
+		if !authorized {
+			if res.Code != 401 || received != nil {
+				t.Fatalf("upgrade without credentials returned %d", res.Code)
+			}
+			continue
+		}
+		if res.Code != 204 || receivedURI != "/items/123" || received.Get("Authorization") != "" ||
+			received.Get("X-Identity") != "verified" {
+			t.Fatalf("incorrect protected upstream request, status %d", res.Code)
+		}
+	}
+}
+
+func TestServiceRouteRejectsPublicOrigin(t *testing.T) {
+	bindings := upstreamBindings{
+		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: "http://catalog.example.net:3000", BackendAuth: true}},
+	}
+	if err := bindings.validateServiceRoutes(false); err == nil {
+		t.Fatal("public host is not a Kubernetes Service")
 	}
 }

@@ -7,7 +7,6 @@ COPY *.go ./
 RUN CGO_ENABLED=0 go build -trimpath -o /darban .
 
 FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /darban /darban
 USER 65532:65532
 ENTRYPOINT ["/darban"]

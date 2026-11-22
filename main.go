@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	pathpkg "path"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -141,7 +140,7 @@ type snapshot struct {
 }
 
 type gateway struct {
-	ingressRoutes  map[string]*httputil.ReverseProxy
+	serviceProxies map[string]*httputil.ReverseProxy
 	bindings       upstreamBindings
 	targets        map[string]*url.URL
 	transport      *http.Transport
@@ -157,7 +156,7 @@ func newGateway(bindings upstreamBindings) *gateway {
 		targets[name], _ = url.Parse(binding.Origin)
 	}
 	return &gateway{
-		ingressRoutes:  newIngressProxies(bindings),
+		serviceProxies: newServiceProxies(bindings),
 		bindings:       bindings,
 		targets:        targets,
 		transport:      newTransport(),
@@ -234,11 +233,11 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		method = r.Header.Get("Access-Control-Request-Method")
 	}
 	contractPath := path
-	if g.ingressRoutes[ingressRoutePrefix(path)] != nil {
-		// Apply contract policy even when the downstream ingress would normalize
-		// the spelling of a path before routing it.
+	prefix := routePrefix(path)
+	if service, found := g.bindings.ServiceRoutes[prefix]; found {
+		// Apply the same policy to alternate spellings of the same path.
 		contractPath = pathpkg.Clean(r.URL.Path)
-		if ingressRoutePrefix(contractPath) != ingressRoutePrefix(path) {
+		if routePrefix(contractPath) != prefix || !service.allowsPath(stripServicePrefix(contractPath, prefix)) {
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
@@ -256,7 +255,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
-		g.serveIngress(w, r, path)
+		g.serveService(w, r, path, contractPath, preflight, method)
 		return
 	}
 	if preflight {
@@ -264,39 +263,9 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		return
 	}
 	g.applyBrowserCORS(w, r)
-	var caller identity
-	if len(route.credentials) != 0 {
-		credentials := r.Header.Values("Authorization")
-		if len(credentials) != 1 {
-			writeStatus(w, http.StatusUnauthorized)
-			return
-		}
-		authorization := credentials[0]
-		if len(authorization) > 8192 {
-			writeStatus(w, http.StatusRequestHeaderFieldsTooLarge)
-			return
-		}
-		scheme := credentialScheme(authorization)
-		profiles := g.bindings.Authorization.Profiles
-		index := slices.IndexFunc(route.credentials, func(name string) bool {
-			return scheme != "" && profiles[name].Scheme == scheme
-		})
-		if index < 0 {
-			writeStatus(w, http.StatusUnauthorized)
-			return
-		}
-		var status int
-		var retry string
-		authCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		caller, status, retry = g.authorize(authCtx, profiles[route.credentials[index]], authorization, r)
-		cancel()
-		if status != 0 {
-			if retry != "" {
-				w.Header().Set("Retry-After", retry)
-			}
-			writeStatus(w, status)
-			return
-		}
+	caller, ok := g.authorizeRequest(w, r, route.credentials)
+	if !ok {
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()

@@ -94,25 +94,21 @@ extensions from published operations.
 }
 ```
 
-## Routing through an existing ingress
+## Direct Service routes
 
-`ingressRoutes` maps a single-segment path prefix to a fixed HTTPS origin.
-Darban removes the prefix and passes the request to that ingress, which
-continues to handle its own authorization, CORS, and streaming protocols.
-Contract operations and internal-route exclusions take precedence. The combined
-OpenAPI document continues to describe operations from registered contracts.
+`serviceRoutes` binds a single-segment path prefix to a private Kubernetes
+Service. A route chooses credential profiles for the gateway's authorization
+subrequest or explicitly sets `backendAuth` for an origin that authenticates
+requests itself. `publicPaths` lists exceptions to gateway authorization.
+`allowedPaths` can restrict the exposed surface and `deniedPaths` can exclude
+paths within it. A trailing `/*` matches a path subtree. Registered operations
+and internal-route exclusions take precedence.
 
-`browserOrigins` is an exact origin allowlist for CORS on contract operations.
-`upstreamRequestHeaders` allows explicit request headers that would otherwise
-be stripped before forwarding. Trusted identity headers still come from the
-authorizer on contract operations or from the existing ingress on delegated
-routes.
-
-Darban prefixes same-origin redirect destinations and cookie paths so they
-continue to work at the gateway origin. Delegated cookies are host-only and
-`__Host-` cookies are omitted since their root path cannot be scoped to a
-service prefix. The private status endpoint lists the configured ingress
-prefixes.
+`browserOrigins` lists the exact origins for gateway CORS, and
+`upstreamRequestHeaders` allows safe request metadata. Protected service
+routes receive the identity returned by the authorizer. Backend-authenticated
+routes receive the original credentials and request metadata.
+Same-service redirects and cookie paths are scoped to the gateway prefix.
 
 ## Kubernetes discovery and status
 

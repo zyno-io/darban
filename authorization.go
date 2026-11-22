@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -105,9 +106,7 @@ func (g *gateway) authorize(ctx context.Context, profile credentialProfile, auth
 		}
 	}
 	req.Header.Set("Authorization", authorization)
-	req.Header.Set("X-Original-Method", original.Method)
-	req.Header.Set("X-Original-URI", original.RequestURI)
-	req.Header.Set("X-Original-URL", "https://"+g.bindings.Hostname+original.RequestURI)
+	setOriginalRequestHeaders(req.Header, original, g.bindings.Hostname)
 	res, err := g.authClient.Do(req)
 	if err != nil {
 		return identity{}, http.StatusServiceUnavailable, ""
@@ -137,4 +136,46 @@ func (g *gateway) authorize(ctx context.Context, profile credentialProfile, auth
 		return caller, 0, ""
 	}
 	return identity{}, http.StatusServiceUnavailable, ""
+}
+
+func setOriginalRequestHeaders(headers http.Header, r *http.Request, hostname string) {
+	headers.Set("X-Original-Method", r.Method)
+	headers.Set("X-Original-URI", r.RequestURI)
+	headers.Set("X-Original-URL", "https://"+hostname+r.RequestURI)
+}
+
+func (g *gateway) authorizeRequest(w http.ResponseWriter, r *http.Request, credentials []string) (identity, bool) {
+	if len(credentials) == 0 {
+		return identity{}, true
+	}
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		writeStatus(w, http.StatusUnauthorized)
+		return identity{}, false
+	}
+	authorization := values[0]
+	if len(authorization) > 8192 {
+		writeStatus(w, http.StatusRequestHeaderFieldsTooLarge)
+		return identity{}, false
+	}
+	scheme := credentialScheme(authorization)
+	profiles := g.bindings.Authorization.Profiles
+	index := slices.IndexFunc(credentials, func(name string) bool {
+		return scheme != "" && profiles[name].Scheme == scheme
+	})
+	if index < 0 {
+		writeStatus(w, http.StatusUnauthorized)
+		return identity{}, false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	caller, status, retry := g.authorize(ctx, profiles[credentials[index]], authorization, r)
+	if status != 0 {
+		if retry != "" {
+			w.Header().Set("Retry-After", retry)
+		}
+		writeStatus(w, status)
+		return identity{}, false
+	}
+	return caller, true
 }
