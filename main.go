@@ -144,6 +144,7 @@ type snapshot struct {
 }
 
 type gateway struct {
+	contractStatus contractStatusStore
 	serviceProxies map[string]*httputil.ReverseProxy
 	legacyPrefixes map[string]string
 	bindings       upstreamBindings
@@ -325,7 +326,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		compiled, err := compile(regs, bindings)
+		compiled, err := compileStrict(regs, bindings)
 		if err != nil {
 			log.Fatal(err)
 		}

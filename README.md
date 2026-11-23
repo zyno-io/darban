@@ -26,6 +26,13 @@ Darban validates its OpenAPI document and reports the loaded service under
 to handle traffic. Operation selections and rewrites require an active
 contract binding.
 
+An operation selection can carry a `legacy` block with the `source` security
+requirements and the target credential `profiles`. Darban replaces the source
+security with the target profiles. If the operation already declares exactly
+the target requirements, in any order, Darban accepts it unchanged, so a
+service can switch to the target security before the bindings drop `legacy`.
+Any other security is rejected as a legacy security mismatch.
+
 ## Public paths and SDK names
 
 Set `prefix` to one public service segment, such as `/catalog`. If the
@@ -182,11 +189,44 @@ chart creates a ClusterIP Service. Set `ingress.enabled`, `ingress.namespace`,
 and `ingress.gatewayName` to restrict its traffic port to a Gateway API
 controller's labeled pods.
 
+### Contract isolation
+
+Darban compiles each service's contract on its own, so one service cannot
+block the others.
+
+- A contract for a service that is not in `bindings.services` is ignored,
+  logged, and reported in `/status`.
+- A bound service without a contract is omitted from the contract routes. Its
+  `serviceRoutes` entry, if any, keeps proxying directly under its own path
+  rules, as registration-only services do. Operations it marks `internal` are
+  not denied while it is omitted.
+- If a service's contract fails to compile (invalid OpenAPI or visibility,
+  legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
+  keeps that service's last good compiled contract. Without one, the service
+  is omitted. The other services update normally, including on a fresh pod,
+  which starts serving as soon as one pass completes.
+- Checks across services still apply: duplicate `operationId` values, routes
+  that shadow the OpenAPI endpoints, and rewrites whose target operation is
+  missing. The newer or changed contract loses and the last good one stays.
+  If several changed contracts conflict, services are admitted in name order
+  and the first wins. A rewrite whose target service has no serving contract
+  is not published.
+- Rejections log `contract candidate rejected` with the service name once per
+  distinct message. A failure to read the contract sources at all still keeps
+  the whole active snapshot.
+
+Darban has no Prometheus registry, so the rejections appear in `/status` only.
+
 ### Status
 
 `GET /status` on the private admin port (8081) reports the active revision,
 route count, and EndpointSlice state for the authorizer and each backend.
-The endpoint returns `503` during startup or drain. Allow the gateway's
+`contracts` lists each service with a contract, a rejected contract, or no
+contract. `serving` is `current`, `last-good` (the current contract was
+rejected), or `none`. `rejected` is true while the current contract is being
+rejected. `lastRejection` holds the latest message and its RFC3339 time and
+remains after the contract is fixed. `missing` marks a bound service with no
+contract. The endpoint returns `503` during startup or drain. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every namespace named in
 its bindings.
 

@@ -5,7 +5,10 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type upstreamStatus struct {
@@ -14,11 +17,57 @@ type upstreamStatus struct {
 	State   endpointState `json:"state"`
 }
 
+type contractRejection struct {
+	Message string `json:"message"`
+	Time    string `json:"time"`
+}
+
+// contractStatus reports one service's contract. Serving is current,
+// last-good, or none. Rejected is true while the service's latest contract is
+// being rejected; LastRejection stays after the contract is fixed.
+type contractStatus struct {
+	Service       string             `json:"service"`
+	Serving       string             `json:"serving"`
+	Rejected      bool               `json:"rejected"`
+	Missing       bool               `json:"missing,omitempty"`
+	LastRejection *contractRejection `json:"lastRejection,omitempty"`
+}
+
+type contractStatusStore struct {
+	mu       sync.RWMutex
+	services map[string]contractStatus
+}
+
+func (s *contractStatusStore) update(report compileReport, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := make(map[string]contractStatus, len(report.services))
+	for name, outcome := range report.services {
+		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing}
+		previous := s.services[name]
+		entry.LastRejection = previous.LastRejection
+		if entry.Rejected && !(previous.Rejected && previous.LastRejection != nil && previous.LastRejection.Message == outcome.rejection) {
+			entry.LastRejection = &contractRejection{Message: outcome.rejection, Time: now.UTC().Format(time.RFC3339)}
+		}
+		next[name] = entry
+	}
+	s.services = next
+}
+
+func (s *contractStatusStore) list() []contractStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.SortedFunc(maps.Values(s.services), func(a, b contractStatus) int {
+		return strings.Compare(a.Service, b.Service)
+	})
+}
+
 type statusResponse struct {
 	Status           string           `json:"status"`
 	Ready            bool             `json:"ready"`
 	ContractServices []string         `json:"contractServices,omitempty"`
 	ContractRevision string           `json:"contractRevision,omitempty"`
+	Contracts        []contractStatus `json:"contracts,omitempty"`
 	RouteCount       int              `json:"routeCount"`
 	Upstreams        []upstreamStatus `json:"upstreams"`
 }
@@ -40,6 +89,7 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 			route := g.bindings.ServiceRoutes[prefix]
 			report.Upstreams = append(report.Upstreams, upstreamStatus{prefix, "service", g.endpoints.state(route.Origin)})
 		}
+		report.Contracts = g.contractStatus.list()
 		if snapshot != nil {
 			report.ContractRevision = snapshot.revision
 			report.ContractServices = snapshot.contractServices

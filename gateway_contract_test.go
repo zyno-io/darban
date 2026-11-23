@@ -92,8 +92,17 @@ func TestGatewayContractMigrationAndLargeInlineOpenAPI(t *testing.T) {
 	if err := current.Update(corrupt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadClusterRegistrations(legacy, current); err == nil {
-		t.Fatal("a corrupted CRD contract should fail instead of activating the old ConfigMap")
+	isolated, err := loadClusterRegistrations(legacy, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, reg := range isolated {
+		if reg.serviceName == "observatory" && (reg.invalid == nil || reg.openAPI != "") {
+			t.Fatal("a corrupted CRD contract must reject its service instead of activating the old ConfigMap")
+		}
+		if reg.serviceName == "herbarium" && reg.invalid != nil {
+			t.Fatal("a corrupted CRD contract must not affect other services")
+		}
 	}
 }
 
