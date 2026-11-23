@@ -201,14 +201,22 @@ block the others once the gateway is running.
   keeps that service's last good compiled contract. Without one, the service
   is omitted. The other services update normally.
 - A bound service without a serving contract is omitted from the contract
-  routes. If it is not `registrationOnly`, its prefix fails closed with `503`
-  even when a `serviceRoutes` entry exists, because the gateway has no list of
-  its `internal` operations. Rewrites into such a service are denied.
-  Registration-only services keep proxying through `serviceRoutes`.
+  routes. If it is not `registrationOnly`, Darban handles its direct
+  `serviceRoutes` entry as follows. When the pod served the service's
+  contract earlier (for example the `GatewayContract` was deleted), Darban
+  keeps that contract's deny list as a tombstone: `internal` operations stay
+  denied, and everything else keeps proxying through the direct route under
+  its own path rules, including `publicPaths` and legacy hosts. When the pod
+  has never served a contract for it, the prefix fails closed with `503`,
+  because the gateway has no list of its `internal` operations. Rewrites into
+  an omitted service are denied. Registration-only services keep proxying
+  through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and rewrites whose target operation is
   missing. Darban first keeps every service's last good contract, then tries
   each changed contract and keeps the last good one when the change conflicts.
+  After each rejection the selection restarts from the last good contracts, so a
+  service with a last good contract is only ever current or last-good.
   A rewrite error rejects the service that declares the rewrite. A service
   that was never good is admitted after the established ones. Among new or
   changed contracts, the `GatewayContract` with the older
@@ -220,9 +228,9 @@ block the others once the gateway is running.
   distinct message. A failure to read the contract sources at all keeps the
   whole active snapshot.
 
-Readiness keeps the rollout safety check. A new pod stays unready until at
-least one contract is accepted and every bound service that is not
-`registrationOnly` has an accepted contract. A bad contract or binding in a
+Readiness keeps the rollout safety check. A new pod stays unready until every
+bound service that is not `registrationOnly` has an accepted contract. A
+deployment with only registration-only services is ready without contracts. A bad contract or binding in a
 new rollout therefore never replaces serving pods. Once a pod is ready it
 stays ready and keeps isolating failures as above.
 

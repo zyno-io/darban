@@ -852,14 +852,16 @@ func compileStrict(regs []registration, bindings upstreamBindings) (candidate, e
 // of a previously valid set is valid. It then tries to upgrade each changed
 // established service, then admits services that have no last-good unit, each
 // group ordered by contract creation time (older first) and then service name.
-// A unit that makes the set fail is rejected, and the service keeps its
-// last-good unit or is omitted. If the failure lies in a different service's
-// unit that was itself admitted in this pass, that service is rejected instead.
-// Among new contracts the older one wins. Pods that already serve last-good
-// units may therefore differ from a fresh pod when an old and a changed
-// contract conflict.
+// When admitting a unit fails, one unit is rejected and admission restarts
+// from the seed without it, so every undo is re-validated. The rejected unit
+// is the one being admitted, unless the failure lies in another unit that was
+// itself admitted in this pass (for example a rewrite owner), which is
+// rejected instead. A service with a last-good unit therefore ends up current
+// or last-good, never omitted. Among new contracts the older one wins. A pod
+// that already serves last-good units may differ from a fresh pod when an old
+// and a changed contract conflict.
 func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string]time.Time, bindings upstreamBindings) (candidate, map[string]*serviceUnit, map[string]string) {
-	if out, err := assemble(preferred, bindings); err == nil {
+	if out, err := assemble(preferred, bindings, ""); err == nil {
 		return out, preferred, nil
 	}
 	order := slices.SortedFunc(maps.Keys(preferred), func(a, b string) int {
@@ -868,68 +870,70 @@ func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string
 		}
 		return strings.Compare(a, b)
 	})
-	accepted := make(map[string]*serviceUnit)
 	conflicts := make(map[string]string)
+	rejected := make(map[string]bool)
+	seed := make(map[string]*serviceUnit)
 	for _, name := range order {
 		if unit := lastGood[name]; unit != nil {
-			accepted[name] = unit
-		}
-	}
-	if _, err := assemble(accepted, bindings); err != nil {
-		clear(accepted)
-	}
-	restore := func(name string) {
-		if unit := lastGood[name]; unit != nil {
-			accepted[name] = unit
-		} else {
-			delete(accepted, name)
-		}
-	}
-	admit := func(name string, unit *serviceUnit) {
-		for range len(order) + 1 {
-			previous, had := accepted[name]
-			accepted[name] = unit
-			_, err := assemble(accepted, bindings)
-			if err == nil {
-				return
-			}
-			if had {
-				accepted[name] = previous
-			} else {
-				delete(accepted, name)
-			}
-			culprit := faultService(err)
-			if other, present := accepted[culprit]; culprit != "" && culprit != name && present && other != lastGood[culprit] {
-				conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
-				restore(culprit)
-				continue
-			}
-			if culprit != "" && culprit != name {
-				conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
-			} else {
-				conflicts[name] = fmt.Sprintf("service %s: %v", name, err)
-			}
-			return
-		}
-	}
-	for _, established := range []bool{true, false} {
-		for _, name := range order {
-			if unit := preferred[name]; (lastGood[name] != nil) == established && accepted[name] != unit {
-				admit(name, unit)
-			}
+			seed[name] = unit
 		}
 	}
 	for {
-		out, err := assemble(accepted, bindings)
+		_, err := assemble(seed, bindings, "")
 		if err == nil {
-			return out, accepted, conflicts
+			break
 		}
+		// Cannot happen while bindings are fixed. Drop only the service at fault.
 		bad := faultService(err)
-		if _, present := accepted[bad]; !present {
-			bad = slices.Sorted(maps.Keys(accepted))[0]
+		if _, present := seed[bad]; !present {
+			clear(seed)
+			break
 		}
 		conflicts[bad] = fmt.Sprintf("service %s: %v", bad, err)
-		delete(accepted, bad)
+		delete(seed, bad)
+	}
+restart:
+	for {
+		accepted := maps.Clone(seed)
+		for _, established := range []bool{true, false} {
+			for _, name := range order {
+				unit := preferred[name]
+				if (lastGood[name] != nil) != established || accepted[name] == unit || rejected[name] {
+					continue
+				}
+				previous, had := accepted[name]
+				accepted[name] = unit
+				_, err := assemble(accepted, bindings, name)
+				if err == nil {
+					continue
+				}
+				if had {
+					accepted[name] = previous
+				} else {
+					delete(accepted, name)
+				}
+				culprit := faultService(err)
+				if other, present := accepted[culprit]; culprit != "" && culprit != name && present && other != lastGood[culprit] {
+					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
+					rejected[culprit] = true
+				} else {
+					if culprit != "" && culprit != name {
+						conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
+					} else {
+						conflicts[name] = fmt.Sprintf("service %s: %v", name, err)
+					}
+					rejected[name] = true
+				}
+				continue restart
+			}
+		}
+		out, err := assemble(accepted, bindings, "")
+		if err != nil {
+			// Unreachable: every admitted step was validated. Fall back to the seed.
+			out, _ = assemble(seed, bindings, "")
+			return out, seed, conflicts
+		}
+		return out, accepted, conflicts
 	}
 }
 
@@ -954,7 +958,7 @@ func faultService(err error) string {
 // assemble merges validated units into one candidate and runs the checks that
 // span services: rewrites, route and OpenAPI endpoint conflicts, duplicate
 // operationIds and component imports.
-func assemble(units map[string]*serviceUnit, bindings upstreamBindings) (candidate, error) {
+func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) (candidate, error) {
 	var out candidate
 	registrationOnlyDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
@@ -984,7 +988,14 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings) (candida
 			published[key] = op
 		}
 	}
-	for from, alias := range aliases {
+	// Check rewrites in a stable order, those owned by the service being
+	// admitted first, so the reported fault does not depend on map order.
+	aliasKeys := slices.SortedFunc(maps.Keys(aliases), compareOperationKeys)
+	slices.SortStableFunc(aliasKeys, func(a, b operationKey) int {
+		return cmpBool(owners[b] == prefer, owners[a] == prefer)
+	})
+	for _, from := range aliasKeys {
+		alias := aliases[from]
 		if _, serving := units[alias.service]; !serving {
 			// The target service has no serving contract. Deny the alias path so
 			// it cannot reach a direct service route.
@@ -1097,6 +1108,17 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings) (candida
 	}
 	out.revision = hex.EncodeToString(hash.Sum(nil))
 	return out, nil
+}
+
+func cmpBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	default:
+		return -1
+	}
 }
 
 func compareOperationKeys(a, b operationKey) int {

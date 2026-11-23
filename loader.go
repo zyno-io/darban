@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -111,12 +113,51 @@ type reconciler struct {
 	logged   map[string]string
 	now      func() time.Time
 	held     string
+	// tombstones keep the deny list of a service whose contract was deleted, by
+	// public prefix, so its internal operations stay denied without an outage.
+	tombstones map[string][]operationKey
+}
+
+// applyTombstones records each serving service's deny list and, for a service
+// that lost its contract after being served on this pod, restores that list and
+// lets the direct service route keep proxying. Services never served stay
+// unserved and fail closed.
+func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) {
+	if r.tombstones == nil {
+		r.tombstones = make(map[string][]operationKey)
+	}
+	var restored []string
+	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
+		binding := r.gateway.bindings.Services[name]
+		if binding.RegistrationOnly {
+			continue
+		}
+		if report.accepted[name] != nil {
+			r.tombstones[binding.Prefix] = slices.DeleteFunc(slices.Clone(compiled.denied), func(key operationKey) bool {
+				return key.path != binding.Prefix && !strings.HasPrefix(key.path, binding.Prefix+"/")
+			})
+			continue
+		}
+		if denied, ok := r.tombstones[binding.Prefix]; ok {
+			restored = append(restored, binding.Prefix)
+			compiled.denied = append(compiled.denied, denied...)
+		}
+	}
+	if len(restored) == 0 {
+		return
+	}
+	slices.SortFunc(compiled.denied, compareOperationKeys)
+	compiled.denied = slices.Compact(compiled.denied)
+	compiled.unserved = slices.DeleteFunc(compiled.unserved, func(prefix string) bool { return slices.Contains(restored, prefix) })
+	hash := sha256.New()
+	fmt.Fprintf(hash, "%s tombstoned %v", compiled.revision, restored)
+	for _, key := range compiled.denied {
+		fmt.Fprintf(hash, " %s %s", key.method, key.path)
+	}
+	compiled.revision = hex.EncodeToString(hash.Sum(nil))
 }
 
 func (r *reconciler) firstSnapshotBlock(report compileReport) string {
-	if len(report.accepted) == 0 {
-		return "no contract accepted"
-	}
 	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
 		if r.gateway.bindings.Services[name].RegistrationOnly {
 			continue
@@ -145,6 +186,7 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
+	r.applyTombstones(&compiled, report)
 	r.logRejections(report)
 	now := time.Now
 	if r.now != nil {

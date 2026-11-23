@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -72,15 +73,148 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
 		t.Fatalf("internal operation returned %d while serving last-good", code)
 	}
-	// With the contract deleted, the prefix fails closed.
+	// With the contract deleted, the tombstone keeps internal operations denied
+	// and the direct route keeps proxying everything else.
 	rec.apply(func() ([]registration, error) { return nil, nil })
+	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
+		t.Errorf("internal operation returned %d after deletion", code)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("upstream received %d requests", hits.Load())
+	}
+	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusTeapot {
+		t.Errorf("direct route returned %d after deletion", code)
+	}
+}
+
+func TestNeverServedServiceFailsClosed(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer upstream.Close()
+	bindings := directRouteBindings(upstream.URL)
+	g := newGateway(bindings)
+	compiled, _ := compile(nil, bindings, nil)
 	for _, path := range []string{"/catalog/private/42", "/catalog/anything"} {
-		if code := probe(http.MethodPost, path); code != http.StatusServiceUnavailable {
-			t.Errorf("POST %s returned %d, want 503", path, code)
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Host = bindings.Hostname
+		res := httptest.NewRecorder()
+		g.serve(g.build(compiled), res, req)
+		if res.Code != http.StatusServiceUnavailable {
+			t.Errorf("POST %s returned %d, want 503", path, res.Code)
 		}
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("upstream received %d requests", hits.Load())
+	}
+}
+
+func TestDeletedContractKeepsPublicAndLegacyPaths(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer upstream.Close()
+	bindings := directRouteBindings(upstream.URL)
+	route := bindings.ServiceRoutes["/catalog"]
+	route.PublicPaths = []string{"/public/*"}
+	route.DeniedPaths = []string{"/zrpc/*"}
+	route.LegacyHosts = []string{"catalog.example.net"}
+	bindings.ServiceRoutes["/catalog"] = route
+	g := newGateway(bindings)
+	var active atomic.Pointer[snapshot]
+	rec := &reconciler{gateway: g, active: &active}
+	probe := func(host, path string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = host
+		res := httptest.NewRecorder()
+		g.serve(active.Load(), res, req)
+		return res.Code
+	}
+	rec.apply(func() ([]registration, error) {
+		return []registration{{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}}, nil
+	})
+	rec.apply(func() ([]registration, error) { return nil, nil })
+	for _, test := range []struct {
+		host, path string
+		want       int
+	}{
+		{"api.example.net", "/catalog/public/x", http.StatusNoContent},
+		{"catalog.example.net", "/public/x", http.StatusNoContent},
+		{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
+	} {
+		if got := probe(test.host, test.path); got != test.want {
+			t.Errorf("%s%s returned %d, want %d", test.host, test.path, got, test.want)
+		}
+	}
+	// The tombstone persists across passes and is replaced once a contract returns.
+	rec.apply(func() ([]registration, error) { return nil, nil })
+	req := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
+	req.Host = bindings.Hostname
+	res := httptest.NewRecorder()
+	g.serve(active.Load(), res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("internal operation returned %d on a later pass", res.Code)
+	}
+}
+
+func TestCascadingUndoNeverOmitsEstablishedService(t *testing.T) {
+	bindings := isolationBindings("a", "m", "z")
+	_, r1 := compile([]registration{
+		contractFor("a", "/items", "x"), contractFor("m", "/items", "m"), contractFor("z", "/thing", "z"),
+	}, bindings, nil)
+	a2 := contractFor("a", "/items", "a-new")
+	a2.rewrites = `[{from: {method: GET, path: /a/old}, to: {serviceName: z, path: /thing}}]`
+	got, r2 := compile([]registration{a2, contractFor("m", "/items", "x"), contractFor("z", "/other", "z")}, bindings, r1.accepted)
+	wantPaths(t, got, "/a/items", "/m/items", "/z/other")
+	for _, name := range []string{"a", "m", "z"} {
+		if r2.services[name].serving == servingNone {
+			t.Errorf("established service %s omitted", name)
+		}
+	}
+	// a2 is rejected for its rewrite, so a1 keeps operationId x and m2 loses to it.
+	if r2.services["a"].serving != servingLastGood || !strings.Contains(r2.services["a"].rejection, "service a:") ||
+		r2.services["m"].serving != servingLastGood || !strings.Contains(r2.services["m"].rejection, "duplicate operationId") ||
+		r2.services["z"].serving != servingCurrent {
+		t.Fatalf("a=%+v m=%+v z=%+v", r2.services["a"], r2.services["m"], r2.services["z"])
+	}
+}
+
+func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
+	const bTwoOps = "openapi: 3.1.0\npaths:\n" +
+		"  /x:\n    get:\n      operationId: bx\n      security: []\n      x-gateway-policy: anonymous\n      responses: {'200': {description: OK}}\n" +
+		"  /y:\n    get:\n      operationId: by\n      security: []\n      x-gateway-policy: anonymous\n      responses: {'200': {description: OK}}\n"
+	bindings := isolationBindings("a", "b", "c")
+	c1 := contractFor("c", "/items", "c")
+	c1.rewrites = `[{from: {method: GET, path: /c/old}, to: {serviceName: b, path: /y}}]`
+	_, r1 := compile([]registration{contractFor("a", "/items", "a"), {serviceName: "b", openAPI: bTwoOps, rewrites: "[]"}, c1}, bindings, nil)
+	if len(r1.accepted) != 3 {
+		t.Fatalf("setup rejected: %v", r1.services)
+	}
+	outcomes := map[string]int{}
+	for range 200 {
+		a2 := contractFor("a", "/items", "a")
+		a2.rewrites = `[{from: {method: GET, path: /a/old}, to: {serviceName: b, path: /x}}]`
+		got, r2 := compile([]registration{a2, contractFor("b", "/z", "bz"), c1}, bindings, r1.accepted)
+		outcomes[fmt.Sprintf("a=%s b=%s c=%s rev=%s", r2.services["a"].serving, r2.services["b"].serving, r2.services["c"].serving, got.revision)]++
+	}
+	if len(outcomes) != 1 {
+		t.Fatalf("distinct outcomes: %v", outcomes)
+	}
+	for outcome := range outcomes {
+		if !strings.HasPrefix(outcome, "a=last-good b=last-good c=current") {
+			t.Fatalf("unexpected outcome %s", outcome)
+		}
+	}
+}
+
+func TestRegistrationOnlyDeploymentBecomesReadyWithoutContracts(t *testing.T) {
+	bindings := upstreamBindings{Hostname: "api.example.net",
+		Services:      map[string]serviceBinding{"archive": {Prefix: "/archive", RegistrationOnly: true}},
+		ServiceRoutes: map[string]serviceRoute{"/archive": {Origin: "http://archive.default.svc.cluster.local:80", BackendAuth: true}}}
+	var active atomic.Pointer[snapshot]
+	rec := &reconciler{gateway: newGateway(bindings), active: &active}
+	rec.apply(func() ([]registration, error) { return nil, nil })
+	if active.Load() == nil {
+		t.Fatalf("not ready: %q", rec.held)
 	}
 }
 
