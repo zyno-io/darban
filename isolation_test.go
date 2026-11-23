@@ -248,21 +248,18 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 	var draining atomic.Bool
 	clock := time.Date(2026, 11, 23, 9, 30, 0, 0, time.FixedZone("test", 3600))
 	reload := &reconciler{gateway: g, active: &active, now: func() time.Time { return clock }}
+	gamma := registration{serviceName: "gamma", openAPI: "openapi: 3.1.0\npaths: {}\n", rewrites: "[]"}
 	regs := []registration{
 		contractFor("alpha", "/items", "listAlpha", "      x-darban-visibility: bogus\n"),
 		contractFor("beta", "/items", "listBeta"),
 		contractFor("ghost", "/items", "listGhost"),
 	}
-	reload.apply(func() ([]registration, error) { return regs, nil })
-	// A bad contract does not stop a fresh pod from becoming ready.
-	if active.Load() == nil {
-		t.Fatal("no snapshot after a fresh start with one bad contract")
-	}
-	read := func() map[string]contractStatus {
+	apply := func() { reload.apply(func() ([]registration, error) { return regs, nil }) }
+	read := func(code int) map[string]contractStatus {
 		t.Helper()
 		response := httptest.NewRecorder()
 		g.statusHandler(&active, &draining).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/status", nil))
-		if response.Code != http.StatusOK {
+		if response.Code != code {
 			t.Fatalf("status %d: %s", response.Code, response.Body.String())
 		}
 		var report statusResponse
@@ -275,7 +272,12 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		}
 		return byName
 	}
-	got := read()
+	// A fresh pod with a rejected and a missing contract stays unready but reports why.
+	apply()
+	if active.Load() != nil {
+		t.Fatal("a fresh pod became ready with a rejected and a missing contract")
+	}
+	got := read(http.StatusServiceUnavailable)
 	if alpha := got["alpha"]; alpha.Serving != servingNone || !alpha.Rejected || alpha.LastRejection == nil ||
 		!strings.Contains(alpha.LastRejection.Message, "x-darban-visibility") || alpha.LastRejection.Time != "2026-11-23T08:30:00Z" {
 		t.Fatalf("unexpected alpha status: %+v", got["alpha"])
@@ -290,21 +292,33 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		t.Fatalf("unexpected gamma status: %+v", gamma)
 	}
 
-	// Alpha becomes good, then bad again: the later rejection reports last-good.
-	regs[0] = contractFor("alpha", "/items", "listAlpha")
-	reload.apply(func() ([]registration, error) { return regs, nil })
+	// With every bound service served, the pod becomes ready.
+	regs = []registration{contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"), gamma}
+	apply()
+	if active.Load() == nil {
+		t.Fatal("pod stayed unready with a complete contract set")
+	}
+	read(http.StatusOK)
+
+	// Alpha turns bad: the ready pod keeps serving last-good and reports it.
 	clock = clock.Add(time.Hour)
 	regs[0] = contractFor("alpha", "/changed", "listAlpha", "      x-darban-visibility: bogus\n")
-	reload.apply(func() ([]registration, error) { return regs, nil })
-	if alpha := read()["alpha"]; alpha.Serving != servingLastGood || !alpha.Rejected || alpha.LastRejection.Time != "2026-11-23T09:30:00Z" {
+	apply()
+	if alpha := read(http.StatusOK)["alpha"]; alpha.Serving != servingLastGood || !alpha.Rejected || alpha.LastRejection.Time != "2026-11-23T09:30:00Z" {
 		t.Fatalf("unexpected alpha status: %+v", alpha)
 	}
 	if _, ok := active.Load().routes[operationKey{http.MethodGet, "/alpha/items"}]; !ok {
 		t.Fatal("last-good route is not active")
 	}
+	// Re-applying the same rejection keeps the same time.
+	clock = clock.Add(time.Hour)
+	apply()
+	if alpha := read(http.StatusOK)["alpha"]; alpha.LastRejection.Time != "2026-11-23T09:30:00Z" {
+		t.Fatalf("rejection time churned: %+v", alpha)
+	}
 	regs[0] = contractFor("alpha", "/items", "listAlpha")
-	reload.apply(func() ([]registration, error) { return regs, nil })
-	if alpha := read()["alpha"]; alpha.Serving != servingCurrent || alpha.Rejected || alpha.LastRejection == nil {
+	apply()
+	if alpha := read(http.StatusOK)["alpha"]; alpha.Serving != servingCurrent || alpha.Rejected || alpha.LastRejection == nil {
 		t.Fatalf("a fixed contract should keep its last rejection but not be rejected: %+v", alpha)
 	}
 }

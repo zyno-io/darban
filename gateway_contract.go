@@ -124,7 +124,7 @@ func decodeGatewayContract(object *unstructured.Unstructured) (registration, err
 	}
 	return registration{
 		serviceName: spec.ServiceName, openAPI: string(openAPI), rewrites: string(rewrites),
-		defaultVisibility: spec.DefaultVisibility,
+		defaultVisibility: spec.DefaultVisibility, created: object.GetCreationTimestamp().Time,
 	}, nil
 }
 

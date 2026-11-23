@@ -86,7 +86,7 @@ func registrationsFromStore(store cache.Store) ([]registration, error) {
 			}
 			return nil, invalid
 		}
-		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites})
+		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites, created: cm.CreationTimestamp.Time})
 	}
 	return regs, nil
 }
@@ -110,6 +110,26 @@ type reconciler struct {
 	lastGood map[string]*serviceUnit
 	logged   map[string]string
 	now      func() time.Time
+	held     string
+}
+
+func (r *reconciler) firstSnapshotBlock(report compileReport) string {
+	if len(report.accepted) == 0 {
+		return "no contract accepted"
+	}
+	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
+		if r.gateway.bindings.Services[name].RegistrationOnly {
+			continue
+		}
+		outcome := report.services[name]
+		if outcome.missing {
+			return fmt.Sprintf("service %s has no contract", name)
+		}
+		if outcome.rejection != "" {
+			return outcome.rejection
+		}
+	}
+	return ""
 }
 
 func (r *reconciler) apply(load func() ([]registration, error)) {
@@ -131,7 +151,20 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 		now = r.now
 	}
 	r.gateway.contractStatus.update(report, now())
-	if old := r.active.Load(); old == nil || old.revision != compiled.revision {
+	old := r.active.Load()
+	if old == nil {
+		// A new pod only becomes ready with a complete, valid contract set, so a
+		// bad rollout never replaces serving pods. Once ready it keeps isolation.
+		if reason := r.firstSnapshotBlock(report); reason != "" {
+			if reason != r.held {
+				log.Printf("contract snapshot not ready: %s", reason)
+				r.held = reason
+			}
+			return
+		}
+		r.held = ""
+	}
+	if old == nil || old.revision != compiled.revision {
 		r.active.Store(r.gateway.build(compiled))
 		log.Printf("contract snapshot active revision=%s", compiled.revision)
 	}

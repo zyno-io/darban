@@ -192,28 +192,39 @@ controller's labeled pods.
 ### Contract isolation
 
 Darban compiles each service's contract on its own, so one service cannot
-block the others.
+block the others once the gateway is running.
 
 - A contract for a service that is not in `bindings.services` is ignored,
   logged, and reported in `/status`.
-- A bound service without a contract is omitted from the contract routes. Its
-  `serviceRoutes` entry, if any, keeps proxying directly under its own path
-  rules, as registration-only services do. Operations it marks `internal` are
-  not denied while it is omitted.
 - If a service's contract fails to compile (invalid OpenAPI or visibility,
   legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
-  is omitted. The other services update normally, including on a fresh pod,
-  which starts serving as soon as one pass completes.
+  is omitted. The other services update normally.
+- A bound service without a serving contract is omitted from the contract
+  routes. If it is not `registrationOnly`, its prefix fails closed with `503`
+  even when a `serviceRoutes` entry exists, because the gateway has no list of
+  its `internal` operations. Rewrites into such a service are denied.
+  Registration-only services keep proxying through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and rewrites whose target operation is
-  missing. The newer or changed contract loses and the last good one stays.
-  If several changed contracts conflict, services are admitted in name order
-  and the first wins. A rewrite whose target service has no serving contract
-  is not published.
+  missing. Darban first keeps every service's last good contract, then tries
+  each changed contract and keeps the last good one when the change conflicts.
+  A rewrite error rejects the service that declares the rewrite. A service
+  that was never good is admitted after the established ones. Among new or
+  changed contracts, the `GatewayContract` with the older
+  `metadata.creationTimestamp` wins, then the lower service name. A running
+  pod keeps an established contract against a changed conflicting one even
+  when the changed one is older, so a fresh pod can pick differently in that
+  case.
 - Rejections log `contract candidate rejected` with the service name once per
-  distinct message. A failure to read the contract sources at all still keeps
-  the whole active snapshot.
+  distinct message. A failure to read the contract sources at all keeps the
+  whole active snapshot.
+
+Readiness keeps the rollout safety check. A new pod stays unready until at
+least one contract is accepted and every bound service that is not
+`registrationOnly` has an accepted contract. A bad contract or binding in a
+new rollout therefore never replaces serving pods. Once a pod is ready it
+stays ready and keeps isolating failures as above.
 
 Darban has no Prometheus registry, so the rejections appear in `/status` only.
 
