@@ -134,12 +134,13 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 }
 
 type snapshot struct {
-	deniedTemplates []operationKey
-	denied          map[operationKey]bool
-	revision        string
-	specYAML        []byte
-	specJSON        []byte
-	routes          map[operationKey]registeredRoute
+	contractServices []string
+	deniedTemplates  []operationKey
+	denied           map[operationKey]bool
+	revision         string
+	specYAML         []byte
+	specJSON         []byte
+	routes           map[operationKey]registeredRoute
 }
 
 type gateway struct {
@@ -181,11 +182,12 @@ func newGateway(bindings upstreamBindings) *gateway {
 
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
-		denied:   make(map[operationKey]bool, len(compiled.denied)),
-		revision: compiled.revision,
-		specYAML: compiled.specYAML,
-		specJSON: compiled.specJSON,
-		routes:   make(map[operationKey]registeredRoute, len(compiled.routes)),
+		contractServices: compiled.contractServices,
+		denied:           make(map[operationKey]bool, len(compiled.denied)),
+		revision:         compiled.revision,
+		specYAML:         compiled.specYAML,
+		specJSON:         compiled.specJSON,
+		routes:           make(map[operationKey]registeredRoute, len(compiled.routes)),
 	}
 	for _, key := range compiled.denied {
 		if strings.Contains(key.path, "{") {

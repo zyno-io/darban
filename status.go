@@ -17,6 +17,7 @@ type upstreamStatus struct {
 type statusResponse struct {
 	Status           string           `json:"status"`
 	Ready            bool             `json:"ready"`
+	ContractServices []string         `json:"contractServices,omitempty"`
 	ContractRevision string           `json:"contractRevision,omitempty"`
 	RouteCount       int              `json:"routeCount"`
 	Upstreams        []upstreamStatus `json:"upstreams"`
@@ -41,6 +42,7 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 		}
 		if snapshot != nil {
 			report.ContractRevision = snapshot.revision
+			report.ContractServices = snapshot.contractServices
 			report.RouteCount = len(snapshot.routes)
 		}
 		code := http.StatusOK

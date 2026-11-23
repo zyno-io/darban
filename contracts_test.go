@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -494,5 +495,62 @@ func TestTagOptions(t *testing.T) {
 				t.Errorf("expected tags %#v, got %#v", test.want, actual)
 			}
 		})
+	}
+}
+
+func TestRegistrationOnlyContractDoesNotChangePublishedRoutes(t *testing.T) {
+	bindings, err := loadBindings("testdata/bindings.json", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrations, err := loadLocal("testdata/local.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings.Services["archive"] = serviceBinding{
+		Origin:           "http://localhost:9000",
+		Prefix:           "/archive",
+		RegistrationOnly: true,
+	}
+	before, err := compile(registrations, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := registration{
+		serviceName: "archive",
+		openAPI: `openapi: 3.1.0
+paths:
+  /private/{id}:
+    get:
+      x-darban-visibility: internal
+  /items:
+    get:
+      x-darban-visibility: public
+`,
+		rewrites: "[]",
+	}
+	after, err := compile(append(registrations, catalog), bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before.routes, after.routes) ||
+		!reflect.DeepEqual(before.denied, after.denied) ||
+		string(before.specYAML) != string(after.specYAML) {
+		t.Fatal("registration changed routing or the combined spec")
+	}
+	if !slices.Contains(after.contractServices, "archive") || before.revision == after.revision {
+		t.Fatal("the active snapshot does not account for the new registration")
+	}
+	if _, err := compile([]registration{catalog}, bindings); err == nil {
+		t.Fatal("missing contract for an active route binding was accepted")
+	}
+	catalog.rewrites = "[{}]"
+	if _, err := compile(append(registrations, catalog), bindings); err == nil {
+		t.Fatal("registration-only rewrite was accepted")
+	}
+	catalog.rewrites = "[]"
+	catalog.openAPI = "openapi: 3.0.0"
+	if _, err := compile(append(registrations, catalog), bindings); err == nil {
+		t.Fatal("invalid registration-only OpenAPI was accepted")
 	}
 }

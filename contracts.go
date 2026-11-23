@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"slices"
@@ -35,11 +36,12 @@ type rewriteRule struct {
 }
 
 type serviceBinding struct {
-	Origin      string
-	Prefix      string
-	Mount       string
-	DebugOrigin string
-	Operations  []operationSelection
+	Origin           string
+	Prefix           string
+	Mount            string
+	DebugOrigin      string
+	Operations       []operationSelection
+	RegistrationOnly bool
 }
 
 type operationSelection struct {
@@ -189,11 +191,12 @@ type compiledOperation struct {
 }
 
 type candidate struct {
-	denied   []operationKey
-	routes   []compiledOperation
-	specYAML []byte
-	specJSON []byte
-	revision string
+	contractServices []string
+	denied           []operationKey
+	routes           []compiledOperation
+	specYAML         []byte
+	specJSON         []byte
+	revision         string
 }
 
 var (
@@ -260,6 +263,9 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 			return bindings, fmt.Errorf("prefix collision between %q and %q", name, other)
 		}
 		prefixes[binding.Prefix] = name
+		if binding.RegistrationOnly && len(binding.Operations) != 0 {
+			return bindings, fmt.Errorf("registration-only service %q cannot select operations", name)
+		}
 		if _, err := upstreamOrigin(binding.Origin, local); err != nil {
 			return bindings, err
 		}
@@ -441,15 +447,19 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 	}
 }
 
-func readOperations(reg registration, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied *[]operationKey) error {
+func parseOpenAPI(openAPI string) (sourceDoc, error) {
 	var source sourceDoc
-	raw, err := yaml.YAMLToJSONStrict([]byte(reg.openAPI))
+	raw, err := yaml.YAMLToJSONStrict([]byte(openAPI))
 	if err != nil || json.Unmarshal(raw, &source) != nil {
-		return errors.New("invalid OpenAPI YAML")
+		return source, errors.New("invalid OpenAPI YAML")
 	}
 	if !apiVersion.MatchString(source.OpenAPI) || source.Paths == nil {
-		return errors.New("expected an OpenAPI 3.1 document with paths")
+		return source, errors.New("expected an OpenAPI 3.1 document with paths")
 	}
+	return source, nil
+}
+
+func readOperations(service string, source sourceDoc, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied *[]operationKey) error {
 	selected := make(map[operationKey]*legacySecurity, len(binding.Operations))
 	for _, operation := range binding.Operations {
 		key := operationKey{operation.Method, operation.Path}
@@ -547,7 +557,7 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 				contract["parameters"] = parameters
 			}
 			native[publicKey] = sourceOperation{
-				service:      reg.serviceName,
+				service:      service,
 				path:         path,
 				credentials:  profiles,
 				visibility:   visibility,
@@ -566,14 +576,12 @@ func readOperations(reg registration, binding serviceBinding, fallback operation
 
 func compile(regs []registration, bindings upstreamBindings) (candidate, error) {
 	var out candidate
-	if len(regs) != len(bindings.Services) {
-		return out, errors.New("contract set is incomplete or has unregistered services")
-	}
 	defaultVisibility := visibilityPublic
 	if bindings.DefaultVisibility != nil {
 		defaultVisibility = *bindings.DefaultVisibility
 	}
 	registered := make(map[string]bool)
+	registrationOnlyDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
 	aliases := make(map[operationKey]operationKey)
 	components := make(map[string]map[string]any)
@@ -590,12 +598,23 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			}
 			fallback = *reg.defaultVisibility
 		}
-		if err := readOperations(reg, binding, fallback, bindings, native, &out.denied); err != nil {
+		source, err := parseOpenAPI(reg.openAPI)
+		if err != nil {
 			return out, fmt.Errorf("service %s: %w", reg.serviceName, err)
 		}
 		var rules []rewriteRule
 		if err := yaml.UnmarshalStrict([]byte(reg.rewrites), &rules); err != nil || rules == nil {
 			return out, fmt.Errorf("service %s requires a rewrites list", reg.serviceName)
+		}
+		if binding.RegistrationOnly {
+			if len(rules) != 0 {
+				return out, fmt.Errorf("registration-only service %s cannot define rewrites", reg.serviceName)
+			}
+			registrationOnlyDigests[reg.serviceName] = sha256.Sum256([]byte(reg.openAPI))
+			continue
+		}
+		if err := readOperations(reg.serviceName, source, binding, fallback, bindings, native, &out.denied); err != nil {
+			return out, fmt.Errorf("service %s: %w", reg.serviceName, err)
 		}
 		for _, rule := range rules {
 			from := operationKey{rule.From.Method, rule.From.Path}
@@ -611,6 +630,13 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			aliases[from] = operationKey{from.method, destination}
 		}
 	}
+
+	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
+		if !bindings.Services[name].RegistrationOnly && !registered[name] {
+			return out, fmt.Errorf("missing contract for service %q", name)
+		}
+	}
+	out.contractServices = slices.Sorted(maps.Keys(registered))
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
 	for key, op := range native {
@@ -709,6 +735,9 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 	})
 	hash := sha256.New()
 	hash.Write(out.specYAML)
+	for _, name := range slices.Sorted(maps.Keys(registrationOnlyDigests)) {
+		fmt.Fprintf(hash, "registered %s %x\n", name, registrationOnlyDigests[name])
+	}
 	for _, route := range out.routes {
 		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.credentials)
 	}

@@ -19,6 +19,13 @@ certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
 namespaced `GatewayContract` resources under `contractAPIGroup`.
 
+Set `registrationOnly: true` on a service binding to accept the backend's
+contract ahead of routing migration. The contract is optional at startup, and
+Darban validates its OpenAPI document and reports the loaded service under
+`contractServices` on the status endpoint. Existing service routes continue
+to handle traffic. Operation selections and rewrites require an active
+contract binding.
+
 ## Public paths and SDK names
 
 Set `prefix` to one public service segment, such as `/catalog`. If the
