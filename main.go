@@ -86,6 +86,12 @@ func dialVerified(transport *http.Transport, base *tls.Config) func(context.Cont
 			return base.VerifyConnection(state)
 		}
 		client := tls.Client(conn, config)
+		// DialTLSContext bypasses TLSHandshakeTimeout, so bound it here.
+		if timeout := transport.TLSHandshakeTimeout; timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
 		if err := client.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, err
@@ -104,7 +110,8 @@ func newTransport(tlsConfig *tls.Config) *http.Transport {
 
 func newBaseTransport(tlsConfig *tls.Config) *http.Transport {
 	return &http.Transport{
-		TLSClientConfig: tlsConfig,
+		TLSClientConfig:     tlsConfig,
+		TLSHandshakeTimeout: 2 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -121,6 +128,7 @@ func newBaseTransport(tlsConfig *tls.Config) *http.Transport {
 func newDebugTransport(tlsConfig *tls.Config) *http.Transport {
 	transport := newTransport(tlsConfig)
 	transport.DialContext = (&net.Dialer{Timeout: 350 * time.Millisecond}).DialContext
+	transport.TLSHandshakeTimeout = 350 * time.Millisecond
 	transport.ResponseHeaderTimeout = 600 * time.Millisecond
 	// Avoid implicit retries of debug requests with an Idempotency-Key.
 	transport.DisableKeepAlives = true

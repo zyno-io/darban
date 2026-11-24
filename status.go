@@ -33,6 +33,7 @@ type contractStatus struct {
 	Missing       bool               `json:"missing,omitempty"`
 	State         string             `json:"state"`
 	Reason        string             `json:"reason,omitempty"`
+	Warning       string             `json:"warning,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -47,7 +48,7 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
 		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
-			State: outcome.state, Reason: outcome.reason}
+			State: outcome.state, Reason: outcome.reason, Warning: outcome.warning}
 		previous := s.services[name]
 		entry.LastRejection = previous.LastRejection
 		if entry.Rejected && !(previous.Rejected && previous.LastRejection != nil && previous.LastRejection.Message == outcome.rejection) {

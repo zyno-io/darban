@@ -150,7 +150,11 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 	// A bindings entry reserves its prefix for its own service, with or
 	// without a contract.
 	for _, other := range slices.Sorted(maps.Keys(bindings.Services)) {
-		if other != name && bindings.Services[other].Prefix == binding.Prefix {
+		reserved := bindings.Services[other].Prefix
+		if reserved == "" {
+			reserved = "/" + other
+		}
+		if other != name && reserved == binding.Prefix {
 			return binding, "", fmt.Errorf("prefix %s is reserved by bindings.services.%s", binding.Prefix, other)
 		}
 	}

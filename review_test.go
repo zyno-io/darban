@@ -170,16 +170,15 @@ func TestCascadingUndoNeverOmitsEstablishedService(t *testing.T) {
 	a2.rewrites = `[{from: {method: GET, path: /a/old}, to: {serviceName: z, path: /thing}}]`
 	got, r2 := compile([]registration{a2, contractFor("m", "/items", "x"), contractFor("z", "/other", "z")}, bindings, r1.accepted)
 	wantPaths(t, got, "/a/items", "/m/items", "/z/other")
+	// z moved its operation, so a2's rewrite is denied and warned on a. Nothing
+	// is undone: every service serves its current contract.
 	for _, name := range []string{"a", "m", "z"} {
-		if r2.services[name].serving == servingNone {
-			t.Errorf("established service %s omitted", name)
+		if r2.services[name].serving != servingCurrent || r2.services[name].rejection != "" {
+			t.Errorf("service %s: %+v", name, r2.services[name])
 		}
 	}
-	// a2 is rejected for its rewrite, so a1 keeps operationId x and m2 loses to it.
-	if r2.services["a"].serving != servingLastGood || !strings.Contains(r2.services["a"].rejection, "service a:") ||
-		r2.services["m"].serving != servingLastGood || !strings.Contains(r2.services["m"].rejection, "duplicate operationId") ||
-		r2.services["z"].serving != servingCurrent {
-		t.Fatalf("a=%+v m=%+v z=%+v", r2.services["a"], r2.services["m"], r2.services["z"])
+	if r2.services["a"].warning == "" || !slices.Contains(got.denied, operationKey{"GET", "/a/old"}) {
+		t.Fatalf("a = %+v denied=%v", r2.services["a"], got.denied)
 	}
 }
 
@@ -205,7 +204,7 @@ func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
 		t.Fatalf("distinct outcomes: %v", outcomes)
 	}
 	for outcome := range outcomes {
-		if !strings.HasPrefix(outcome, "a=last-good b=last-good c=current") {
+		if !strings.HasPrefix(outcome, "a=current b=current c=current") {
 			t.Fatalf("unexpected outcome %s", outcome)
 		}
 	}
@@ -256,41 +255,34 @@ func TestEstablishedServiceSurvivesNewerConflict(t *testing.T) {
 	}
 }
 
-func TestBrokenRewriteRejectsItsOwner(t *testing.T) {
+func TestBrokenRewriteIsDeniedAndWarnedOnItsOwner(t *testing.T) {
 	bindings := isolationBindings("alpha", "beta")
 	broken := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /missing}}]`}
 	beta := contractFor("beta", "/items", "listBeta")
 	got, report := compile([]registration{broken, beta}, bindings, nil)
-	wantPaths(t, got, "/beta/items")
-	if report.services["alpha"].serving != servingNone || report.services["beta"].serving != servingCurrent {
+	wantPaths(t, got, "/alpha/items", "/beta/items")
+	if report.services["alpha"].serving != servingCurrent || report.services["alpha"].warning == "" ||
+		report.services["beta"].serving != servingCurrent || !slices.Contains(got.denied, operationKey{"GET", "/alpha/old"}) {
 		t.Fatalf("alpha=%+v beta=%+v", report.services["alpha"], report.services["beta"])
 	}
+	// The same on an established pod.
 	_, r1 := compile([]registration{contractFor("alpha", "/items", "listAlpha"), beta}, bindings, nil)
-	_, r2 := compile([]registration{broken, beta}, bindings, r1.accepted)
-	if r2.services["alpha"].serving != servingLastGood || r2.services["alpha"].rejection == "" {
+	got2, r2 := compile([]registration{broken, beta}, bindings, r1.accepted)
+	if r2.services["alpha"].serving != servingCurrent || r2.services["alpha"].warning == "" || got2.revision != got.revision {
 		t.Fatalf("alpha = %+v", r2.services["alpha"])
 	}
-	edited := contractFor("beta", "/items", "listBeta", "      summary: edited\n")
-	got, r3 := compile([]registration{broken, edited}, bindings, r2.accepted)
-	wantPaths(t, got, "/alpha/items", "/beta/items")
-	if r3.services["beta"].serving != servingCurrent || r3.services["beta"].rejection != "" {
-		t.Fatalf("beta = %+v", r3.services["beta"])
-	}
-	// A change that removes a target an established rewrite needs is rejected.
-	_, s1 := compile([]registration{
-		{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
-			rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}, beta,
-	}, bindings, nil)
+	// A change that removes a target an established rewrite needs only denies
+	// the rewrite. Neither service is rejected.
+	rewrite := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
+		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}
+	_, s1 := compile([]registration{rewrite, beta}, bindings, nil)
 	moved := contractFor("beta", "/moved", "listBeta")
-	got, s2 := compile([]registration{
-		{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
-			rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}, moved,
-	}, bindings, s1.accepted)
-	if s2.services["beta"].serving != servingLastGood || s2.services["alpha"].serving != servingCurrent {
+	got, s2 := compile([]registration{rewrite, moved}, bindings, s1.accepted)
+	if s2.services["beta"].serving != servingCurrent || s2.services["alpha"].serving != servingCurrent || s2.services["alpha"].warning == "" {
 		t.Fatalf("alpha=%+v beta=%+v", s2.services["alpha"], s2.services["beta"])
 	}
-	wantPaths(t, got, "/alpha/items", "/alpha/old", "/beta/items")
+	wantPaths(t, got, "/alpha/items", "/beta/moved")
 }
 
 func TestConflictOrderUsesCreationTimeThenName(t *testing.T) {

@@ -208,7 +208,8 @@ version if it had one, when:
 - its prefix is a `serviceRoutes` prefix that the service does not own.
   Ownership means a bindings entry for the same service name with that
   prefix, and that service's `spec.prefix` must stay on it;
-- its prefix is reserved by a `bindings.services` entry of another service,
+- its prefix is reserved by a `bindings.services` entry of another service
+  (its `prefix`, or `/<name>` when it has none, `registrationOnly` included),
   whether or not that service has a contract yet;
 - its prefix has a `serviceRoutes` direct route and its upstream (or bindings
   `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`, so
@@ -302,12 +303,14 @@ block the others once the gateway is running.
   as on a fresh pod. Rewrites into a service that is not installed are denied.
   Registration-only services keep proxying through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
-  that shadow the OpenAPI endpoints, and rewrites whose target operation is
-  missing. Darban first keeps every service's last good contract, then tries
+  that shadow the OpenAPI endpoints, and prefix collisions. Darban first keeps every service's last good contract, then tries
   each changed contract and keeps the last good one when the change conflicts.
   After each rejection the selection restarts from the last good contracts, so a
   service with a last good contract is only ever current or last-good.
-  A rewrite error rejects the service that declares the rewrite. A service
+  A rewrite whose served target lacks the destination (missing or rewritten
+  operation, or a path outside the target's mount) is denied and reported as a
+  `warning` on the owner in `/status`. It never rejects either service, so the
+  outcome does not depend on arrival order. A service
   that was never good is admitted after the established ones. Two contracts
   that claim one prefix conflict the same way. Among new or
   changed contracts, the `GatewayContract` with the older

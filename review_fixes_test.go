@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -178,4 +180,174 @@ func TestCAModeRejectsCertificateForAnotherNameOnIPTarget(t *testing.T) {
 	if err := verifier.tlsConfig().VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{ca.cert}}); err == nil {
 		t.Fatal("empty server name verified")
 	}
+}
+
+// assertAliasDenied checks that x is served with its alias denied and warned,
+// and that t is served.
+func assertAliasDenied(t *testing.T, label string, got candidate, report compileReport, wantT string) {
+	t.Helper()
+	if report.services["x"].serving != servingCurrent || report.services["x"].rejection != "" || report.services["x"].warning == "" {
+		t.Errorf("%s: x = %+v", label, report.services["x"])
+	}
+	if report.services["t"].serving != servingCurrent || report.services["t"].rejection != "" {
+		t.Errorf("%s: t = %+v", label, report.services["t"])
+	}
+	wantPaths(t, got, wantT)
+}
+
+func TestRewriteThatCannotMapNeverBlamesTargetOrOwner(t *testing.T) {
+	// Trace A: t's bindings mount is /api, but x rewrites to /items (outside it).
+	bindings := isolationBindings("x")
+	bindings.Services["t"] = serviceBinding{Prefix: "/t", Origin: "http://t.zyno-alpha.svc.cluster.local:80", Mount: "/api"}
+	owner := rewriteOwner("aliasX")
+	target := contractFor("t", "/api/items", "listT")
+	for name, order := range map[string][]registration{
+		"owner first":  {owner, target},
+		"target first": {target, owner},
+	} {
+		got, report := compile(order, bindings, nil)
+		assertAliasDenied(t, "fresh "+name, got, report, "/t/items")
+		// Established pod: owner served alone, then the target arrives.
+		_, first := compile([]registration{owner}, bindings, nil)
+		if first.services["x"].serving != servingCurrent {
+			t.Fatalf("setup: %+v", first.services)
+		}
+		got2, report := compile(order, bindings, first.accepted)
+		assertAliasDenied(t, "established "+name, got2, report, "/t/items")
+		if got2.revision != got.revision {
+			t.Errorf("%s: fresh and established revisions differ", name)
+		}
+	}
+	// Trace B: t's update adds a mount through spec.upstream, so the rewrite no
+	// longer maps. t is served with the update, x is warned, nobody is rejected.
+	bindings = isolationBindings("t", "x")
+	plain := contractFor("t", "/items", "listT")
+	_, r1 := compile([]registration{plain, owner}, bindings, nil)
+	if len(r1.accepted) != 2 || r1.services["x"].warning != "" {
+		t.Fatalf("setup: %+v", r1.services)
+	}
+	moved := clusterContract("t", "/api/items", "listT", "http://t."+testNamespace+".svc.cluster.local/api", "/t")
+	got, established := compile([]registration{moved, owner}, bindings, r1.accepted)
+	assertAliasDenied(t, "trace B established", got, established, "/t/items")
+	got, fresh := compile([]registration{moved, owner}, bindings, nil)
+	assertAliasDenied(t, "trace B fresh", got, fresh, "/t/items")
+}
+
+func TestRewriteApprovalDoesNotDependOnHowTargetFails(t *testing.T) {
+	bindings := isolationBindings("t", "x")
+	badUpstream := contractFor("t", "/items", "listT")
+	badUpstream.namespace, badUpstream.upstream = testNamespace, "ftp://t"
+	for name, target := range map[string]registration{
+		"bad upstream":   badUpstream,
+		"bad visibility": contractFor("t", "/items", "listT", badVisibility),
+	} {
+		got, report := compile([]registration{target, rewriteOwner("aliasX")}, bindings, nil)
+		if report.services["x"].serving != servingCurrent || report.services["x"].rejection != "" {
+			t.Errorf("%s: x = %+v", name, report.services["x"])
+		}
+		if report.services["t"].serving != servingNone {
+			t.Errorf("%s: t = %+v", name, report.services["t"])
+		}
+		wantPaths(t, got)
+		for _, key := range got.denied {
+			if key == (operationKey{"GET", "/x/alias"}) {
+				goto denied
+			}
+		}
+		t.Errorf("%s: alias not denied: %v", name, got.denied)
+	denied:
+	}
+}
+
+func TestBindingsEntryWithoutPrefixReservesItsDefaultPrefix(t *testing.T) {
+	for _, registrationOnly := range []bool{false, true} {
+		bindings := contractOnlyBindings()
+		bindings.Services["foo"] = serviceBinding{Origin: "http://foo.zyno-alpha.svc.cluster.local:80", RegistrationOnly: registrationOnly}
+		evil := clusterContract("evil", "/items", "listEvil", "http://evil", "/foo")
+		foo := contractFor("foo", "/items", "listFoo")
+		if registrationOnly {
+			foo.rewrites = "[]"
+		}
+		for name, regs := range map[string][]registration{
+			"evil only":  {evil},
+			"evil first": {evil, foo},
+			"foo first":  {foo, evil},
+		} {
+			_, report := compile(regs, bindings, nil)
+			if outcome := report.services["evil"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "reserved") {
+				t.Errorf("registrationOnly=%v %s: evil = %+v", registrationOnly, name, outcome)
+			}
+			if _, has := report.services["foo"]; has && report.services["foo"].rejection != "" {
+				t.Errorf("registrationOnly=%v %s: foo = %+v", registrationOnly, name, report.services["foo"])
+			}
+		}
+	}
+}
+
+func hangingTLSListener(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conns []net.Conn
+	var mu sync.Mutex
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			conn.Close()
+		}
+	})
+	return "https://" + listener.Addr().String()
+}
+
+func TestTLSHandshakeTimeoutFreesConnectionSlots(t *testing.T) {
+	ca := newTestCA(t, "upstream-ca")
+	healthy := tlsUpstream(t, ca)
+	hung := hangingTLSListener(t)
+	verifier, err := newUpstreamVerifier(upstreamTLSConfig{CAFile: writeCA(t, ca.pem)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := newTransport(verifier.tlsConfig())
+	transport.TLSHandshakeTimeout = 200 * time.Millisecond
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	for wave := 0; wave < 2; wave++ {
+		start := time.Now()
+		var wg sync.WaitGroup
+		for i := 0; i < 80; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if resp, err := client.Get(hung); err == nil {
+					resp.Body.Close()
+					t.Error("hung upstream answered")
+				}
+			}()
+		}
+		wg.Wait()
+		// 80 attempts exceed MaxConnsPerHost (64), so slots must be released.
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Fatalf("wave %d took %v", wave, elapsed)
+		}
+	}
+	resp, err := client.Get(healthy.URL)
+	if err != nil {
+		t.Fatalf("healthy upstream: %v", err)
+	}
+	resp.Body.Close()
 }

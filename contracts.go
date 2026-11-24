@@ -261,9 +261,12 @@ type candidate struct {
 	routes   []compiledOperation
 	// services holds the effective binding of every assembled service.
 	services map[string]serviceBinding
-	specYAML []byte
-	specJSON []byte
-	revision string
+	// aliasWarnings holds, by owning service, why a rewrite of that service is
+	// denied although its target is served. It never rejects a contract.
+	aliasWarnings map[string]string
+	specYAML      []byte
+	specJSON      []byte
+	revision      string
 }
 
 var (
@@ -724,6 +727,9 @@ type serviceOutcome struct {
 	// state and reason are set by the reconciler.
 	state  string
 	reason string
+	// warning describes a rewrite denied because its target is served but
+	// does not offer the rewritten operation.
+	warning string
 }
 
 // compileReport describes what compile did with each service. accepted holds
@@ -855,6 +861,13 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		}
 	}
 	maps.Copy(effective, resolved)
+	// Approve a rewrite target whichever way it fails: any registration counts.
+	// Rewrites into a target that is not served stay denied in assemble.
+	for name := range count {
+		if _, known := effective[name]; !known {
+			effective[name] = serviceBinding{}
+		}
+	}
 	effectiveBindings := bindings
 	effectiveBindings.Services = effective
 	for _, reg := range sorted {
@@ -884,7 +897,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	out, accepted, conflicts := selectUnits(preferred, lastGood, created, effectiveBindings)
 	report.accepted = accepted
 	for name := range count {
-		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name]}
+		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name], warning: out.aliasWarnings[name]}
 		if message, failed := conflicts[name]; failed {
 			outcome.rejection = message
 		}
@@ -1108,9 +1121,23 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 			out.denied = append(out.denied, from)
 			continue
 		}
+		// A rewrite that cannot reach its served target is denied and reported
+		// on its owner. It never faults a service, so the outcome does not
+		// depend on arrival order or on what was served before.
+		deny := func(format string, args ...any) {
+			delete(published, from)
+			out.denied = append(out.denied, from)
+			if _, reported := out.aliasWarnings[owners[from]]; !reported {
+				if out.aliasWarnings == nil {
+					out.aliasWarnings = make(map[string]string)
+				}
+				out.aliasWarnings[owners[from]] = fmt.Sprintf(format, args...)
+			}
+		}
 		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
 		if !mapped {
-			return out, &assemblyError{owners[from], fmt.Errorf("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)}
+			deny("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)
+			continue
 		}
 		to := operationKey{alias.key.method, destination}
 		original := native[from]
@@ -1122,7 +1149,8 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		}
 		_, targetRewritten := aliases[to]
 		if !exists || targetRewritten {
-			return out, &assemblyError{owners[from], fmt.Errorf("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)}
+			deny("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)
+			continue
 		}
 		if original.visibility == visibilityUnlisted {
 			target.visibility = visibilityUnlisted
