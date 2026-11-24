@@ -221,14 +221,16 @@ version if it had one, when:
 
 ### Installing the chart
 
-Build the image from the repository's Dockerfile and make it available to
-your cluster. Supply the TLS certificate and key in a Secret named
+CI publishes a multi-arch (`linux/amd64`, `linux/arm64`) image for every
+push to `main`: `ghcr.io/zyno-io/darban:<short-sha>`, plus `:main` for the
+newest commit. Pin the short-sha tag in deployments. You can also build the
+image from the repository's Dockerfile. Supply the TLS certificate and key in a Secret named
 `<release-name>-backend-tls`. Use Helm values to supply the image and
 bindings. This example configures a catalog API and publishes both
 OpenAPI formats.
 
 ```yaml
-image: registry.example.net/darban:dev
+image: ghcr.io/zyno-io/darban:<short-sha>
 bindings:
   hostname: api.example.net
   openapi:
