@@ -318,7 +318,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 
 func main() {
 	manifest := flag.String("manifest", "", "local contract manifest YAML")
-	namespace := flag.String("namespace", "", "namespace of GatewayContracts and legacy ConfigMaps")
+	namespace := flag.String("namespace", "", "namespace of GatewayContracts")
 	printSpec := flag.Bool("print-spec", false, "compile local manifest once and print public OpenAPI")
 	bindingsPath := flag.String("bindings", "/config/bindings.json", "private service bindings")
 	cert := flag.String("cert", "/tls/tls.crt", "gateway TLS certificate")
@@ -349,13 +349,9 @@ func main() {
 	gateway := newGateway(bindings)
 	var active atomic.Pointer[snapshot]
 	reload := &reconciler{gateway: gateway, active: &active}
-	var legacy, current cache.SharedIndexInformer
+	var current cache.SharedIndexInformer
 	if *namespace != "" {
 		config, err := rest.InClusterConfig()
-		if err != nil {
-			log.Fatal(err)
-		}
-		legacy, err = newConfigMapInformer(config, *namespace, bindings.ContractAPIGroup)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -442,7 +438,7 @@ func main() {
 		go reload.watchLocal(stopping, *manifest)
 	} else {
 		go func() {
-			if err := reload.watchCluster(stopping, legacy, current); err != nil {
+			if err := reload.watchCluster(stopping, current); err != nil {
 				failures <- err
 			}
 		}()

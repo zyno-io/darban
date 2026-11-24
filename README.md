@@ -153,8 +153,7 @@ For a different group, install the same CRD with that group and set
 one of `spec.openapi.yaml` or `spec.openapi.gzipBase64`. Set `spec.openapi.sha256`
 to the SHA-256 of the original YAML. The gateway caps the inline field at
 1,400,000 bytes and decoded gzip at 16 MiB. Kubernetes and Helm storage limits
-also apply. Legacy ConfigMaps can register contracts using the
-`<contractAPIGroup>/contract=true` label. A `GatewayContract` takes precedence.
+also apply.
 
 ### Installing the chart
 

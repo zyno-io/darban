@@ -15,10 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/yaml"
 )
@@ -69,39 +65,6 @@ func loadLocal(path string) ([]registration, error) {
 func nameFromResource(name string) (string, bool) {
 	service, found := strings.CutPrefix(name, contractNamePrefix)
 	return service, found && serviceName.MatchString(service)
-}
-
-func registrationsFromStore(store cache.Store) ([]registration, error) {
-	items := store.List()
-	regs := make([]registration, 0, len(items))
-	for _, item := range items {
-		cm := item.(*corev1.ConfigMap)
-		service, hasName := cm.Data["serviceName"]
-		spec, hasSpec := cm.Data["openapi.yaml"]
-		rewrites, hasRewrites := cm.Data["rewrites.yaml"]
-		if len(cm.BinaryData) != 0 || len(cm.Data) != 3 || !hasName || !hasSpec || !hasRewrites ||
-			cm.Name != contractNamePrefix+service {
-			invalid := fmt.Errorf("invalid registration ConfigMap %s", cm.Name)
-			if name, ok := nameFromResource(cm.Name); ok {
-				regs = append(regs, registration{serviceName: name, invalid: invalid})
-				continue
-			}
-			return nil, invalid
-		}
-		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites, created: cm.CreationTimestamp.Time})
-	}
-	return regs, nil
-}
-
-func newConfigMapInformer(config *rest.Config, namespace, apiGroup string) (cache.SharedIndexInformer, error) {
-	client, err := coreclient.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	api := cache.NewFilteredListWatchFromClient(client.RESTClient(), "configmaps", namespace, func(options *metav1.ListOptions) {
-		options.LabelSelector = apiGroup + "/contract=true"
-	})
-	return cache.NewSharedIndexInformer(api, &corev1.ConfigMap{}, 0, cache.Indexers{}), nil
 }
 
 type reconciler struct {
@@ -250,7 +213,7 @@ func (r *reconciler) watchLocal(ctx context.Context, path string) {
 	}
 }
 
-func (r *reconciler) watchCluster(ctx context.Context, legacy, current cache.SharedIndexInformer) error {
+func (r *reconciler) watchCluster(ctx context.Context, current cache.SharedIndexInformer) error {
 	changed := make(chan struct{}, 1)
 	mark := func() {
 		select {
@@ -263,17 +226,15 @@ func (r *reconciler) watchCluster(ctx context.Context, legacy, current cache.Sha
 		UpdateFunc: func(any, any) { mark() },
 		DeleteFunc: func(any) { mark() },
 	}
-	for _, informer := range []cache.SharedIndexInformer{legacy, current} {
-		if _, err := informer.AddEventHandler(handler); err != nil {
-			return err
-		}
-		go informer.RunWithContext(ctx)
+	if _, err := current.AddEventHandler(handler); err != nil {
+		return err
 	}
-	if !cache.WaitForCacheSync(ctx.Done(), legacy.HasSynced, current.HasSynced) {
+	go current.RunWithContext(ctx)
+	if !cache.WaitForCacheSync(ctx.Done(), current.HasSynced) {
 		return nil
 	}
 	load := func() ([]registration, error) {
-		return loadClusterRegistrations(legacy.GetStore(), current.GetStore())
+		return loadClusterRegistrations(current.GetStore())
 	}
 	r.apply(load)
 	for {

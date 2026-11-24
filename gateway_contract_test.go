@@ -9,18 +9,30 @@ import (
 	"strings"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 )
+
+func plainGatewayContract(service, yaml string) *unstructured.Unstructured {
+	digest := sha256.Sum256([]byte(yaml))
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "darban.zyno.io/v1alpha1",
+		"kind":       "GatewayContract",
+		"metadata":   map[string]any{"name": contractNamePrefix + service, "namespace": "fixtures"},
+		"spec": map[string]any{
+			"serviceName": service,
+			"openapi":     map[string]any{"yaml": yaml, "sha256": hex.EncodeToString(digest[:])},
+			"rewrites":    []any{},
+		},
+	}}
+}
 
 func TestGatewayContractMigrationAndLargeInlineOpenAPI(t *testing.T) {
 	var packed bytes.Buffer
 	compressor := gzip.NewWriter(&packed)
 	raw := strings.Repeat("# OpenAPI description\n", 60_000) + "openapi: 3.1.0\n"
 	if len(raw) <= 1<<20 {
-		t.Fatal("fixture must exceed the ConfigMap size limit")
+		t.Fatal("fixture must exceed the 1 MiB object size limit")
 	}
 	if _, err := compressor.Write([]byte(raw)); err != nil {
 		t.Fatal(err)
@@ -43,20 +55,13 @@ func TestGatewayContractMigrationAndLargeInlineOpenAPI(t *testing.T) {
 			"rewrites": []any{},
 		},
 	}}
-	legacy := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	current := cache.NewStore(cache.MetaNamespaceKeyFunc)
-	for _, service := range []string{"herbarium", "observatory"} {
-		if err := legacy.Add(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: contractNamePrefix + service, Namespace: "fixtures"},
-			Data:       map[string]string{"serviceName": service, "openapi.yaml": "old", "rewrites.yaml": "[]"},
-		}); err != nil {
+	for _, object := range []*unstructured.Unstructured{plainGatewayContract("herbarium", "old"), observatory} {
+		if err := current.Add(object); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := current.Add(observatory); err != nil {
-		t.Fatal(err)
-	}
-	result, err := loadClusterRegistrations(legacy, current)
+	result, err := loadClusterRegistrations(current)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +87,7 @@ func TestGatewayContractMigrationAndLargeInlineOpenAPI(t *testing.T) {
 	if err := current.Update(plain); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadClusterRegistrations(legacy, current); err != nil {
+	if _, err := loadClusterRegistrations(current); err != nil {
 		t.Fatal(err)
 	}
 	corrupt := plain.DeepCopy()
@@ -92,13 +97,13 @@ func TestGatewayContractMigrationAndLargeInlineOpenAPI(t *testing.T) {
 	if err := current.Update(corrupt); err != nil {
 		t.Fatal(err)
 	}
-	isolated, err := loadClusterRegistrations(legacy, current)
+	isolated, err := loadClusterRegistrations(current)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, reg := range isolated {
 		if reg.serviceName == "observatory" && (reg.invalid == nil || reg.openAPI != "") {
-			t.Fatal("a corrupted CRD contract must reject its service instead of activating the old ConfigMap")
+			t.Fatal("a corrupted CRD contract must reject its service and must not activate any other source")
 		}
 		if reg.serviceName == "herbarium" && reg.invalid != nil {
 			t.Fatal("a corrupted CRD contract must not affect other services")
