@@ -7,6 +7,7 @@ import (
 
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	discoveryclient "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	"k8s.io/client-go/rest"
@@ -34,7 +35,10 @@ func serviceReference(origin string) (string, string) {
 	return parts[0], parts[1]
 }
 
-func newEndpointCatalog(config *rest.Config, bindings upstreamBindings) (endpointCatalog, error) {
+// newEndpointCatalog watches EndpointSlices in the namespaces of the static
+// origins, filtered to the Services named there, and every EndpointSlice in the
+// watched namespace, where contracts can add upstreams at runtime.
+func newEndpointCatalog(config *rest.Config, bindings upstreamBindings, watched string) (endpointCatalog, error) {
 	client, err := discoveryclient.NewForConfig(config)
 	if err != nil {
 		return nil, err
@@ -57,8 +61,14 @@ func newEndpointCatalog(config *rest.Config, bindings upstreamBindings) (endpoin
 		}
 		names[namespace][name] = true
 	}
-	out := make(endpointCatalog, len(names))
+	out := make(endpointCatalog, len(names)+1)
+	if watched != "" {
+		out[watched] = newEndpointInformer(cache.NewListWatchFromClient(client.RESTClient(), "endpointslices", watched, fields.Everything()))
+	}
 	for namespace, services := range names {
+		if namespace == watched {
+			continue
+		}
 		selector := discoveryv1.LabelServiceName + " in ("
 		var values []string
 		for name := range services {

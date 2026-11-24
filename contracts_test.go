@@ -167,7 +167,7 @@ paths:
         '200': {description: OK}
 `
 	binding := serviceBinding{
-		Prefix: "/observatory",
+		Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80",
 		Operations: []operationSelection{{
 			Method: "get", Path: "/sky/objects",
 			Legacy: &legacySecurity{Profiles: []string{"sessionBearer"}},
@@ -365,7 +365,10 @@ components:
 	internal, unlisted := visibilityInternal, visibilityUnlisted
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(), DefaultVisibility: &internal,
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory"}, "herbarium": {Prefix: "/herbarium"}},
+		Services: map[string]serviceBinding{
+			"observatory": {Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80"},
+			"herbarium":   {Prefix: "/herbarium", Origin: "http://herbarium.fixtures.svc.cluster.local:80"},
+		},
 	}
 	regs := []registration{
 		{serviceName: "observatory", openAPI: raw, rewrites: rewrites, defaultVisibility: &unlisted},
@@ -469,8 +472,8 @@ paths:
 		{serviceName: "catalog", openAPI: raw, rewrites: "[]"},
 	}
 	bindings := upstreamBindings{Services: map[string]serviceBinding{
-		"night-sky": {Prefix: "/night-sky"},
-		"catalog":   {Prefix: "/catalog"},
+		"night-sky": {Prefix: "/night-sky", Origin: "http://night-sky.fixtures.svc.cluster.local:80"},
+		"catalog":   {Prefix: "/catalog", Origin: "http://catalog.fixtures.svc.cluster.local:80"},
 	}}
 	_, err := compileStrict(regs, bindings)
 	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "listObjects"`) {

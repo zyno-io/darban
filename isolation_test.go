@@ -19,7 +19,7 @@ func anonymousContract(path, operationID string, extra ...string) string {
 func isolationBindings(names ...string) upstreamBindings {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{}}
 	for _, name := range names {
-		bindings.Services[name] = serviceBinding{Prefix: "/" + name}
+		bindings.Services[name] = serviceBinding{Prefix: "/" + name, Origin: "http://" + name + ".fixtures.svc.cluster.local:80"}
 	}
 	return bindings
 }
@@ -44,13 +44,13 @@ func wantPaths(t *testing.T, c candidate, want ...string) {
 	}
 }
 
-func TestUnregisteredServiceContractIsIgnored(t *testing.T) {
+func TestContractWithoutUpstreamOrBindingIsRejected(t *testing.T) {
 	bindings := isolationBindings("alpha")
 	regs := []registration{contractFor("alpha", "/items", "listAlpha"), contractFor("ghost", "/items", "listGhost")}
 	got, report := compile(regs, bindings, nil)
 	wantPaths(t, got, "/alpha/items")
 	ghost := report.services["ghost"]
-	if !strings.Contains(ghost.rejection, "not in bindings.services") || ghost.serving != servingNone {
+	if !strings.Contains(ghost.rejection, "no upstream") || ghost.serving != servingNone {
 		t.Fatalf("unexpected ghost outcome: %+v", ghost)
 	}
 	if report.services["alpha"].rejection != "" || report.services["alpha"].serving != servingCurrent {
@@ -222,7 +222,7 @@ paths:
 `
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(),
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Operations: []operationSelection{{
+		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80", Operations: []operationSelection{{
 			Method: "get", Path: "/objects",
 			Legacy: &legacySecurity{Source: securityRequirements{{"staffBearer": {}}}, Profiles: []string{"sessionBearer"}},
 		}}}},

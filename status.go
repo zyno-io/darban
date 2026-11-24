@@ -78,8 +78,16 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 		stopping := draining.Load()
 		report := statusResponse{Status: "ready", Ready: snapshot != nil && !stopping}
 		report.Upstreams = append(report.Upstreams, upstreamStatus{"authz", "authorization", g.endpoints.state(g.bindings.Authz)})
-		for _, name := range slices.Sorted(maps.Keys(g.bindings.Services)) {
-			binding := g.bindings.Services[name]
+		// Contracts can add upstreams at runtime, so merge the served ones.
+		services := maps.Clone(g.bindings.Services)
+		if snapshot != nil {
+			if services == nil {
+				services = make(map[string]serviceBinding)
+			}
+			maps.Copy(services, snapshot.services)
+		}
+		for _, name := range slices.Sorted(maps.Keys(services)) {
+			binding := services[name]
 			report.Upstreams = append(report.Upstreams,
 				upstreamStatus{name, "primary", g.endpoints.state(binding.Origin)},
 				upstreamStatus{name, "debug", g.endpoints.state(binding.DebugOrigin)},

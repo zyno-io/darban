@@ -136,13 +136,15 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 
 type snapshot struct {
 	contractServices []string
-	unserved         map[string]bool
-	deniedTemplates  []operationKey
-	denied           map[operationKey]bool
-	revision         string
-	specYAML         []byte
-	specJSON         []byte
-	routes           map[operationKey]registeredRoute
+	// services holds the effective binding of each served contract service.
+	services        map[string]serviceBinding
+	unserved        map[string]bool
+	deniedTemplates []operationKey
+	denied          map[operationKey]bool
+	revision        string
+	specYAML        []byte
+	specJSON        []byte
+	routes          map[operationKey]registeredRoute
 }
 
 type gateway struct {
@@ -150,7 +152,6 @@ type gateway struct {
 	serviceProxies map[string]*httputil.ReverseProxy
 	legacyPrefixes map[string]string
 	bindings       upstreamBindings
-	targets        map[string]*url.URL
 	transport      *http.Transport
 	debugTransport *http.Transport
 	authClient     *http.Client
@@ -159,11 +160,6 @@ type gateway struct {
 }
 
 func newGateway(bindings upstreamBindings) *gateway {
-	targets := make(map[string]*url.URL, len(bindings.Services))
-	for name, binding := range bindings.Services {
-		// loadBindings already validated the URL.
-		targets[name], _ = url.Parse(binding.Origin)
-	}
 	legacyPrefixes := make(map[string]string)
 	for prefix, route := range bindings.ServiceRoutes {
 		for _, host := range route.LegacyHosts {
@@ -181,7 +177,6 @@ func newGateway(bindings upstreamBindings) *gateway {
 		serviceProxies: newServiceProxies(bindings, tlsConfig),
 		legacyPrefixes: legacyPrefixes,
 		bindings:       bindings,
-		targets:        targets,
 		transport:      newTransport(tlsConfig),
 		debugTransport: newDebugTransport(tlsConfig),
 		authClient: &http.Client{
@@ -194,6 +189,7 @@ func newGateway(bindings upstreamBindings) *gateway {
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
 		contractServices: compiled.contractServices,
+		services:         compiled.services,
 		unserved:         make(map[string]bool, len(compiled.unserved)),
 		denied:           make(map[operationKey]bool, len(compiled.denied)),
 		revision:         compiled.revision,
@@ -212,10 +208,15 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		}
 	}
 	for _, route := range compiled.routes {
-		binding := g.bindings.Services[route.service]
+		binding, found := compiled.services[route.service]
+		if !found {
+			binding = g.bindings.Services[route.service]
+		}
+		// Validated when the contract or the bindings were loaded.
+		target, _ := url.Parse(binding.Origin)
 		registered := registeredRoute{
 			credentials: route.credentials,
-			proxy:       g.reverseProxy(route, g.targets[route.service], g.transport),
+			proxy:       g.reverseProxy(route, target, g.transport),
 		}
 		if binding.DebugOrigin != "" {
 			alternate, _ := url.Parse(binding.DebugOrigin)
@@ -368,7 +369,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		gateway.endpoints, err = newEndpointCatalog(config, bindings)
+		gateway.endpoints, err = newEndpointCatalog(config, bindings, *namespace)
 		if err != nil {
 			log.Fatal(err)
 		}

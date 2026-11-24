@@ -17,7 +17,15 @@ Set `-namespace` for Kubernetes discovery or `-manifest` for local files.
 The gateway reads bindings JSON from `/config/bindings.json` and its TLS
 certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
-namespaced `GatewayContract` resources under `contractAPIGroup`.
+namespaced `GatewayContract` resources under `contractAPIGroup`. A contract
+names its own upstream (see [Contract upstreams](#contract-upstreams)), so a
+backend can join the gateway without a bindings entry.
+
+`bindings.services` entries are optional overrides. A contract that sets
+`spec.upstream` needs none. Use an entry for what only bindings carry:
+`operations` (with `legacy`), `debugOrigin` and `registrationOnly`. Its
+`origin`, `prefix` and `mount` are the transition fallback for contracts
+that do not yet set `spec.upstream`, and are validated when present.
 
 Set `registrationOnly: true` on a service binding to accept the backend's
 contract ahead of routing migration. The contract is optional at startup, and
@@ -149,11 +157,59 @@ Install the [GatewayContract CRD](deploy/gateway-contract-crd.yaml) before
 deploying Darban. The Helm chart and CRD use `darban.zyno.io` by default.
 For a different group, install the same CRD with that group and set
 `bindings.contractAPIGroup` to match. Name each contract
-`api-contract-<serviceName>`. Specify `spec.serviceName`, `spec.rewrites`, and
+`api-contract-<serviceName>`. Specify `spec.serviceName`, `spec.upstream`, `spec.rewrites`, and
 one of `spec.openapi.yaml` or `spec.openapi.gzipBase64`. Set `spec.openapi.sha256`
 to the SHA-256 of the original YAML. The gateway caps the inline field at
 1,400,000 bytes and decoded gzip at 16 MiB. Kubernetes and Helm storage limits
 also apply.
+
+### Contract upstreams
+
+Every `GatewayContract` in the watched namespace is a candidate. It names
+its backend with `spec.upstream`, a URL, and its public path with the optional
+`spec.prefix`:
+
+```yaml
+apiVersion: darban.zyno.io/v1alpha1
+kind: GatewayContract
+metadata:
+  name: api-contract-hosting
+spec:
+  serviceName: hosting
+  upstream: http://hosting-manager.zyno-alpha.svc.cluster.local/hosting
+  prefix: /hosting
+  openapi: { yaml: "...", sha256: "..." }
+  rewrites: []
+```
+
+- Scheme is `http` or `https`. The host must be a Service in the contract's own
+  namespace: `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc` or
+  `<svc>.<ns>.svc.cluster.local`, with `<ns>` equal to that namespace and `<svc>`
+  a DNS-1035 label. Darban normalises to the full form. The port defaults to
+  80 for `http` and 443 for `https`, and is stored explicitly.
+- A path is the upstream mount. It replaces the bindings `mount`, must be
+  literal, and must not end with `/`. Query, fragment and userinfo are rejected.
+- `spec.prefix` defaults to `/<serviceName>` and is one public segment.
+  `https` upstreams use the `upstreamTLS` settings below.
+- Without `spec.upstream`, the contract uses `bindings.services.<name>`'s
+  `origin`, `prefix` and `mount`. With neither, it is rejected. When both
+  exist, the contract wins and Darban logs the disagreement once per
+  distinct value.
+- In a local manifest, a contract entry may set `upstream` and `prefix` and
+  may use loopback hosts. There is no namespace check.
+
+Each contract is admitted or rejected on its own, with the reason in
+`/status` and the logs. A contract is rejected, and keeps its last good
+version if it had one, when:
+
+- its upstream URL is invalid or in another namespace;
+- its prefix collides with another contract: the older `creationTimestamp`
+  keeps serving, then the lower service name;
+- its prefix is a `serviceRoutes` prefix that the service does not own.
+  Ownership means a bindings entry for the same service name with that
+  prefix, and that service's `spec.prefix` must stay on it;
+- its prefix is the first path segment of `openapi.yamlPath`,
+  `openapi.jsonPath` or `authorization.path`, which Darban serves or reserves.
 
 ### Installing the chart
 
@@ -218,8 +274,9 @@ to match. Leaving them unset changes nothing.
 Darban compiles each service's contract on its own, so one service cannot
 block the others once the gateway is running.
 
-- A contract for a service that is not in `bindings.services` is ignored,
-  logged, and reported in `/status`.
+- A contract for a service that is not in `bindings.services` is admitted
+  when it sets `spec.upstream`. Without an upstream or a bindings origin it is
+  rejected, logged, and reported in `/status`.
 - If a service's contract fails to compile (invalid OpenAPI or visibility,
   legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
@@ -242,7 +299,8 @@ block the others once the gateway is running.
   After each rejection the selection restarts from the last good contracts, so a
   service with a last good contract is only ever current or last-good.
   A rewrite error rejects the service that declares the rewrite. A service
-  that was never good is admitted after the established ones. Among new or
+  that was never good is admitted after the established ones. Two contracts
+  that claim one prefix conflict the same way. Among new or
   changed contracts, the `GatewayContract` with the older
   `metadata.creationTimestamp` wins, then the lower service name. A running
   pod keeps an established contract against a changed conflicting one even
@@ -263,15 +321,18 @@ Darban has no Prometheus registry, so the rejections appear in `/status` only.
 ### Status
 
 `GET /status` on the private admin port (8081) reports the active revision,
-route count, and EndpointSlice state for the authorizer and each backend.
+route count, and EndpointSlice state for the authorizer and each backend,
+including the upstreams that contracts add at runtime. Darban watches every
+EndpointSlice in its own namespace, and the Services named in `bindings` in
+other namespaces.
 `contracts` lists each service with a contract, a rejected contract, or no
 contract. `serving` is `current`, `last-good` (the current contract was
 rejected), or `none`. `rejected` is true while the current contract is being
 rejected. `lastRejection` holds the latest message and its RFC3339 time and
 remains after the contract is fixed. `missing` marks a bound service with no
-contract. The endpoint returns `503` during startup or drain. Allow the gateway's
-ServiceAccount to list and watch EndpointSlices in every namespace named in
-its bindings.
+contract. The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+ServiceAccount to list and watch EndpointSlices in every other namespace named
+in its bindings.
 
 ## License
 

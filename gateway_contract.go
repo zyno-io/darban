@@ -29,6 +29,8 @@ const (
 
 type gatewayContractSpec struct {
 	ServiceName       string               `json:"serviceName"`
+	Upstream          string               `json:"upstream,omitempty"`
+	Prefix            string               `json:"prefix,omitempty"`
 	DefaultVisibility *operationVisibility `json:"defaultVisibility,omitempty"`
 	OpenAPI           gatewayOpenAPI       `json:"openapi"`
 	Rewrites          []rewriteRule        `json:"rewrites"`
@@ -124,6 +126,7 @@ func decodeGatewayContract(object *unstructured.Unstructured) (registration, err
 	}
 	return registration{
 		serviceName: spec.ServiceName, openAPI: string(openAPI), rewrites: string(rewrites),
+		upstream: spec.Upstream, prefix: spec.Prefix, namespace: object.GetNamespace(),
 		defaultVisibility: spec.DefaultVisibility, created: object.GetCreationTimestamp().Time,
 	}, nil
 }

@@ -220,7 +220,7 @@ func TestRegistrationOnlyDeploymentBecomesReadyWithoutContracts(t *testing.T) {
 
 func TestAliasToUnservedTargetIsDenied(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha"}, "beta": {Prefix: "/beta"},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "beta": {Prefix: "/beta", Origin: "http://beta.fixtures.svc.cluster.local:80"},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /thing}}]`}
@@ -393,7 +393,7 @@ func TestRevisionTracksServingServices(t *testing.T) {
 
 func TestStrictRejectsRewriteToServiceWithoutContract(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha"}, "archive": {Prefix: "/archive", RegistrationOnly: true},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", RegistrationOnly: true},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: archive, path: /thing}}]`}

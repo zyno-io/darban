@@ -24,6 +24,8 @@ const contractNamePrefix = "api-contract-"
 type localManifest struct {
 	Contracts []struct {
 		ServiceName       string               `json:"serviceName"`
+		Upstream          string               `json:"upstream,omitempty"`
+		Prefix            string               `json:"prefix,omitempty"`
 		OpenAPIPath       string               `json:"openapi.yaml"`
 		RewritesPath      string               `json:"rewrites.yaml"`
 		DefaultVisibility *operationVisibility `json:"defaultVisibility,omitempty"`
@@ -55,7 +57,10 @@ func loadLocal(path string) ([]registration, error) {
 		if err != nil {
 			return nil, err
 		}
-		regs = append(regs, registration{serviceName: entry.ServiceName, openAPI: string(spec), rewrites: string(rewrites), defaultVisibility: entry.DefaultVisibility})
+		regs = append(regs, registration{
+			serviceName: entry.ServiceName, openAPI: string(spec), rewrites: string(rewrites),
+			upstream: entry.Upstream, prefix: entry.Prefix, local: true, defaultVisibility: entry.DefaultVisibility,
+		})
 	}
 	return regs, nil
 }
@@ -74,8 +79,10 @@ type reconciler struct {
 	// lastGood holds the units serving in the active snapshot, by service.
 	lastGood map[string]*serviceUnit
 	logged   map[string]string
-	now      func() time.Time
-	held     string
+	// overrides remembers the contract-over-binding messages already logged.
+	overrides map[string]string
+	now       func() time.Time
+	held      string
 	// tombstones keep the deny list of a service whose contract was deleted, by
 	// public prefix, so its internal operations stay denied without an outage.
 	tombstones map[string][]operationKey
@@ -92,7 +99,7 @@ func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) 
 	var restored []string
 	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
 		binding := r.gateway.bindings.Services[name]
-		if binding.RegistrationOnly {
+		if binding.RegistrationOnly || binding.Prefix == "" {
 			continue
 		}
 		if report.accepted[name] != nil {
@@ -151,6 +158,7 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastGood = report.accepted
 	r.applyTombstones(&compiled, report)
 	r.logRejections(report)
+	r.logOverrides(report)
 	now := time.Now
 	if r.now != nil {
 		now = r.now
@@ -195,6 +203,25 @@ func (r *reconciler) logRejections(report compileReport) {
 	for name := range r.logged {
 		if _, present := report.services[name]; !present {
 			delete(r.logged, name)
+		}
+	}
+}
+
+// logOverrides logs where a contract disagrees with its bindings entry, once
+// per distinct message.
+func (r *reconciler) logOverrides(report compileReport) {
+	if r.overrides == nil {
+		r.overrides = make(map[string]string)
+	}
+	for _, name := range slices.Sorted(maps.Keys(report.overrides)) {
+		if r.overrides[name] != report.overrides[name] {
+			log.Print(report.overrides[name])
+			r.overrides[name] = report.overrides[name]
+		}
+	}
+	for name := range r.overrides {
+		if _, present := report.overrides[name]; !present {
+			delete(r.overrides, name)
 		}
 	}
 }
