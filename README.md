@@ -3,7 +3,7 @@
 Darban is an OpenAPI-driven HTTP reverse proxy by Zyno Consulting. It routes
 HTTP APIs through one hostname. It watches service
 contracts, compiles routes and combined OpenAPI into one immutable snapshot,
-and keeps the last accepted snapshot if an update fails validation.
+and keeps each service's last accepted contract if an update fails validation.
 
 ## Development
 
@@ -281,17 +281,20 @@ block the others once the gateway is running.
   legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
   is omitted. The other services update normally.
-- A bound service without a serving contract is omitted from the contract
-  routes. If it is not `registrationOnly`, Darban handles its direct
-  `serviceRoutes` entry as follows. When the pod served the service's
-  contract earlier (for example the `GatewayContract` was deleted), Darban
-  keeps that contract's deny list as a tombstone: `internal` operations stay
-  denied, and everything else keeps proxying through the direct route under
-  its own path rules, including `publicPaths` and legacy hosts. When the pod
-  has never served a contract for it, the prefix fails closed with `503`,
-  because the gateway has no list of its `internal` operations. Rewrites into
-  an omitted service are denied. Registration-only services keep proxying
-  through `serviceRoutes`.
+- A service that was never accepted on this pod (its contract is bad, or a
+  `bindings.services` entry has no contract) is not installed: its public
+  prefix returns `404` like any unknown path. A service accepted earlier keeps
+  its last good unit while a later update is bad.
+- A service whose prefix has a `serviceRoutes` direct route (proxy-all minus
+  the `internal` operations) needs its contract to know those operations.
+  With no good contract yet on this pod, only that direct route fails closed
+  with `503`. When the pod served the contract earlier (for example the
+  `GatewayContract` was deleted), Darban keeps its deny list as a tombstone:
+  `internal` operations stay denied, and everything else keeps proxying through
+  the direct route under its own path rules, including `publicPaths` and legacy
+  hosts. Rewrites into a service that is not installed are denied.
+  Registration-only services keep proxying through `serviceRoutes`.
+  Deleting a contract with no direct route removes its prefix (`404`).
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and rewrites whose target operation is
   missing. Darban first keeps every service's last good contract, then tries
@@ -308,13 +311,20 @@ block the others once the gateway is running.
   case.
 - Rejections log `contract candidate rejected` with the service name once per
   distinct message. A failure to read the contract sources at all keeps the
-  whole active snapshot.
+  whole active snapshot. A `GatewayContract` whose name does not map to a
+  service is logged and skipped. In local manifest mode an entry with an
+  unreadable file is rejected on its own the same way.
 
-Readiness keeps the rollout safety check. A new pod stays unready until every
-bound service that is not `registrationOnly` has an accepted contract. A
-deployment with only registration-only services is ready without contracts. A bad contract or binding in a
-new rollout therefore never replaces serving pods. Once a pod is ready it
-stays ready and keeps isolating failures as above.
+Readiness never waits on contracts. A new pod is ready once the
+`GatewayContract` informer has synced and the first snapshot is built,
+whatever contracts are valid: a bad contract, a missing contract or no
+contracts at all. A manifest that cannot be parsed at all keeps the pod unready.
+
+Last-good state lives in memory, per pod. A restarted or new pod treats every
+contract as first-seen, so during a Darban rollout a service whose current
+contract is bad is not installed on the new pods (`404`, or `503` on its direct
+route) while old pods still serve their last good unit. Darban writes nothing
+to Kubernetes.
 
 Darban has no Prometheus registry, so the rejections appear in `/status` only.
 
@@ -330,7 +340,12 @@ contract. `serving` is `current`, `last-good` (the current contract was
 rejected), or `none`. `rejected` is true while the current contract is being
 rejected. `lastRejection` holds the latest message and its RFC3339 time and
 remains after the contract is fixed. `missing` marks a bound service with no
-contract. The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+contract. `state` is the explicit outcome per service, with a `reason`:
+`serving`, `serving_last_good` (the current contract was rejected),
+`not_installed` (no good contract was ever accepted on this pod, or the
+contract was deleted and only a direct route's deny list remains), or
+`direct_route_closed` (the direct service route returns `503` until a good
+contract is seen). The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
 

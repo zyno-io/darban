@@ -44,25 +44,38 @@ func loadLocal(path string) ([]registration, error) {
 	base := filepath.Dir(path)
 	regs := make([]registration, 0, len(manifest.Contracts))
 	for _, entry := range manifest.Contracts {
-		for _, file := range []string{entry.OpenAPIPath, entry.RewritesPath} {
-			if file == "" || !filepath.IsLocal(file) {
-				return nil, errors.New("contract paths must be relative to the manifest")
+		spec, rewrites, err := readLocalContract(base, entry.OpenAPIPath, entry.RewritesPath)
+		if err != nil {
+			// A broken entry rejects its own service, like a broken GatewayContract.
+			if !serviceName.MatchString(entry.ServiceName) {
+				return nil, err
 			}
-		}
-		spec, err := os.ReadFile(filepath.Join(base, entry.OpenAPIPath))
-		if err != nil {
-			return nil, err
-		}
-		rewrites, err := os.ReadFile(filepath.Join(base, entry.RewritesPath))
-		if err != nil {
-			return nil, err
+			regs = append(regs, registration{serviceName: entry.ServiceName, invalid: err, local: true})
+			continue
 		}
 		regs = append(regs, registration{
-			serviceName: entry.ServiceName, openAPI: string(spec), rewrites: string(rewrites),
+			serviceName: entry.ServiceName, openAPI: spec, rewrites: rewrites,
 			upstream: entry.Upstream, prefix: entry.Prefix, local: true, defaultVisibility: entry.DefaultVisibility,
 		})
 	}
 	return regs, nil
+}
+
+func readLocalContract(base, openAPIPath, rewritesPath string) (string, string, error) {
+	for _, file := range []string{openAPIPath, rewritesPath} {
+		if file == "" || !filepath.IsLocal(file) {
+			return "", "", errors.New("contract paths must be relative to the manifest")
+		}
+	}
+	spec, err := os.ReadFile(filepath.Join(base, openAPIPath))
+	if err != nil {
+		return "", "", err
+	}
+	rewrites, err := os.ReadFile(filepath.Join(base, rewritesPath))
+	if err != nil {
+		return "", "", err
+	}
+	return string(spec), string(rewrites), nil
 }
 
 // nameFromResource recovers the service name from an api-contract-<service>
@@ -82,7 +95,6 @@ type reconciler struct {
 	// overrides remembers the contract-over-binding messages already logged.
 	overrides map[string]string
 	now       func() time.Time
-	held      string
 	// tombstones keep the deny list of a service whose contract was deleted, by
 	// public prefix, so its internal operations stay denied without an outage.
 	tombstones map[string][]operationKey
@@ -92,11 +104,12 @@ type reconciler struct {
 // that lost its contract after being served on this pod, restores that list and
 // lets the direct service route keep proxying. Services never served stay
 // unserved and fail closed.
-func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) {
+func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) map[string]bool {
 	if r.tombstones == nil {
 		r.tombstones = make(map[string][]operationKey)
 	}
 	var restored []string
+	restoredNames := make(map[string]bool)
 	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
 		binding := r.gateway.bindings.Services[name]
 		if binding.RegistrationOnly || binding.Prefix == "" {
@@ -110,11 +123,12 @@ func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) 
 		}
 		if denied, ok := r.tombstones[binding.Prefix]; ok {
 			restored = append(restored, binding.Prefix)
+			restoredNames[name] = true
 			compiled.denied = append(compiled.denied, denied...)
 		}
 	}
 	if len(restored) == 0 {
-		return
+		return restoredNames
 	}
 	slices.SortFunc(compiled.denied, compareOperationKeys)
 	compiled.denied = slices.Compact(compiled.denied)
@@ -125,22 +139,49 @@ func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) 
 		fmt.Fprintf(hash, " %s %s", key.method, key.path)
 	}
 	compiled.revision = hex.EncodeToString(hash.Sum(nil))
+	return restoredNames
 }
 
-func (r *reconciler) firstSnapshotBlock(report compileReport) string {
-	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
-		if r.gateway.bindings.Services[name].RegistrationOnly {
-			continue
-		}
-		outcome := report.services[name]
-		if outcome.missing {
-			return fmt.Sprintf("service %s has no contract", name)
-		}
-		if outcome.rejection != "" {
-			return outcome.rejection
+// classify sets each service's explicit state and reason. Services whose
+// prefix has a direct service route fail closed (503) until the pod has seen a
+// good contract for them; every other unaccepted service is simply not
+// installed.
+func (r *reconciler) classify(report *compileReport, tombstoned map[string]bool) {
+	bindings := r.gateway.bindings
+	names := make(map[string]bool, len(report.services)+len(bindings.Services))
+	for name := range report.services {
+		names[name] = true
+	}
+	for name, binding := range bindings.Services {
+		if !binding.RegistrationOnly && binding.Prefix != "" {
+			names[name] = true
 		}
 	}
-	return ""
+	for name := range names {
+		outcome := report.services[name]
+		reason := outcome.rejection
+		if reason == "" && outcome.missing || reason == "" && report.accepted[name] == nil {
+			reason = "no GatewayContract"
+		}
+		switch {
+		case outcome.serving == servingCurrent:
+			outcome.state, reason = stateServing, ""
+		case outcome.serving == servingLastGood:
+			outcome.state = stateServingLastGood
+		case tombstoned[name]:
+			outcome.state = stateNotInstalled
+			reason += "; direct service route keeps proxying with the retained deny list"
+		default:
+			outcome.state = stateNotInstalled
+			binding := bindings.Services[name]
+			if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && !binding.RegistrationOnly && binding.Prefix != "" {
+				outcome.state = stateDirectRouteClosed
+				reason += "; direct service route returns 503 until a good contract is seen"
+			}
+		}
+		outcome.reason = reason
+		report.services[name] = outcome
+	}
 }
 
 func (r *reconciler) apply(load func() ([]registration, error)) {
@@ -156,7 +197,8 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
-	r.applyTombstones(&compiled, report)
+	tombstoned := r.applyTombstones(&compiled, report)
+	r.classify(&report, tombstoned)
 	r.logRejections(report)
 	r.logOverrides(report)
 	now := time.Now
@@ -165,18 +207,8 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	}
 	r.gateway.contractStatus.update(report, now())
 	old := r.active.Load()
-	if old == nil {
-		// A new pod only becomes ready with a complete, valid contract set, so a
-		// bad rollout never replaces serving pods. Once ready it keeps isolation.
-		if reason := r.firstSnapshotBlock(report); reason != "" {
-			if reason != r.held {
-				log.Printf("contract snapshot not ready: %s", reason)
-				r.held = reason
-			}
-			return
-		}
-		r.held = ""
-	}
+	// The first apply always stores a snapshot, so a pod is ready once its
+	// contracts are loaded whether or not any of them is valid.
 	if old == nil || old.revision != compiled.revision {
 		r.active.Store(r.gateway.build(compiled))
 		log.Printf("contract snapshot active revision=%s", compiled.revision)

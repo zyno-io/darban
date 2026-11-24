@@ -703,10 +703,21 @@ const (
 	servingNone     = "none"
 )
 
+// Service states reported in /status.
+const (
+	stateServing           = "serving"
+	stateServingLastGood   = "serving_last_good"
+	stateNotInstalled      = "not_installed"
+	stateDirectRouteClosed = "direct_route_closed"
+)
+
 type serviceOutcome struct {
 	serving   string
 	rejection string
 	missing   bool
+	// state and reason are set by the reconciler after tombstones apply.
+	state  string
+	reason string
 }
 
 // compileReport describes what compile did with each service. accepted holds

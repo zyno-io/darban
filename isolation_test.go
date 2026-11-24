@@ -272,12 +272,12 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		}
 		return byName
 	}
-	// A fresh pod with a rejected and a missing contract stays unready but reports why.
+	// A fresh pod with a rejected and a missing contract is ready and reports why.
 	apply()
-	if active.Load() != nil {
-		t.Fatal("a fresh pod became ready with a rejected and a missing contract")
+	if active.Load() == nil {
+		t.Fatal("a fresh pod stayed unready with a rejected and a missing contract")
 	}
-	got := read(http.StatusServiceUnavailable)
+	got := read(http.StatusOK)
 	if alpha := got["alpha"]; alpha.Serving != servingNone || !alpha.Rejected || alpha.LastRejection == nil ||
 		!strings.Contains(alpha.LastRejection.Message, "x-darban-visibility") || alpha.LastRejection.Time != "2026-11-23T08:30:00Z" {
 		t.Fatalf("unexpected alpha status: %+v", got["alpha"])
@@ -292,12 +292,9 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		t.Fatalf("unexpected gamma status: %+v", gamma)
 	}
 
-	// With every bound service served, the pod becomes ready.
+	// Once every bound service is served the pod stays ready.
 	regs = []registration{contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"), gamma}
 	apply()
-	if active.Load() == nil {
-		t.Fatal("pod stayed unready with a complete contract set")
-	}
 	read(http.StatusOK)
 
 	// Alpha turns bad: the ready pod keeps serving last-good and reports it.

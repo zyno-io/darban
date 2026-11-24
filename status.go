@@ -23,13 +23,16 @@ type contractRejection struct {
 }
 
 // contractStatus reports one service's contract. Serving is current,
-// last-good, or none. Rejected is true while the service's latest contract is
+// last-good, or none. State is the explicit outcome: serving, serving_last_good,
+// not_installed or direct_route_closed, with the Reason. Rejected is true while the service's latest contract is
 // being rejected; LastRejection stays after the contract is fixed.
 type contractStatus struct {
 	Service       string             `json:"service"`
 	Serving       string             `json:"serving"`
 	Rejected      bool               `json:"rejected"`
 	Missing       bool               `json:"missing,omitempty"`
+	State         string             `json:"state"`
+	Reason        string             `json:"reason,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -43,7 +46,8 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	defer s.mu.Unlock()
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
-		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing}
+		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
+			State: outcome.state, Reason: outcome.reason}
 		previous := s.services[name]
 		entry.LastRejection = previous.LastRejection
 		if entry.Rejected && !(previous.Rejected && previous.LastRejection != nil && previous.LastRejection.Message == outcome.rejection) {

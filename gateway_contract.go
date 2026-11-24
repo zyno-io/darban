@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"unicode/utf8"
 
@@ -141,7 +142,9 @@ func loadClusterRegistrations(current cache.Store) ([]registration, error) {
 			invalid := fmt.Errorf("GatewayContract %s: %w", object.GetName(), err)
 			name, ok := nameFromResource(object.GetName())
 			if !ok {
-				return nil, invalid
+				// No service to attribute it to, so skip it rather than block the rest.
+				log.Printf("contract candidate rejected: %v", invalid)
+				continue
 			}
 			reg = registration{serviceName: name, invalid: invalid}
 		}

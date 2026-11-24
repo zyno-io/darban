@@ -57,11 +57,20 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	good := registration{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}
 	bad := registration{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-gateway-policy: anonymous", "x-gateway-policy: bogus", 1)}
 
-	// A fresh pod with only a bad contract is not ready, so it serves nothing.
-	fresh := &reconciler{gateway: newGateway(bindings), active: new(atomic.Pointer[snapshot])}
+	// A fresh pod with only a bad contract becomes ready, but the direct route
+	// fails closed because the internal operations are unknown.
+	freshGateway := newGateway(bindings)
+	fresh := &reconciler{gateway: freshGateway, active: new(atomic.Pointer[snapshot])}
 	fresh.apply(func() ([]registration, error) { return []registration{bad}, nil })
-	if fresh.active.Load() != nil {
-		t.Fatal("fresh pod with a bad contract became ready")
+	if fresh.active.Load() == nil {
+		t.Fatal("fresh pod with a bad contract did not become ready")
+	}
+	freshReq := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
+	freshReq.Host = bindings.Hostname
+	freshRes := httptest.NewRecorder()
+	freshGateway.serve(fresh.active.Load(), freshRes, freshReq)
+	if freshRes.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fresh pod direct route returned %d, want 503", freshRes.Code)
 	}
 
 	rec.apply(func() ([]registration, error) { return []registration{good}, nil })
@@ -214,7 +223,7 @@ func TestRegistrationOnlyDeploymentBecomesReadyWithoutContracts(t *testing.T) {
 	rec := &reconciler{gateway: newGateway(bindings), active: &active}
 	rec.apply(func() ([]registration, error) { return nil, nil })
 	if active.Load() == nil {
-		t.Fatalf("not ready: %q", rec.held)
+		t.Fatal("not ready")
 	}
 }
 
@@ -314,28 +323,25 @@ func TestConflictOrderUsesCreationTimeThenName(t *testing.T) {
 	}
 }
 
-func TestFirstSnapshotWaitsForCompleteContractSet(t *testing.T) {
+func TestFirstSnapshotNeverWaitsOnContracts(t *testing.T) {
 	bindings := isolationBindings("alpha", "beta")
-	g := newGateway(bindings)
+	for name, regs := range map[string][]registration{
+		"no contracts":     nil,
+		"missing contract": {contractFor("alpha", "/items", "listAlpha")},
+		"rejected contract": {contractFor("alpha", "/items", "listAlpha"),
+			contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n")},
+	} {
+		var active atomic.Pointer[snapshot]
+		rec := &reconciler{gateway: newGateway(bindings), active: &active}
+		rec.apply(func() ([]registration, error) { return regs, nil })
+		if active.Load() == nil {
+			t.Fatalf("%s: pod did not become ready", name)
+		}
+	}
 	var active atomic.Pointer[snapshot]
-	rec := &reconciler{gateway: g, active: &active}
+	rec := &reconciler{gateway: newGateway(bindings), active: &active}
 	apply := func(regs ...registration) { rec.apply(func() ([]registration, error) { return regs, nil }) }
-	apply()
-	if active.Load() != nil {
-		t.Fatal("ready with no contracts")
-	}
-	apply(contractFor("alpha", "/items", "listAlpha"))
-	if active.Load() != nil {
-		t.Fatal("ready with a missing contract")
-	}
-	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n"))
-	if active.Load() != nil {
-		t.Fatal("ready with a rejected contract")
-	}
 	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"))
-	if active.Load() == nil {
-		t.Fatal("not ready with a complete set")
-	}
 	// Once ready, a bad contract keeps last-good and a deletion drops the service.
 	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n"))
 	if active.Load() == nil || len(active.Load().routes) != 2 {
