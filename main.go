@@ -66,7 +66,43 @@ func upstreamOrigin(address string, local bool) (*url.URL, error) {
 	return target, nil
 }
 
+// dialVerified dials a TLS upstream when the config does its own verification.
+// The TLS state carries no server name for an IP literal (no SNI is sent), so
+// the dialed host is supplied to the verifier explicitly.
+func dialVerified(transport *http.Transport, base *tls.Config) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		config := base.Clone()
+		config.ServerName = host
+		config.VerifyConnection = func(state tls.ConnectionState) error {
+			state.ServerName = host
+			return base.VerifyConnection(state)
+		}
+		client := tls.Client(conn, config)
+		if err := client.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return client, nil
+	}
+}
+
 func newTransport(tlsConfig *tls.Config) *http.Transport {
+	transport := newBaseTransport(tlsConfig)
+	if tlsConfig != nil && tlsConfig.VerifyConnection != nil {
+		transport.DialTLSContext = dialVerified(transport, tlsConfig)
+	}
+	return transport
+}
+
+func newBaseTransport(tlsConfig *tls.Config) *http.Transport {
 	return &http.Transport{
 		TLSClientConfig: tlsConfig,
 		DialContext: (&net.Dialer{

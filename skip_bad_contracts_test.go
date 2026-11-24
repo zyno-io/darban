@@ -139,7 +139,7 @@ func TestDirectRouteWithoutGoodContractFailsClosedOnly(t *testing.T) {
 	}
 }
 
-func TestDeletedContractTombstoneAndContractOnlyPrefix(t *testing.T) {
+func TestDeletedContractRemovesServiceAndFailsDirectRouteClosed(t *testing.T) {
 	origin := teapotUpstream(t)
 	bindings := directRouteBindings(origin)
 	bindings.Services["other"] = serviceBinding{Prefix: "/other", Origin: origin}
@@ -151,24 +151,33 @@ func TestDeletedContractTombstoneAndContractOnlyPrefix(t *testing.T) {
 		t.Fatalf("served: %d", code)
 	}
 	h.apply(other)
-	// Direct route keeps proxying; the deny list is retained.
-	if code := h.get("/catalog/anything"); code != http.StatusTeapot {
-		t.Errorf("tombstoned direct route: %d, want 418", code)
+	// The service is gone: its direct route fails closed like a fresh pod.
+	if code := h.get("/catalog/anything"); code != http.StatusServiceUnavailable {
+		t.Errorf("direct route after deletion: %d, want 503", code)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
 	req.Host = bindings.Hostname
 	res := httptest.NewRecorder()
 	h.g.serve(h.active.Load(), res, req)
-	if res.Code != http.StatusNotFound {
-		t.Errorf("internal operation after deletion: %d, want 404", res.Code)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Errorf("internal operation after deletion: %d, want 503", res.Code)
 	}
-	if got := h.status()["catalog"]; got.State != stateNotInstalled || !strings.Contains(got.Reason, "retained deny list") {
+	got := h.status()["catalog"]
+	if got.State != stateDirectRouteClosed || !got.Missing || strings.Contains(got.Reason, "retained") || !strings.Contains(got.Reason, "503") {
 		t.Errorf("catalog status: %+v", got)
 	}
-	// A deleted contract without a direct route simply stops serving its prefix.
+	// The contract returns and the service is installed again.
+	h.apply(catalog, other)
+	if code := h.get("/catalog/prices"); code != http.StatusTeapot {
+		t.Errorf("restored: %d, want 418", code)
+	}
+	// A deleted contract without a direct route removes its prefix (404).
 	h.apply()
 	if code := h.get("/other/items"); code != http.StatusNotFound {
 		t.Errorf("deleted contract prefix: %d, want 404", code)
+	}
+	if got := h.status()["other"]; got.State != stateNotInstalled {
+		t.Errorf("other status: %+v", got)
 	}
 }
 

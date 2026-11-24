@@ -82,17 +82,17 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
 		t.Fatalf("internal operation returned %d while serving last-good", code)
 	}
-	// With the contract deleted, the tombstone keeps internal operations denied
-	// and the direct route keeps proxying everything else.
+	// With the contract deleted the service is gone: the direct route fails
+	// closed for everything, as on a fresh pod.
 	rec.apply(func() ([]registration, error) { return nil, nil })
-	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
-		t.Errorf("internal operation returned %d after deletion", code)
+	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusServiceUnavailable {
+		t.Errorf("internal operation returned %d after deletion, want 503", code)
+	}
+	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusServiceUnavailable {
+		t.Errorf("direct route returned %d after deletion, want 503", code)
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("upstream received %d requests", hits.Load())
-	}
-	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusTeapot {
-		t.Errorf("direct route returned %d after deletion", code)
 	}
 }
 
@@ -119,7 +119,7 @@ func TestNeverServedServiceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDeletedContractKeepsPublicAndLegacyPaths(t *testing.T) {
+func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer upstream.Close()
 	bindings := directRouteBindings(upstream.URL)
@@ -141,27 +141,23 @@ func TestDeletedContractKeepsPublicAndLegacyPaths(t *testing.T) {
 	rec.apply(func() ([]registration, error) {
 		return []registration{{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}}, nil
 	})
-	rec.apply(func() ([]registration, error) { return nil, nil })
-	for _, test := range []struct {
-		host, path string
-		want       int
-	}{
-		{"api.example.net", "/catalog/public/x", http.StatusNoContent},
-		{"catalog.example.net", "/public/x", http.StatusNoContent},
-		{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
-	} {
-		if got := probe(test.host, test.path); got != test.want {
-			t.Errorf("%s%s returned %d, want %d", test.host, test.path, got, test.want)
-		}
+	if got := probe("api.example.net", "/catalog/public/x"); got != http.StatusNoContent {
+		t.Fatalf("served: %d", got)
 	}
-	// The tombstone persists across passes and is replaced once a contract returns.
-	rec.apply(func() ([]registration, error) { return nil, nil })
-	req := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
-	req.Host = bindings.Hostname
-	res := httptest.NewRecorder()
-	g.serve(active.Load(), res, req)
-	if res.Code != http.StatusNotFound {
-		t.Fatalf("internal operation returned %d on a later pass", res.Code)
+	for pass := 0; pass < 2; pass++ {
+		rec.apply(func() ([]registration, error) { return nil, nil })
+		for _, test := range []struct {
+			host, path string
+			want       int
+		}{
+			{"api.example.net", "/catalog/public/x", http.StatusServiceUnavailable},
+			{"catalog.example.net", "/public/x", http.StatusServiceUnavailable},
+			{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
+		} {
+			if got := probe(test.host, test.path); got != test.want {
+				t.Errorf("pass %d: %s%s returned %d, want %d", pass, test.host, test.path, got, test.want)
+			}
+		}
 	}
 }
 

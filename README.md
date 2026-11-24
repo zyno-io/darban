@@ -208,6 +208,13 @@ version if it had one, when:
 - its prefix is a `serviceRoutes` prefix that the service does not own.
   Ownership means a bindings entry for the same service name with that
   prefix, and that service's `spec.prefix` must stay on it;
+- its prefix is reserved by a `bindings.services` entry of another service,
+  whether or not that service has a contract yet;
+- its prefix has a `serviceRoutes` direct route and its upstream (or bindings
+  `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`, so
+  a mount would make its `internal` deny list miss the public paths. A
+  `bindings.services` entry that combines a `mount` with a `serviceRoutes`
+  prefix is a startup error;
 - its prefix is the first path segment of `openapi.yamlPath`,
   `openapi.jsonPath` or `authorization.path`, which Darban serves or reserves.
 
@@ -256,8 +263,10 @@ uses TLS 1.2 or later and applies to every upstream transport.
 ```
 
 - With neither option, Darban verifies upstreams against the system roots.
+  The image ships the CA bundle at `/etc/ssl/certs/ca-certificates.crt`.
 - `caFile` verifies against only the certificates in that PEM bundle,
-  replacing the system roots. Hostname verification stays on. The file must
+  replacing the system roots. Hostname verification stays on, including for
+  IP targets, which must appear in the certificate's IP SANs. The file must
   parse at startup or Darban exits. It is re-read every 10 seconds, like the
   serving certificate. A bundle that fails to parse keeps the last good one
   and logs each distinct error once. New connections use the current bundle.
@@ -281,20 +290,17 @@ block the others once the gateway is running.
   legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
   is omitted. The other services update normally.
-- A service that was never accepted on this pod (its contract is bad, or a
-  `bindings.services` entry has no contract) is not installed: its public
-  prefix returns `404` like any unknown path. A service accepted earlier keeps
-  its last good unit while a later update is bad.
+- A service with no accepted contract is not installed: its public prefix
+  returns `404` like any unknown path. That covers a bad first contract, a
+  `bindings.services` entry with no contract, and a deleted `GatewayContract`.
+  Only a bad **update** keeps the service's last good unit in memory; deleting
+  the contract removes the service.
 - A service whose prefix has a `serviceRoutes` direct route (proxy-all minus
   the `internal` operations) needs its contract to know those operations.
-  With no good contract yet on this pod, only that direct route fails closed
-  with `503`. When the pod served the contract earlier (for example the
-  `GatewayContract` was deleted), Darban keeps its deny list as a tombstone:
-  `internal` operations stay denied, and everything else keeps proxying through
-  the direct route under its own path rules, including `publicPaths` and legacy
-  hosts. Rewrites into a service that is not installed are denied.
+  With no good contract, including after the contract was deleted, only that
+  direct route fails closed with `503` until a good contract arrives, exactly
+  as on a fresh pod. Rewrites into a service that is not installed are denied.
   Registration-only services keep proxying through `serviceRoutes`.
-  Deleting a contract with no direct route removes its prefix (`404`).
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and rewrites whose target operation is
   missing. Darban first keeps every service's last good contract, then tries
@@ -342,10 +348,10 @@ rejected. `lastRejection` holds the latest message and its RFC3339 time and
 remains after the contract is fixed. `missing` marks a bound service with no
 contract. `state` is the explicit outcome per service, with a `reason`:
 `serving`, `serving_last_good` (the current contract was rejected),
-`not_installed` (no good contract was ever accepted on this pod, or the
-contract was deleted and only a direct route's deny list remains), or
-`direct_route_closed` (the direct service route returns `503` until a good
-contract is seen). The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+`not_installed` (no accepted contract: never accepted, or deleted; the
+prefix returns `404`), or `direct_route_closed` (no accepted contract and the
+service has a direct route, which returns `503` until a good contract
+arrives). The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
 

@@ -336,6 +336,9 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 		if binding.Prefix == "" {
 			continue
 		}
+		if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.Mount != "" {
+			return bindings, fmt.Errorf("service %q has a mount, which a serviceRoutes prefix %s does not support", name, binding.Prefix)
+		}
 		if other, exists := prefixes[binding.Prefix]; exists {
 			return bindings, fmt.Errorf("prefix collision between %q and %q", name, other)
 		}
@@ -679,6 +682,9 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 	return nil
 }
 
+// aliasTarget is a rewrite destination. key.path is the target's upstream
+// path; assemble maps it to a public path with the binding the target is
+// actually served with.
 type aliasTarget struct {
 	key     operationKey
 	service string
@@ -715,7 +721,7 @@ type serviceOutcome struct {
 	serving   string
 	rejection string
 	missing   bool
-	// state and reason are set by the reconciler after tombstones apply.
+	// state and reason are set by the reconciler.
 	state  string
 	reason string
 }
@@ -730,8 +736,9 @@ type compileReport struct {
 }
 
 // registrationDigest identifies everything a compiled unit depends on: the
-// contract, its effective binding and the bindings of its rewrite targets.
-func registrationDigest(reg registration, binding serviceBinding, services map[string]serviceBinding) [sha256.Size]byte {
+// contract and its effective binding. Rewrite destinations are resolved against
+// the served target binding in assemble, so they are not part of it.
+func registrationDigest(reg registration, binding serviceBinding) [sha256.Size]byte {
 	hash := sha256.New()
 	visibility := "-"
 	if reg.defaultVisibility != nil {
@@ -740,18 +747,6 @@ func registrationDigest(reg registration, binding serviceBinding, services map[s
 	fmt.Fprintf(hash, "%q %q %q %q", reg.serviceName, reg.openAPI, reg.rewrites, visibility)
 	encoded, _ := json.Marshal(binding)
 	fmt.Fprintf(hash, " %s", encoded)
-	var rules []rewriteRule
-	if yaml.Unmarshal([]byte(reg.rewrites), &rules) == nil {
-		targets := make([]string, 0, len(rules))
-		for _, rule := range rules {
-			targets = append(targets, rule.To.ServiceName)
-		}
-		slices.Sort(targets)
-		for _, target := range slices.Compact(targets) {
-			encoded, _ := json.Marshal(services[target])
-			fmt.Fprintf(hash, " %q %s", target, encoded)
-		}
-	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
 	return digest
@@ -775,7 +770,7 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 	}
 	unit := &serviceUnit{
 		binding:          binding,
-		digest:           registrationDigest(reg, binding, bindings.Services),
+		digest:           registrationDigest(reg, binding),
 		openAPIDigest:    sha256.Sum256([]byte(reg.openAPI)),
 		registrationOnly: binding.RegistrationOnly,
 		native:           make(map[operationKey]sourceOperation),
@@ -792,16 +787,15 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 	}
 	for _, rule := range rules {
 		from := operationKey{rule.From.Method, rule.From.Path}
-		target, approved := bindings.Services[rule.To.ServiceName]
-		destination, mapped := target.publicPath(rule.To.Path)
-		if !approved || !mapped || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
+		_, approved := bindings.Services[rule.To.ServiceName]
+		if !approved || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
 			!literalPath.MatchString(from.path) {
 			return nil, errors.New("rewrite outside its registered service bindings")
 		}
 		if _, exists := unit.aliases[from]; exists {
 			return nil, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
 		}
-		unit.aliases[from] = aliasTarget{operationKey{from.method, destination}, rule.To.ServiceName}
+		unit.aliases[from] = aliasTarget{operationKey{from.method, rule.To.Path}, rule.To.ServiceName}
 	}
 	return unit, nil
 }
@@ -869,7 +863,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		if !ok {
 			continue
 		}
-		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding, effective) {
+		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding) {
 			current[name] = prev
 			continue
 		}
@@ -1106,14 +1100,19 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	})
 	for _, from := range aliasKeys {
 		alias := aliases[from]
-		if _, serving := units[alias.service]; !serving {
+		targetUnit, serving := units[alias.service]
+		if !serving {
 			// The target service has no serving contract. Deny the alias path so
 			// it cannot reach a direct service route.
 			delete(published, from)
 			out.denied = append(out.denied, from)
 			continue
 		}
-		to := alias.key
+		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
+		if !mapped {
+			return out, &assemblyError{owners[from], fmt.Errorf("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)}
+		}
+		to := operationKey{alias.key.method, destination}
 		original := native[from]
 		target, exists := native[to]
 		if original.visibility == visibilityInternal || target.visibility == visibilityInternal {

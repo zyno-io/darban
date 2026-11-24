@@ -111,6 +111,11 @@ func (v *upstreamVerifier) tlsConfig() *tls.Config {
 		// verification, against the current pool.
 		config.InsecureSkipVerify = true
 		config.VerifyConnection = func(state tls.ConnectionState) error {
+			// An empty name would skip hostname matching. The transports set
+			// it from the dialed host (see dialVerified), IP literals included.
+			if state.ServerName == "" {
+				return errors.New("upstream hostname unknown, refusing to verify without a name")
+			}
 			if len(state.PeerCertificates) == 0 {
 				return errors.New("upstream presented no certificate")
 			}

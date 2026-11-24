@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"log"
 	"maps"
 	"os"
@@ -95,58 +92,13 @@ type reconciler struct {
 	// overrides remembers the contract-over-binding messages already logged.
 	overrides map[string]string
 	now       func() time.Time
-	// tombstones keep the deny list of a service whose contract was deleted, by
-	// public prefix, so its internal operations stay denied without an outage.
-	tombstones map[string][]operationKey
-}
-
-// applyTombstones records each serving service's deny list and, for a service
-// that lost its contract after being served on this pod, restores that list and
-// lets the direct service route keep proxying. Services never served stay
-// unserved and fail closed.
-func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) map[string]bool {
-	if r.tombstones == nil {
-		r.tombstones = make(map[string][]operationKey)
-	}
-	var restored []string
-	restoredNames := make(map[string]bool)
-	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
-		binding := r.gateway.bindings.Services[name]
-		if binding.RegistrationOnly || binding.Prefix == "" {
-			continue
-		}
-		if report.accepted[name] != nil {
-			r.tombstones[binding.Prefix] = slices.DeleteFunc(slices.Clone(compiled.denied), func(key operationKey) bool {
-				return key.path != binding.Prefix && !strings.HasPrefix(key.path, binding.Prefix+"/")
-			})
-			continue
-		}
-		if denied, ok := r.tombstones[binding.Prefix]; ok {
-			restored = append(restored, binding.Prefix)
-			restoredNames[name] = true
-			compiled.denied = append(compiled.denied, denied...)
-		}
-	}
-	if len(restored) == 0 {
-		return restoredNames
-	}
-	slices.SortFunc(compiled.denied, compareOperationKeys)
-	compiled.denied = slices.Compact(compiled.denied)
-	compiled.unserved = slices.DeleteFunc(compiled.unserved, func(prefix string) bool { return slices.Contains(restored, prefix) })
-	hash := sha256.New()
-	fmt.Fprintf(hash, "%s tombstoned %v", compiled.revision, restored)
-	for _, key := range compiled.denied {
-		fmt.Fprintf(hash, " %s %s", key.method, key.path)
-	}
-	compiled.revision = hex.EncodeToString(hash.Sum(nil))
-	return restoredNames
 }
 
 // classify sets each service's explicit state and reason. Services whose
-// prefix has a direct service route fail closed (503) until the pod has seen a
-// good contract for them; every other unaccepted service is simply not
-// installed.
-func (r *reconciler) classify(report *compileReport, tombstoned map[string]bool) {
+// prefix has a direct service route fail closed (503) until a good contract
+// arrives, including after the contract was deleted; every other unaccepted
+// service is simply not installed.
+func (r *reconciler) classify(report *compileReport) {
 	bindings := r.gateway.bindings
 	names := make(map[string]bool, len(report.services)+len(bindings.Services))
 	for name := range report.services {
@@ -168,9 +120,6 @@ func (r *reconciler) classify(report *compileReport, tombstoned map[string]bool)
 			outcome.state, reason = stateServing, ""
 		case outcome.serving == servingLastGood:
 			outcome.state = stateServingLastGood
-		case tombstoned[name]:
-			outcome.state = stateNotInstalled
-			reason += "; direct service route keeps proxying with the retained deny list"
 		default:
 			outcome.state = stateNotInstalled
 			binding := bindings.Services[name]
@@ -197,8 +146,7 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
-	tombstoned := r.applyTombstones(&compiled, report)
-	r.classify(&report, tombstoned)
+	r.classify(&report)
 	r.logRejections(report)
 	r.logOverrides(report)
 	now := time.Now

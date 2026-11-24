@@ -3,9 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -139,6 +141,18 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 	}
 	if _, owns := bindings.ServiceRoutes[static.Prefix]; owns && static.Prefix != "" && binding.Prefix != static.Prefix {
 		return binding, "", fmt.Errorf("service owns the serviceRoutes prefix %s, so spec.prefix must match it", static.Prefix)
+	}
+	// A direct route proxies Prefix+X to upstream X, so a mount would make the
+	// deny keys (computed from the upstream paths) miss the public paths.
+	if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.Mount != "" {
+		return binding, "", fmt.Errorf("prefix %s has a serviceRoutes direct route, which cannot be combined with an upstream path or mount %q", binding.Prefix, binding.Mount)
+	}
+	// A bindings entry reserves its prefix for its own service, with or
+	// without a contract.
+	for _, other := range slices.Sorted(maps.Keys(bindings.Services)) {
+		if other != name && bindings.Services[other].Prefix == binding.Prefix {
+			return binding, "", fmt.Errorf("prefix %s is reserved by bindings.services.%s", binding.Prefix, other)
+		}
 	}
 	if reason, reserved := reservedPrefixes(bindings)[binding.Prefix]; reserved {
 		return binding, "", fmt.Errorf("prefix %s collides with %s", binding.Prefix, reason)
