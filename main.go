@@ -135,6 +135,7 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 
 type snapshot struct {
 	contractServices []string
+	unserved         map[string]bool
 	deniedTemplates  []operationKey
 	denied           map[operationKey]bool
 	revision         string
@@ -144,6 +145,7 @@ type snapshot struct {
 }
 
 type gateway struct {
+	contractStatus contractStatusStore
 	serviceProxies map[string]*httputil.ReverseProxy
 	legacyPrefixes map[string]string
 	bindings       upstreamBindings
@@ -183,11 +185,15 @@ func newGateway(bindings upstreamBindings) *gateway {
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
 		contractServices: compiled.contractServices,
+		unserved:         make(map[string]bool, len(compiled.unserved)),
 		denied:           make(map[operationKey]bool, len(compiled.denied)),
 		revision:         compiled.revision,
 		specYAML:         compiled.specYAML,
 		specJSON:         compiled.specJSON,
 		routes:           make(map[operationKey]registeredRoute, len(compiled.routes)),
+	}
+	for _, prefix := range compiled.unserved {
+		active.unserved[prefix] = true
 	}
 	for _, key := range compiled.denied {
 		if strings.Contains(key.path, "{") {
@@ -263,6 +269,12 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
+		// A contract-bound service with no serving contract has no deny list, so
+		// do not proxy its prefix.
+		if active.unserved[prefix] {
+			writeStatus(w, http.StatusServiceUnavailable)
+			return
+		}
 	}
 	key := operationKey{method, contractPath}
 	if active.denied[key] {
@@ -325,7 +337,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		compiled, err := compile(regs, bindings)
+		compiled, err := compileStrict(regs, bindings)
 		if err != nil {
 			log.Fatal(err)
 		}

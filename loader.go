@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -60,6 +64,13 @@ func loadLocal(path string) ([]registration, error) {
 	return regs, nil
 }
 
+// nameFromResource recovers the service name from an api-contract-<service>
+// resource name so a broken resource is isolated to its own service.
+func nameFromResource(name string) (string, bool) {
+	service, found := strings.CutPrefix(name, contractNamePrefix)
+	return service, found && serviceName.MatchString(service)
+}
+
 func registrationsFromStore(store cache.Store) ([]registration, error) {
 	items := store.List()
 	regs := make([]registration, 0, len(items))
@@ -70,9 +81,14 @@ func registrationsFromStore(store cache.Store) ([]registration, error) {
 		rewrites, hasRewrites := cm.Data["rewrites.yaml"]
 		if len(cm.BinaryData) != 0 || len(cm.Data) != 3 || !hasName || !hasSpec || !hasRewrites ||
 			cm.Name != contractNamePrefix+service {
-			return nil, fmt.Errorf("invalid registration ConfigMap %s", cm.Name)
+			invalid := fmt.Errorf("invalid registration ConfigMap %s", cm.Name)
+			if name, ok := nameFromResource(cm.Name); ok {
+				regs = append(regs, registration{serviceName: name, invalid: invalid})
+				continue
+			}
+			return nil, invalid
 		}
-		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites})
+		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites, created: cm.CreationTimestamp.Time})
 	}
 	return regs, nil
 }
@@ -92,26 +108,131 @@ type reconciler struct {
 	gateway   *gateway
 	active    *atomic.Pointer[snapshot]
 	lastError string
+	// lastGood holds the units serving in the active snapshot, by service.
+	lastGood map[string]*serviceUnit
+	logged   map[string]string
+	now      func() time.Time
+	held     string
+	// tombstones keep the deny list of a service whose contract was deleted, by
+	// public prefix, so its internal operations stay denied without an outage.
+	tombstones map[string][]operationKey
+}
+
+// applyTombstones records each serving service's deny list and, for a service
+// that lost its contract after being served on this pod, restores that list and
+// lets the direct service route keep proxying. Services never served stay
+// unserved and fail closed.
+func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) {
+	if r.tombstones == nil {
+		r.tombstones = make(map[string][]operationKey)
+	}
+	var restored []string
+	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
+		binding := r.gateway.bindings.Services[name]
+		if binding.RegistrationOnly {
+			continue
+		}
+		if report.accepted[name] != nil {
+			r.tombstones[binding.Prefix] = slices.DeleteFunc(slices.Clone(compiled.denied), func(key operationKey) bool {
+				return key.path != binding.Prefix && !strings.HasPrefix(key.path, binding.Prefix+"/")
+			})
+			continue
+		}
+		if denied, ok := r.tombstones[binding.Prefix]; ok {
+			restored = append(restored, binding.Prefix)
+			compiled.denied = append(compiled.denied, denied...)
+		}
+	}
+	if len(restored) == 0 {
+		return
+	}
+	slices.SortFunc(compiled.denied, compareOperationKeys)
+	compiled.denied = slices.Compact(compiled.denied)
+	compiled.unserved = slices.DeleteFunc(compiled.unserved, func(prefix string) bool { return slices.Contains(restored, prefix) })
+	hash := sha256.New()
+	fmt.Fprintf(hash, "%s tombstoned %v", compiled.revision, restored)
+	for _, key := range compiled.denied {
+		fmt.Fprintf(hash, " %s %s", key.method, key.path)
+	}
+	compiled.revision = hex.EncodeToString(hash.Sum(nil))
+}
+
+func (r *reconciler) firstSnapshotBlock(report compileReport) string {
+	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
+		if r.gateway.bindings.Services[name].RegistrationOnly {
+			continue
+		}
+		outcome := report.services[name]
+		if outcome.missing {
+			return fmt.Sprintf("service %s has no contract", name)
+		}
+		if outcome.rejection != "" {
+			return outcome.rejection
+		}
+	}
+	return ""
 }
 
 func (r *reconciler) apply(load func() ([]registration, error)) {
 	regs, err := load()
-	if err == nil {
-		var compiled candidate
-		compiled, err = compile(regs, r.gateway.bindings)
-		if err == nil {
-			old := r.active.Load()
-			if old == nil || old.revision != compiled.revision {
-				r.active.Store(r.gateway.build(compiled))
-				log.Printf("contract snapshot active revision=%s", compiled.revision)
+	if err != nil {
+		// Nothing was loaded, so keep serving what is active.
+		if message := err.Error(); message != r.lastError {
+			log.Printf("contract candidate rejected: %s", strings.ReplaceAll(message, "\n", " "))
+			r.lastError = message
+		}
+		return
+	}
+	r.lastError = ""
+	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
+	r.lastGood = report.accepted
+	r.applyTombstones(&compiled, report)
+	r.logRejections(report)
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	r.gateway.contractStatus.update(report, now())
+	old := r.active.Load()
+	if old == nil {
+		// A new pod only becomes ready with a complete, valid contract set, so a
+		// bad rollout never replaces serving pods. Once ready it keeps isolation.
+		if reason := r.firstSnapshotBlock(report); reason != "" {
+			if reason != r.held {
+				log.Printf("contract snapshot not ready: %s", reason)
+				r.held = reason
 			}
-			r.lastError = ""
 			return
 		}
+		r.held = ""
 	}
-	if message := err.Error(); message != r.lastError {
-		log.Printf("contract candidate rejected: %s", strings.ReplaceAll(message, "\n", " "))
-		r.lastError = message
+	if old == nil || old.revision != compiled.revision {
+		r.active.Store(r.gateway.build(compiled))
+		log.Printf("contract snapshot active revision=%s", compiled.revision)
+	}
+}
+
+// logRejections logs each service's rejection when its message changes.
+func (r *reconciler) logRejections(report compileReport) {
+	if r.logged == nil {
+		r.logged = make(map[string]string)
+	}
+	for _, name := range slices.Sorted(maps.Keys(report.services)) {
+		outcome := report.services[name]
+		if outcome.rejection == "" {
+			delete(r.logged, name)
+			continue
+		}
+		if r.logged[name] != outcome.rejection {
+			log.Printf("contract candidate rejected: %s (service=%s serving=%s)",
+				strings.ReplaceAll(outcome.rejection, "\n", " "), name, outcome.serving)
+			r.logged[name] = outcome.rejection
+		}
+	}
+	for name := range r.logged {
+		if _, present := report.services[name]; !present {
+			delete(r.logged, name)
+		}
 	}
 }
 

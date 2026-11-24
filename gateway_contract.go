@@ -124,7 +124,7 @@ func decodeGatewayContract(object *unstructured.Unstructured) (registration, err
 	}
 	return registration{
 		serviceName: spec.ServiceName, openAPI: string(openAPI), rewrites: string(rewrites),
-		defaultVisibility: spec.DefaultVisibility,
+		defaultVisibility: spec.DefaultVisibility, created: object.GetCreationTimestamp().Time,
 	}, nil
 }
 
@@ -134,7 +134,14 @@ func loadClusterRegistrations(legacy, current cache.Store) ([]registration, erro
 		object := item.(*unstructured.Unstructured)
 		reg, err := decodeGatewayContract(object)
 		if err != nil {
-			return nil, fmt.Errorf("GatewayContract %s: %w", object.GetName(), err)
+			// A broken contract rejects its own service. It must not fall back to
+			// the legacy ConfigMap, so it still takes the service's slot.
+			invalid := fmt.Errorf("GatewayContract %s: %w", object.GetName(), err)
+			name, ok := nameFromResource(object.GetName())
+			if !ok {
+				return nil, invalid
+			}
+			reg = registration{serviceName: name, invalid: invalid}
 		}
 		registrations[reg.serviceName] = reg
 	}

@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -22,6 +22,11 @@ type registration struct {
 	openAPI           string
 	rewrites          string
 	defaultVisibility *operationVisibility
+	// invalid marks a registration that could not be decoded. The compiler
+	// rejects the service instead of failing the whole contract set.
+	invalid error
+	// created orders conflicts between changed contracts. Zero when unknown.
+	created time.Time
 }
 
 type rewriteRule struct {
@@ -53,6 +58,23 @@ type operationSelection struct {
 type legacySecurity struct {
 	Source   securityRequirements
 	Profiles []string
+}
+
+func (l *legacySecurity) validate() error {
+	if l == nil {
+		return nil
+	}
+	if len(slices.Compact(slices.Sorted(slices.Values(l.Profiles)))) != len(l.Profiles) {
+		return errors.New("duplicate legacy profiles")
+	}
+	for i, requirement := range l.Source {
+		for _, other := range l.Source[i+1:] {
+			if sameRequirementSet(securityRequirements{requirement}, securityRequirements{other}) {
+				return errors.New("duplicate legacy source security requirements")
+			}
+		}
+	}
+	return nil
 }
 
 // Some backends already mount routes under their module name. Map that
@@ -192,11 +214,13 @@ type compiledOperation struct {
 
 type candidate struct {
 	contractServices []string
-	denied           []operationKey
-	routes           []compiledOperation
-	specYAML         []byte
-	specJSON         []byte
-	revision         string
+	// unserved lists public prefixes of bound services with no serving contract.
+	unserved []string
+	denied   []operationKey
+	routes   []compiledOperation
+	specYAML []byte
+	specJSON []byte
+	revision string
 }
 
 var (
@@ -263,6 +287,11 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 			return bindings, fmt.Errorf("prefix collision between %q and %q", name, other)
 		}
 		prefixes[binding.Prefix] = name
+		for _, operation := range binding.Operations {
+			if err := operation.Legacy.validate(); err != nil {
+				return bindings, fmt.Errorf("service %q: %w", name, err)
+			}
+		}
 		if binding.RegistrationOnly && len(binding.Operations) != 0 {
 			return bindings, fmt.Errorf("registration-only service %q cannot select operations", name)
 		}
@@ -338,15 +367,16 @@ func applyLegacySecurity(op map[string]any, source *sourceDoc, legacy *legacySec
 	if err != nil {
 		return err
 	}
-	if len(security) != len(legacy.Source) || (security == nil) != (legacy.Source == nil) {
-		return errors.New("legacy source security changed")
-	}
-	for _, expected := range legacy.Source {
-		if !slices.ContainsFunc(security, func(actual map[string][]string) bool {
-			return reflect.DeepEqual(actual, expected)
-		}) {
-			return errors.New("legacy source security changed")
+	target := make(securityRequirements, 0, len(legacy.Profiles))
+	for _, name := range legacy.Profiles {
+		if _, exists := allowed[name]; !exists {
+			return fmt.Errorf("unknown legacy credential profile %q", name)
 		}
+		target = append(target, map[string][]string{name: {}})
+	}
+	native := len(legacy.Profiles) != 0 && sameRequirementSet(security, target)
+	if !native && ((security == nil) != (legacy.Source == nil) || !sameRequirementSet(security, legacy.Source)) {
+		return errors.New("legacy source security changed")
 	}
 	if source.Components == nil {
 		source.Components = make(map[string]map[string]any)
@@ -355,17 +385,55 @@ func applyLegacySecurity(op map[string]any, source *sourceDoc, legacy *legacySec
 		source.Components["securitySchemes"] = make(map[string]any)
 	}
 	schemes := source.Components["securitySchemes"]
-	requirements := make(securityRequirements, 0, len(legacy.Profiles))
-	for _, name := range legacy.Profiles {
-		profile, exists := allowed[name]
-		if !exists {
-			return fmt.Errorf("unknown legacy credential profile %q", name)
+	if native {
+		// The service already emits the target security. Keep its operation and
+		// the schemes it declares, and only fill in a scheme it left out.
+		for _, name := range legacy.Profiles {
+			if _, declared := schemes[name]; !declared {
+				schemes[name] = map[string]any{"type": "http", "scheme": allowed[name].Scheme}
+			}
 		}
-		schemes[name] = map[string]any{"type": "http", "scheme": profile.Scheme}
-		requirements = append(requirements, map[string][]string{name: {}})
+		return nil
 	}
-	op["security"] = requirements
+	for _, name := range legacy.Profiles {
+		schemes[name] = map[string]any{"type": "http", "scheme": allowed[name].Scheme}
+	}
+	op["security"] = target
 	return nil
+}
+
+// sameRequirementSet compares security requirement objects as an unordered
+// set. A nil and an empty scope list are equal.
+func sameRequirementSet(a, b securityRequirements) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	same := func(x, y map[string][]string) bool {
+		if len(x) != len(y) {
+			return false
+		}
+		for name, scopes := range x {
+			other, exists := y[name]
+			if !exists || !slices.Equal(scopes, other) {
+				return false
+			}
+		}
+		return true
+	}
+	contains := func(set securityRequirements, item map[string][]string) bool {
+		return slices.ContainsFunc(set, func(other map[string][]string) bool { return same(item, other) })
+	}
+	for _, item := range b {
+		if !contains(a, item) {
+			return false
+		}
+	}
+	for _, item := range a {
+		if !contains(b, item) {
+			return false
+		}
+	}
+	return true
 }
 
 // Import only components referenced by a published operation. Prefix names
@@ -395,7 +463,8 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 	switch item := value.(type) {
 	case map[string]any:
 		copy := make(map[string]any, len(item))
-		for key, val := range item {
+		for _, key := range slices.Sorted(maps.Keys(item)) {
+			val := item[key]
 			switch key {
 			case "$ref":
 				ref, _ := val.(string)
@@ -469,8 +538,10 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 		selected[key] = operation.Legacy
 	}
 	matched := 0
-	for path, item := range source.Paths {
-		for key, value := range item {
+	for _, path := range slices.Sorted(maps.Keys(source.Paths)) {
+		item := source.Paths[path]
+		for _, key := range slices.Sorted(maps.Keys(item)) {
+			value := item[key]
 			legacy, included := selected[operationKey{key, path}]
 			excluded := len(selected) != 0 && !included
 			_, direct := bindings.ServiceRoutes[binding.Prefix]
@@ -574,69 +645,340 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 	return nil
 }
 
-func compile(regs []registration, bindings upstreamBindings) (candidate, error) {
-	var out candidate
+type aliasTarget struct {
+	key     operationKey
+	service string
+}
+
+// serviceUnit is one service's contract after per-service validation. It is
+// the unit of isolation: the compiler keeps, replaces or drops whole units.
+type serviceUnit struct {
+	digest           [sha256.Size]byte
+	openAPIDigest    [sha256.Size]byte
+	registrationOnly bool
+	native           map[operationKey]sourceOperation
+	aliases          map[operationKey]aliasTarget
+	denied           []operationKey
+}
+
+const (
+	servingCurrent  = "current"
+	servingLastGood = "last-good"
+	servingNone     = "none"
+)
+
+type serviceOutcome struct {
+	serving   string
+	rejection string
+	missing   bool
+}
+
+// compileReport describes what compile did with each service. accepted holds
+// the units that are serving and becomes the next call's lastGood.
+type compileReport struct {
+	services map[string]serviceOutcome
+	accepted map[string]*serviceUnit
+}
+
+func registrationDigest(reg registration) [sha256.Size]byte {
+	hash := sha256.New()
+	visibility := "-"
+	if reg.defaultVisibility != nil {
+		visibility = string(*reg.defaultVisibility)
+	}
+	fmt.Fprintf(hash, "%q %q %q %q", reg.serviceName, reg.openAPI, reg.rewrites, visibility)
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
+func compileService(reg registration, binding serviceBinding, bindings upstreamBindings, defaultVisibility operationVisibility) (*serviceUnit, error) {
+	fallback := defaultVisibility
+	if reg.defaultVisibility != nil {
+		if !reg.defaultVisibility.valid() {
+			return nil, errors.New("defaultVisibility must be public, unlisted, or internal")
+		}
+		fallback = *reg.defaultVisibility
+	}
+	source, err := parseOpenAPI(reg.openAPI)
+	if err != nil {
+		return nil, err
+	}
+	var rules []rewriteRule
+	if err := yaml.UnmarshalStrict([]byte(reg.rewrites), &rules); err != nil || rules == nil {
+		return nil, errors.New("requires a rewrites list")
+	}
+	unit := &serviceUnit{
+		digest:           registrationDigest(reg),
+		openAPIDigest:    sha256.Sum256([]byte(reg.openAPI)),
+		registrationOnly: binding.RegistrationOnly,
+		native:           make(map[operationKey]sourceOperation),
+		aliases:          make(map[operationKey]aliasTarget),
+	}
+	if binding.RegistrationOnly {
+		if len(rules) != 0 {
+			return nil, errors.New("registration-only service cannot define rewrites")
+		}
+		return unit, nil
+	}
+	if err := readOperations(reg.serviceName, source, binding, fallback, bindings, unit.native, &unit.denied); err != nil {
+		return nil, err
+	}
+	for _, rule := range rules {
+		from := operationKey{rule.From.Method, rule.From.Path}
+		target, approved := bindings.Services[rule.To.ServiceName]
+		destination, mapped := target.publicPath(rule.To.Path)
+		if !approved || !mapped || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
+			!literalPath.MatchString(from.path) {
+			return nil, errors.New("rewrite outside its registered service bindings")
+		}
+		if _, exists := unit.aliases[from]; exists {
+			return nil, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
+		}
+		unit.aliases[from] = aliasTarget{operationKey{from.method, destination}, rule.To.ServiceName}
+	}
+	return unit, nil
+}
+
+// compile builds one candidate from per-service contracts. A service whose
+// contract is unbound, invalid, or conflicts with another service is isolated:
+// it keeps its entry in lastGood when it has one, and is otherwise omitted.
+// Other services are unaffected.
+func compile(regs []registration, bindings upstreamBindings, lastGood map[string]*serviceUnit) (candidate, compileReport) {
 	defaultVisibility := visibilityPublic
 	if bindings.DefaultVisibility != nil {
 		defaultVisibility = *bindings.DefaultVisibility
 	}
-	registered := make(map[string]bool)
-	registrationOnlyDigests := make(map[string][sha256.Size]byte)
-	native := make(map[operationKey]sourceOperation)
-	aliases := make(map[operationKey]operationKey)
-	components := make(map[string]map[string]any)
-	for _, reg := range regs {
-		binding, exists := bindings.Services[reg.serviceName]
-		if !exists || registered[reg.serviceName] {
-			return out, fmt.Errorf("unknown or duplicate service %q", reg.serviceName)
-		}
-		registered[reg.serviceName] = true
-		fallback := defaultVisibility
-		if reg.defaultVisibility != nil {
-			if !reg.defaultVisibility.valid() {
-				return out, fmt.Errorf("service %s defaultVisibility must be public, unlisted, or internal", reg.serviceName)
+	report := compileReport{services: make(map[string]serviceOutcome)}
+	sorted := slices.SortedStableFunc(slices.Values(regs), func(a, b registration) int {
+		return strings.Compare(a.serviceName, b.serviceName)
+	})
+	count := make(map[string]int, len(sorted))
+	created := make(map[string]time.Time, len(sorted))
+	for _, reg := range sorted {
+		count[reg.serviceName]++
+		created[reg.serviceName] = reg.created
+	}
+	current := make(map[string]*serviceUnit)
+	rejected := make(map[string]string)
+	for _, reg := range sorted {
+		name := reg.serviceName
+		binding, bound := bindings.Services[name]
+		switch {
+		case !bound:
+			report.services[name] = serviceOutcome{serving: servingNone,
+				rejection: fmt.Sprintf("service %q is not in bindings.services; contract ignored", name)}
+		case count[name] > 1:
+			rejected[name] = fmt.Sprintf("service %s: duplicate contract registrations", name)
+		case reg.invalid != nil:
+			rejected[name] = fmt.Sprintf("service %s: %v", name, reg.invalid)
+		default:
+			if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg) {
+				current[name] = prev
+				continue
 			}
-			fallback = *reg.defaultVisibility
-		}
-		source, err := parseOpenAPI(reg.openAPI)
-		if err != nil {
-			return out, fmt.Errorf("service %s: %w", reg.serviceName, err)
-		}
-		var rules []rewriteRule
-		if err := yaml.UnmarshalStrict([]byte(reg.rewrites), &rules); err != nil || rules == nil {
-			return out, fmt.Errorf("service %s requires a rewrites list", reg.serviceName)
-		}
-		if binding.RegistrationOnly {
-			if len(rules) != 0 {
-				return out, fmt.Errorf("registration-only service %s cannot define rewrites", reg.serviceName)
+			unit, err := compileService(reg, binding, bindings, defaultVisibility)
+			if err != nil {
+				rejected[name] = fmt.Sprintf("service %s: %v", name, err)
+				continue
 			}
-			registrationOnlyDigests[reg.serviceName] = sha256.Sum256([]byte(reg.openAPI))
-			continue
+			current[name] = unit
 		}
-		if err := readOperations(reg.serviceName, source, binding, fallback, bindings, native, &out.denied); err != nil {
-			return out, fmt.Errorf("service %s: %w", reg.serviceName, err)
-		}
-		for _, rule := range rules {
-			from := operationKey{rule.From.Method, rule.From.Path}
-			target, approved := bindings.Services[rule.To.ServiceName]
-			destination, mapped := target.publicPath(rule.To.Path)
-			if !approved || !mapped || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
-				!literalPath.MatchString(from.path) {
-				return out, fmt.Errorf("service %s has a rewrite outside its registered service bindings", reg.serviceName)
-			}
-			if _, exists := aliases[from]; exists {
-				return out, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
-			}
-			aliases[from] = operationKey{from.method, destination}
+	}
+	preferred := maps.Clone(current)
+	for name := range rejected {
+		if prev := lastGood[name]; prev != nil {
+			preferred[name] = prev
 		}
 	}
 
+	out, accepted, conflicts := selectUnits(preferred, lastGood, created, bindings)
+	report.accepted = accepted
+	for name := range count {
+		if _, bound := bindings.Services[name]; !bound {
+			continue
+		}
+		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name]}
+		if message, failed := conflicts[name]; failed {
+			outcome.rejection = message
+		}
+		if unit := accepted[name]; unit != nil {
+			outcome.serving = servingLastGood
+			if unit == current[name] {
+				outcome.serving = servingCurrent
+			}
+		}
+		report.services[name] = outcome
+	}
 	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
-		if !bindings.Services[name].RegistrationOnly && !registered[name] {
+		if !bindings.Services[name].RegistrationOnly && count[name] == 0 {
+			report.services[name] = serviceOutcome{serving: servingNone, missing: true}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
+		if binding := bindings.Services[name]; !binding.RegistrationOnly && accepted[name] == nil {
+			out.unserved = append(out.unserved, binding.Prefix)
+		}
+	}
+	return out, report
+}
+
+// compileStrict treats any rejected, unbound or missing contract as an error.
+// It is for one-shot use such as -print-spec.
+func compileStrict(regs []registration, bindings upstreamBindings) (candidate, error) {
+	out, report := compile(regs, bindings, nil)
+	for _, name := range slices.Sorted(maps.Keys(report.services)) {
+		outcome := report.services[name]
+		if outcome.rejection != "" {
+			return out, errors.New(outcome.rejection)
+		}
+		if outcome.missing {
 			return out, fmt.Errorf("missing contract for service %q", name)
 		}
 	}
-	out.contractServices = slices.Sorted(maps.Keys(registered))
+	for _, name := range slices.Sorted(maps.Keys(report.accepted)) {
+		unit := report.accepted[name]
+		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
+			if target := unit.aliases[from].service; report.accepted[target] == nil {
+				return out, fmt.Errorf("service %s: rewrite %s %s targets service %q without a contract", name, from.method, from.path, target)
+			}
+		}
+	}
+	return out, nil
+}
+
+// selectUnits assembles every preferred unit together. When that fails it
+// starts from every service's last-good unit, which is valid because a subset
+// of a previously valid set is valid. It then tries to upgrade each changed
+// established service, then admits services that have no last-good unit, each
+// group ordered by contract creation time (older first) and then service name.
+// When admitting a unit fails, one unit is rejected and admission restarts
+// from the seed without it, so every undo is re-validated. The rejected unit
+// is the one being admitted, unless the failure lies in another unit that was
+// itself admitted in this pass (for example a rewrite owner), which is
+// rejected instead. A service with a last-good unit therefore ends up current
+// or last-good, never omitted. Among new contracts the older one wins. A pod
+// that already serves last-good units may differ from a fresh pod when an old
+// and a changed contract conflict.
+func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string]time.Time, bindings upstreamBindings) (candidate, map[string]*serviceUnit, map[string]string) {
+	if out, err := assemble(preferred, bindings, ""); err == nil {
+		return out, preferred, nil
+	}
+	order := slices.SortedFunc(maps.Keys(preferred), func(a, b string) int {
+		if c := created[a].Compare(created[b]); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	})
+	conflicts := make(map[string]string)
+	rejected := make(map[string]bool)
+	seed := make(map[string]*serviceUnit)
+	for _, name := range order {
+		if unit := lastGood[name]; unit != nil {
+			seed[name] = unit
+		}
+	}
+	for {
+		_, err := assemble(seed, bindings, "")
+		if err == nil {
+			break
+		}
+		// Cannot happen while bindings are fixed. Drop only the service at fault.
+		bad := faultService(err)
+		if _, present := seed[bad]; !present {
+			clear(seed)
+			break
+		}
+		conflicts[bad] = fmt.Sprintf("service %s: %v", bad, err)
+		delete(seed, bad)
+	}
+restart:
+	for {
+		accepted := maps.Clone(seed)
+		for _, established := range []bool{true, false} {
+			for _, name := range order {
+				unit := preferred[name]
+				if (lastGood[name] != nil) != established || accepted[name] == unit || rejected[name] {
+					continue
+				}
+				previous, had := accepted[name]
+				accepted[name] = unit
+				_, err := assemble(accepted, bindings, name)
+				if err == nil {
+					continue
+				}
+				if had {
+					accepted[name] = previous
+				} else {
+					delete(accepted, name)
+				}
+				culprit := faultService(err)
+				if other, present := accepted[culprit]; culprit != "" && culprit != name && present && other != lastGood[culprit] {
+					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
+					rejected[culprit] = true
+				} else {
+					if culprit != "" && culprit != name {
+						conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
+					} else {
+						conflicts[name] = fmt.Sprintf("service %s: %v", name, err)
+					}
+					rejected[name] = true
+				}
+				continue restart
+			}
+		}
+		out, err := assemble(accepted, bindings, "")
+		if err != nil {
+			// Unreachable: every admitted step was validated. Fall back to the seed.
+			out, _ = assemble(seed, bindings, "")
+			return out, seed, conflicts
+		}
+		return out, accepted, conflicts
+	}
+}
+
+// assemblyError names the service whose contract caused a cross-service
+// failure, so the compiler can reject that service.
+type assemblyError struct {
+	service string
+	err     error
+}
+
+func (e *assemblyError) Error() string { return e.err.Error() }
+func (e *assemblyError) Unwrap() error { return e.err }
+
+func faultService(err error) string {
+	var fault *assemblyError
+	if errors.As(err, &fault) {
+		return fault.service
+	}
+	return ""
+}
+
+// assemble merges validated units into one candidate and runs the checks that
+// span services: rewrites, route and OpenAPI endpoint conflicts, duplicate
+// operationIds and component imports.
+func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) (candidate, error) {
+	var out candidate
+	registrationOnlyDigests := make(map[string][sha256.Size]byte)
+	native := make(map[operationKey]sourceOperation)
+	aliases := make(map[operationKey]aliasTarget)
+	owners := make(map[operationKey]string)
+	components := make(map[string]map[string]any)
+	out.contractServices = slices.Sorted(maps.Keys(units))
+	for _, name := range out.contractServices {
+		unit := units[name]
+		if unit.registrationOnly {
+			registrationOnlyDigests[name] = unit.openAPIDigest
+			continue
+		}
+		maps.Copy(native, unit.native)
+		maps.Copy(aliases, unit.aliases)
+		for from := range unit.aliases {
+			owners[from] = name
+		}
+		out.denied = append(out.denied, unit.denied...)
+	}
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
 	for key, op := range native {
@@ -646,7 +988,22 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 			published[key] = op
 		}
 	}
-	for from, to := range aliases {
+	// Check rewrites in a stable order, those owned by the service being
+	// admitted first, so the reported fault does not depend on map order.
+	aliasKeys := slices.SortedFunc(maps.Keys(aliases), compareOperationKeys)
+	slices.SortStableFunc(aliasKeys, func(a, b operationKey) int {
+		return cmpBool(owners[b] == prefer, owners[a] == prefer)
+	})
+	for _, from := range aliasKeys {
+		alias := aliases[from]
+		if _, serving := units[alias.service]; !serving {
+			// The target service has no serving contract. Deny the alias path so
+			// it cannot reach a direct service route.
+			delete(published, from)
+			out.denied = append(out.denied, from)
+			continue
+		}
+		to := alias.key
 		original := native[from]
 		target, exists := native[to]
 		if original.visibility == visibilityInternal || target.visibility == visibilityInternal {
@@ -656,7 +1013,7 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		}
 		_, targetRewritten := aliases[to]
 		if !exists || targetRewritten {
-			return out, fmt.Errorf("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)
+			return out, &assemblyError{owners[from], fmt.Errorf("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)}
 		}
 		if original.visibility == visibilityUnlisted {
 			target.visibility = visibilityUnlisted
@@ -668,9 +1025,10 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 	paths := make(map[string]map[string]any)
 	operationIDs := make(map[string]operationKey)
 	unlistedComponents := make(map[string]map[string]any)
-	for key, source := range published {
+	for _, key := range slices.SortedFunc(maps.Keys(published), compareOperationKeys) {
+		source := published[key]
 		if key.path == bindings.OpenAPI.YAMLPath || key.path == bindings.OpenAPI.JSONPath {
-			return out, fmt.Errorf("OpenAPI endpoint conflicts with route %s %s", key.method, key.path)
+			return out, &assemblyError{source.service, fmt.Errorf("OpenAPI endpoint conflicts with route %s %s", key.method, key.path)}
 		}
 		out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.credentials})
 		operationComponents := components
@@ -679,7 +1037,7 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		}
 		normalized, err := importReferences(source.doc, source.service, *source.source, operationComponents)
 		if err != nil {
-			return out, fmt.Errorf("%s %s: %w", key.method, key.path, err)
+			return out, &assemblyError{source.service, fmt.Errorf("%s %s: %w", key.method, key.path, err)}
 		}
 		if source.visibility == visibilityUnlisted {
 			continue
@@ -689,14 +1047,14 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		}
 		operation := normalized.(map[string]any)
 		if err := applyTagOptions(operation, source.service, bindings.OpenAPI); err != nil {
-			return out, fmt.Errorf("%s %s: %w", key.method, key.path, err)
+			return out, &assemblyError{source.service, fmt.Errorf("%s %s: %w", key.method, key.path, err)}
 		}
 		security := make(securityRequirements, 0, len(source.requirements))
 		for _, alternative := range source.requirements {
 			for profile, scopes := range alternative {
 				name, err := importComponent(source.service, "securitySchemes", profile, *source.source, components)
 				if err != nil {
-					return out, err
+					return out, &assemblyError{source.service, err}
 				}
 				security = append(security, map[string][]string{name: scopes})
 			}
@@ -704,7 +1062,8 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 		operation["security"] = security
 		if id := source.operationID; id != "" {
 			if other, exists := operationIDs[id]; exists {
-				return out, fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)
+				// Both services are at fault, so name neither.
+				return out, &assemblyError{"", fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)}
 			}
 			operationIDs[id] = key
 			operation["operationId"] = id
@@ -735,6 +1094,7 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 	})
 	hash := sha256.New()
 	hash.Write(out.specYAML)
+	fmt.Fprintf(hash, "services %v\n", out.contractServices)
 	for _, name := range slices.Sorted(maps.Keys(registrationOnlyDigests)) {
 		fmt.Fprintf(hash, "registered %s %x\n", name, registrationOnlyDigests[name])
 	}
@@ -748,6 +1108,17 @@ func compile(regs []registration, bindings upstreamBindings) (candidate, error) 
 	}
 	out.revision = hex.EncodeToString(hash.Sum(nil))
 	return out, nil
+}
+
+func cmpBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	default:
+		return -1
+	}
 }
 
 func compareOperationKeys(a, b operationKey) int {

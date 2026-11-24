@@ -251,7 +251,7 @@ paths:
       x-darban-visibility: internal
 `,
 	}
-	compiled, err := compile([]registration{reg}, bindings)
+	compiled, err := compileStrict([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ paths:
 		t.Fatalf("unexpected internal routes: %v", compiled.denied)
 	}
 	reg.openAPI = strings.ReplaceAll(reg.openAPI, "internal", "unlisted")
-	withoutDenial, err := compile([]registration{reg}, bindings)
+	withoutDenial, err := compileStrict([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}

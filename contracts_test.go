@@ -97,7 +97,7 @@ components:
 		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Origin: backend.URL}},
 	}
 	reg := registration{serviceName: "observatory", openAPI: raw, rewrites: rewrites}
-	compiled, err := compile([]registration{reg}, bindings)
+	compiled, err := compileStrict([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ components:
 		}
 	}
 	reg.openAPI = strings.Replace(raw, "security: [{sessionBearer: []}]", "security: [{clientBasic: []}]", 1)
-	changed, err := compile([]registration{reg}, bindings)
+	changed, err := compileStrict([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ components:
 		t.Fatal("changing only an unlisted route's auth policy should change the active revision")
 	}
 	reg.openAPI = strings.Replace(raw, "x-darban-visibility: unlisted", "x-darban-visibility: true", 1)
-	if _, err := compile([]registration{reg}, bindings); err == nil {
+	if _, err := compileStrict([]registration{reg}, bindings); err == nil {
 		t.Fatal("accepted a boolean visibility")
 	}
 }
@@ -179,7 +179,7 @@ paths:
 		Services: map[string]serviceBinding{"observatory": binding},
 	}
 	reg := registration{serviceName: "observatory", openAPI: raw, rewrites: "[]"}
-	got, err := compile([]registration{reg}, bindings)
+	got, err := compileStrict([]registration{reg}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,11 +189,11 @@ paths:
 	}
 
 	reg.openAPI = strings.Replace(raw, "    get:\n", "    get:\n      security: []\n", 1)
-	if _, err := compile([]registration{reg}, bindings); err == nil {
+	if _, err := compileStrict([]registration{reg}, bindings); err == nil {
 		t.Fatal("selected operation accepted with a changed security policy")
 	}
 	reg.openAPI = strings.Replace(raw, "    get:\n", "    get:\n      x-darban-visibility: internal\n", 1)
-	got, err = compile([]registration{reg}, bindings)
+	got, err = compileStrict([]registration{reg}, bindings)
 	if err != nil || len(got.routes) != 0 || strings.Contains(string(got.specYAML), "/sky/objects") {
 		t.Fatalf("selected internal operation must be removed from the active snapshot: %v", err)
 	}
@@ -226,11 +226,11 @@ func TestLocalAndConfigMapCandidatesMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := compile(local, bindings)
+	want, err := compileStrict(local, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := compile(watched, bindings)
+	got, err := compileStrict(watched, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ components:
 		{serviceName: "observatory", openAPI: raw, rewrites: rewrites, defaultVisibility: &unlisted},
 		{serviceName: "herbarium", openAPI: strings.Replace(raw, "readListed", "ReadHerbarium", 1), rewrites: "[]"},
 	}
-	withoutDocs, err := compile(regs, bindings)
+	withoutDocs, err := compileStrict(regs, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ components:
 	}
 
 	bindings.OpenAPI = openAPIConfig{YAMLPath: "/docs/openapi.yaml", JSONPath: "/docs/openapi.json", OmitOperationExtensionPrefixes: []string{"x-publisher-"}}
-	compiled, err := compile(regs, bindings)
+	compiled, err := compileStrict(regs, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ components:
 		}
 	}
 	bindings.OpenAPI.YAMLPath = "/observatory/listed"
-	if _, err := compile(regs, bindings); err == nil {
+	if _, err := compileStrict(regs, bindings); err == nil {
 		t.Fatal("accepted an OpenAPI endpoint that would shadow an operation")
 	}
 }
@@ -464,7 +464,7 @@ paths:
 		"night-sky": {Prefix: "/night-sky"},
 		"catalog":   {Prefix: "/catalog"},
 	}}
-	_, err := compile(regs, bindings)
+	_, err := compileStrict(regs, bindings)
 	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "listObjects"`) {
 		t.Fatalf("expected duplicate upstream operationId to be rejected, got %v", err)
 	}
@@ -512,7 +512,7 @@ func TestRegistrationOnlyContractDoesNotChangePublishedRoutes(t *testing.T) {
 		Prefix:           "/archive",
 		RegistrationOnly: true,
 	}
-	before, err := compile(registrations, bindings)
+	before, err := compileStrict(registrations, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -529,7 +529,7 @@ paths:
 `,
 		rewrites: "[]",
 	}
-	after, err := compile(append(registrations, catalog), bindings)
+	after, err := compileStrict(append(registrations, catalog), bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,16 +541,16 @@ paths:
 	if !slices.Contains(after.contractServices, "archive") || before.revision == after.revision {
 		t.Fatal("the active snapshot does not account for the new registration")
 	}
-	if _, err := compile([]registration{catalog}, bindings); err == nil {
+	if _, err := compileStrict([]registration{catalog}, bindings); err == nil {
 		t.Fatal("missing contract for an active route binding was accepted")
 	}
 	catalog.rewrites = "[{}]"
-	if _, err := compile(append(registrations, catalog), bindings); err == nil {
+	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
 		t.Fatal("registration-only rewrite was accepted")
 	}
 	catalog.rewrites = "[]"
 	catalog.openAPI = "openapi: 3.0.0"
-	if _, err := compile(append(registrations, catalog), bindings); err == nil {
+	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
 		t.Fatal("invalid registration-only OpenAPI was accepted")
 	}
 }
