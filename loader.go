@@ -89,6 +89,8 @@ type reconciler struct {
 	// lastGood holds the units serving in the active snapshot, by service.
 	lastGood map[string]*serviceUnit
 	logged   map[string]string
+	// warned holds the last logged rewrite warning per service.
+	warned map[string]string
 	// overrides remembers the contract-over-binding messages already logged.
 	overrides map[string]string
 	now       func() time.Time
@@ -183,6 +185,25 @@ func (r *reconciler) logRejections(report compileReport) {
 	for name := range r.logged {
 		if _, present := report.services[name]; !present {
 			delete(r.logged, name)
+		}
+	}
+	if r.warned == nil {
+		r.warned = make(map[string]string)
+	}
+	for _, name := range slices.Sorted(maps.Keys(report.services)) {
+		warning := report.services[name].warning
+		if warning == "" {
+			delete(r.warned, name)
+			continue
+		}
+		if r.warned[name] != warning {
+			log.Printf("contract rewrite denied: %s (service=%s)", strings.ReplaceAll(warning, "\n", " "), name)
+			r.warned[name] = warning
+		}
+	}
+	for name := range r.warned {
+		if _, present := report.services[name]; !present {
+			delete(r.warned, name)
 		}
 	}
 }
