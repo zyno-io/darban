@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -106,9 +107,9 @@ func routePrefix(rawPath string) string {
 	return "/" + prefix
 }
 
-func newServiceProxies(bindings upstreamBindings) map[string]*httputil.ReverseProxy {
+func newServiceProxies(bindings upstreamBindings, tlsConfig *tls.Config) map[string]*httputil.ReverseProxy {
 	proxies := make(map[string]*httputil.ReverseProxy, len(bindings.ServiceRoutes))
-	transport := newTransport()
+	transport := newTransport(tlsConfig)
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	for prefix, route := range bindings.ServiceRoutes {
 		target, _ := url.Parse(route.Origin)

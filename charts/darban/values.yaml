@@ -5,6 +5,13 @@ replicas: 2
 bindings:
   contractAPIGroup: darban.zyno.io
 
+# Trust a private CA for HTTPS upstreams. Set at most one of the two names.
+# When unset, upstreams are verified against the system roots.
+upstreamTLS:
+  caSecretName: ''
+  caConfigMapName: ''
+  key: ca.crt
+
 ingress:
   enabled: false
   namespace: ''

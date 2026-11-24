@@ -3,7 +3,7 @@
 Darban is an OpenAPI-driven HTTP reverse proxy by Zyno Consulting. It routes
 HTTP APIs through one hostname. It watches service
 contracts, compiles routes and combined OpenAPI into one immutable snapshot,
-and keeps the last accepted snapshot if an update fails validation.
+and keeps each service's last accepted contract if an update fails validation.
 
 ## Development
 
@@ -17,7 +17,15 @@ Set `-namespace` for Kubernetes discovery or `-manifest` for local files.
 The gateway reads bindings JSON from `/config/bindings.json` and its TLS
 certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
-namespaced `GatewayContract` resources under `contractAPIGroup`.
+namespaced `GatewayContract` resources under `contractAPIGroup`. A contract
+names its own upstream (see [Contract upstreams](#contract-upstreams)), so a
+backend can join the gateway without a bindings entry.
+
+`bindings.services` entries are optional overrides. A contract that sets
+`spec.upstream` needs none. Use an entry for what only bindings carry:
+`operations` (with `legacy`), `debugOrigin` and `registrationOnly`. Its
+`origin`, `prefix` and `mount` are the transition fallback for contracts
+that do not yet set `spec.upstream`, and are validated when present.
 
 Set `registrationOnly: true` on a service binding to accept the backend's
 contract ahead of routing migration. The contract is optional at startup, and
@@ -149,12 +157,67 @@ Install the [GatewayContract CRD](deploy/gateway-contract-crd.yaml) before
 deploying Darban. The Helm chart and CRD use `darban.zyno.io` by default.
 For a different group, install the same CRD with that group and set
 `bindings.contractAPIGroup` to match. Name each contract
-`api-contract-<serviceName>`. Specify `spec.serviceName`, `spec.rewrites`, and
+`api-contract-<serviceName>`. Specify `spec.serviceName`, `spec.upstream`, `spec.rewrites`, and
 one of `spec.openapi.yaml` or `spec.openapi.gzipBase64`. Set `spec.openapi.sha256`
 to the SHA-256 of the original YAML. The gateway caps the inline field at
 1,400,000 bytes and decoded gzip at 16 MiB. Kubernetes and Helm storage limits
-also apply. Legacy ConfigMaps can register contracts using the
-`<contractAPIGroup>/contract=true` label. A `GatewayContract` takes precedence.
+also apply.
+
+### Contract upstreams
+
+Every `GatewayContract` in the watched namespace is a candidate. It names
+its backend with `spec.upstream`, a URL, and its public path with the optional
+`spec.prefix`:
+
+```yaml
+apiVersion: darban.zyno.io/v1alpha1
+kind: GatewayContract
+metadata:
+  name: api-contract-hosting
+spec:
+  serviceName: hosting
+  upstream: http://hosting-manager.zyno-alpha.svc.cluster.local/hosting
+  prefix: /hosting
+  openapi: { yaml: "...", sha256: "..." }
+  rewrites: []
+```
+
+- Scheme is `http` or `https`. The host must be a Service in the contract's own
+  namespace: `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc` or
+  `<svc>.<ns>.svc.cluster.local`, with `<ns>` equal to that namespace and `<svc>`
+  a DNS-1035 label. Darban normalises to the full form. The port defaults to
+  80 for `http` and 443 for `https`, and is stored explicitly.
+- A path is the upstream mount. It replaces the bindings `mount`, must be
+  literal, and must not end with `/`. Query, fragment and userinfo are rejected.
+- `spec.prefix` defaults to `/<serviceName>` and is one public segment.
+  `https` upstreams use the `upstreamTLS` settings below.
+- Without `spec.upstream`, the contract uses `bindings.services.<name>`'s
+  `origin`, `prefix` and `mount`. With neither, it is rejected. When both
+  exist, the contract wins and Darban logs the disagreement once per
+  distinct value.
+- In a local manifest, a contract entry may set `upstream` and `prefix` and
+  may use loopback hosts. There is no namespace check.
+
+Each contract is admitted or rejected on its own, with the reason in
+`/status` and the logs. A contract is rejected, and keeps its last good
+version if it had one, when:
+
+- its upstream URL is invalid or in another namespace;
+- its prefix collides with another contract: the older `creationTimestamp`
+  keeps serving, then the lower service name;
+- its prefix is a `serviceRoutes` prefix that the service does not own.
+  Ownership means a bindings entry for the same service name with that
+  prefix, and that service's `spec.prefix` must stay on it;
+- its prefix is reserved by a `bindings.services` entry of another service
+  (its `prefix`, or `/<name>` when it has none, `registrationOnly` included),
+  whether or not that service has a contract yet;
+- its prefix has a `serviceRoutes` direct route and its upstream (or bindings
+  `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`, so
+  a mount would make its `internal` deny list miss the public paths. A
+  `bindings.services` entry that combines a `mount` with a `serviceRoutes`
+  prefix is a startup error;
+- its prefix is the first path segment of `openapi.yamlPath`,
+  `openapi.jsonPath` or `authorization.path`, which Darban serves or reserves.
 
 ### Installing the chart
 
@@ -189,36 +252,67 @@ chart creates a ClusterIP Service. Set `ingress.enabled`, `ingress.namespace`,
 and `ingress.gatewayName` to restrict its traffic port to a Gateway API
 controller's labeled pods.
 
+### HTTPS upstreams
+
+Service origins (`services[*].origin`, `debugOrigin`, `serviceRoutes[*].origin`)
+and `authz` accept `http://` or `https://`. The host rules, the required port
+and the ban on path, query, userinfo and fragment are unchanged. Upstream TLS
+uses TLS 1.2 or later and applies to every upstream transport.
+
+```json
+"upstreamTLS": { "caFile": "/etc/darban/upstream-ca/ca.crt", "insecureSkipVerify": false }
+```
+
+- With neither option, Darban verifies upstreams against the system roots.
+  The image ships the CA bundle at `/etc/ssl/certs/ca-certificates.crt`.
+- `caFile` verifies against only the certificates in that PEM bundle,
+  replacing the system roots. Hostname verification stays on, including for
+  IP targets, which must appear in the certificate's IP SANs. The file must
+  parse at startup or Darban exits. It is re-read every 10 seconds, like the
+  serving certificate. A bundle that fails to parse keeps the last good one
+  and logs each distinct error once. New connections use the current bundle.
+- `insecureSkipVerify: true` disables verification and logs a warning at
+  startup. Setting it together with `caFile` is a configuration error.
+
+In the chart, set `upstreamTLS.caSecretName` or `upstreamTLS.caConfigMapName`
+(not both) and optionally `upstreamTLS.key` (default `ca.crt`). The chart
+mounts it at `/etc/darban/upstream-ca` and sets `bindings.upstreamTLS.caFile`
+to match. Leaving them unset changes nothing.
+
 ### Contract isolation
 
 Darban compiles each service's contract on its own, so one service cannot
 block the others once the gateway is running.
 
-- A contract for a service that is not in `bindings.services` is ignored,
-  logged, and reported in `/status`.
+- A contract for a service that is not in `bindings.services` is admitted
+  when it sets `spec.upstream`. Without an upstream or a bindings origin it is
+  rejected, logged, and reported in `/status`.
 - If a service's contract fails to compile (invalid OpenAPI or visibility,
   legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
   is omitted. The other services update normally.
-- A bound service without a serving contract is omitted from the contract
-  routes. If it is not `registrationOnly`, Darban handles its direct
-  `serviceRoutes` entry as follows. When the pod served the service's
-  contract earlier (for example the `GatewayContract` was deleted), Darban
-  keeps that contract's deny list as a tombstone: `internal` operations stay
-  denied, and everything else keeps proxying through the direct route under
-  its own path rules, including `publicPaths` and legacy hosts. When the pod
-  has never served a contract for it, the prefix fails closed with `503`,
-  because the gateway has no list of its `internal` operations. Rewrites into
-  an omitted service are denied. Registration-only services keep proxying
-  through `serviceRoutes`.
+- A service with no accepted contract is not installed: its public prefix
+  returns `404` like any unknown path. That covers a bad first contract, a
+  `bindings.services` entry with no contract, and a deleted `GatewayContract`.
+  Only a bad **update** keeps the service's last good unit in memory; deleting
+  the contract removes the service.
+- A service whose prefix has a `serviceRoutes` direct route (proxy-all minus
+  the `internal` operations) needs its contract to know those operations.
+  With no good contract, including after the contract was deleted, only that
+  direct route fails closed with `503` until a good contract arrives, exactly
+  as on a fresh pod. Rewrites into a service that is not installed are denied.
+  Registration-only services keep proxying through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
-  that shadow the OpenAPI endpoints, and rewrites whose target operation is
-  missing. Darban first keeps every service's last good contract, then tries
+  that shadow the OpenAPI endpoints, and prefix collisions. Darban first keeps every service's last good contract, then tries
   each changed contract and keeps the last good one when the change conflicts.
   After each rejection the selection restarts from the last good contracts, so a
   service with a last good contract is only ever current or last-good.
-  A rewrite error rejects the service that declares the rewrite. A service
-  that was never good is admitted after the established ones. Among new or
+  A rewrite whose served target lacks the destination (missing or rewritten
+  operation, or a path outside the target's mount) is denied and reported as a
+  `warning` on the owner in `/status`. It never rejects either service, so the
+  outcome does not depend on arrival order. A service
+  that was never good is admitted after the established ones. Two contracts
+  that claim one prefix conflict the same way. Among new or
   changed contracts, the `GatewayContract` with the older
   `metadata.creationTimestamp` wins, then the lower service name. A running
   pod keeps an established contract against a changed conflicting one even
@@ -226,28 +320,43 @@ block the others once the gateway is running.
   case.
 - Rejections log `contract candidate rejected` with the service name once per
   distinct message. A failure to read the contract sources at all keeps the
-  whole active snapshot.
+  whole active snapshot. A `GatewayContract` whose name does not map to a
+  service is logged and skipped. In local manifest mode an entry with an
+  unreadable file is rejected on its own the same way.
 
-Readiness keeps the rollout safety check. A new pod stays unready until every
-bound service that is not `registrationOnly` has an accepted contract. A
-deployment with only registration-only services is ready without contracts. A bad contract or binding in a
-new rollout therefore never replaces serving pods. Once a pod is ready it
-stays ready and keeps isolating failures as above.
+Readiness never waits on contracts. A new pod is ready once the
+`GatewayContract` informer has synced and the first snapshot is built,
+whatever contracts are valid: a bad contract, a missing contract or no
+contracts at all. A manifest that cannot be parsed at all keeps the pod unready.
+
+Last-good state lives in memory, per pod. A restarted or new pod treats every
+contract as first-seen, so during a Darban rollout a service whose current
+contract is bad is not installed on the new pods (`404`, or `503` on its direct
+route) while old pods still serve their last good unit. Darban writes nothing
+to Kubernetes.
 
 Darban has no Prometheus registry, so the rejections appear in `/status` only.
 
 ### Status
 
 `GET /status` on the private admin port (8081) reports the active revision,
-route count, and EndpointSlice state for the authorizer and each backend.
+route count, and EndpointSlice state for the authorizer and each backend,
+including the upstreams that contracts add at runtime. Darban watches every
+EndpointSlice in its own namespace, and the Services named in `bindings` in
+other namespaces.
 `contracts` lists each service with a contract, a rejected contract, or no
 contract. `serving` is `current`, `last-good` (the current contract was
 rejected), or `none`. `rejected` is true while the current contract is being
 rejected. `lastRejection` holds the latest message and its RFC3339 time and
 remains after the contract is fixed. `missing` marks a bound service with no
-contract. The endpoint returns `503` during startup or drain. Allow the gateway's
-ServiceAccount to list and watch EndpointSlices in every namespace named in
-its bindings.
+contract. `state` is the explicit outcome per service, with a `reason`:
+`serving`, `serving_last_good` (the current contract was rejected),
+`not_installed` (no accepted contract: never accepted, or deleted; the
+prefix returns `404`), or `direct_route_closed` (no accepted contract and the
+service has a direct route, which returns `503` until a good contract
+arrives). The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+ServiceAccount to list and watch EndpointSlices in every other namespace named
+in its bindings.
 
 ## License
 

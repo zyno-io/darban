@@ -29,6 +29,22 @@ spec:
                   type: string
                   maxLength: 63
                   pattern: '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+                upstream:
+                  description: >-
+                    URL of the backend Service, in this contract's namespace, such as
+                    https://api.ns.svc.cluster.local:3000 or http://api.ns.svc/hosting.
+                    The host is <svc>, <svc>.<ns>, <svc>.<ns>.svc or
+                    <svc>.<ns>.svc.cluster.local. The port defaults by scheme. A path
+                    is the upstream mount and must not end with a slash.
+                  type: string
+                  format: uri
+                  pattern: '^https?://[^?#@]+[^/?#@]$'
+                  maxLength: 253
+                prefix:
+                  description: Public path prefix. Defaults to /<serviceName>.
+                  type: string
+                  maxLength: 64
+                  pattern: '^/[a-z][a-z0-9-]*$'
                 defaultVisibility:
                   description: Visibility of operations that do not declare their own. If omitted, inherit the gateway default.
                   type: string

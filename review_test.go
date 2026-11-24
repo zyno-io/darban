@@ -57,11 +57,20 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	good := registration{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}
 	bad := registration{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-gateway-policy: anonymous", "x-gateway-policy: bogus", 1)}
 
-	// A fresh pod with only a bad contract is not ready, so it serves nothing.
-	fresh := &reconciler{gateway: newGateway(bindings), active: new(atomic.Pointer[snapshot])}
+	// A fresh pod with only a bad contract becomes ready, but the direct route
+	// fails closed because the internal operations are unknown.
+	freshGateway := newGateway(bindings)
+	fresh := &reconciler{gateway: freshGateway, active: new(atomic.Pointer[snapshot])}
 	fresh.apply(func() ([]registration, error) { return []registration{bad}, nil })
-	if fresh.active.Load() != nil {
-		t.Fatal("fresh pod with a bad contract became ready")
+	if fresh.active.Load() == nil {
+		t.Fatal("fresh pod with a bad contract did not become ready")
+	}
+	freshReq := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
+	freshReq.Host = bindings.Hostname
+	freshRes := httptest.NewRecorder()
+	freshGateway.serve(fresh.active.Load(), freshRes, freshReq)
+	if freshRes.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fresh pod direct route returned %d, want 503", freshRes.Code)
 	}
 
 	rec.apply(func() ([]registration, error) { return []registration{good}, nil })
@@ -73,17 +82,17 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
 		t.Fatalf("internal operation returned %d while serving last-good", code)
 	}
-	// With the contract deleted, the tombstone keeps internal operations denied
-	// and the direct route keeps proxying everything else.
+	// With the contract deleted the service is gone: the direct route fails
+	// closed for everything, as on a fresh pod.
 	rec.apply(func() ([]registration, error) { return nil, nil })
-	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
-		t.Errorf("internal operation returned %d after deletion", code)
+	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusServiceUnavailable {
+		t.Errorf("internal operation returned %d after deletion, want 503", code)
+	}
+	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusServiceUnavailable {
+		t.Errorf("direct route returned %d after deletion, want 503", code)
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("upstream received %d requests", hits.Load())
-	}
-	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusTeapot {
-		t.Errorf("direct route returned %d after deletion", code)
 	}
 }
 
@@ -110,7 +119,7 @@ func TestNeverServedServiceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDeletedContractKeepsPublicAndLegacyPaths(t *testing.T) {
+func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer upstream.Close()
 	bindings := directRouteBindings(upstream.URL)
@@ -132,27 +141,23 @@ func TestDeletedContractKeepsPublicAndLegacyPaths(t *testing.T) {
 	rec.apply(func() ([]registration, error) {
 		return []registration{{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}}, nil
 	})
-	rec.apply(func() ([]registration, error) { return nil, nil })
-	for _, test := range []struct {
-		host, path string
-		want       int
-	}{
-		{"api.example.net", "/catalog/public/x", http.StatusNoContent},
-		{"catalog.example.net", "/public/x", http.StatusNoContent},
-		{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
-	} {
-		if got := probe(test.host, test.path); got != test.want {
-			t.Errorf("%s%s returned %d, want %d", test.host, test.path, got, test.want)
-		}
+	if got := probe("api.example.net", "/catalog/public/x"); got != http.StatusNoContent {
+		t.Fatalf("served: %d", got)
 	}
-	// The tombstone persists across passes and is replaced once a contract returns.
-	rec.apply(func() ([]registration, error) { return nil, nil })
-	req := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
-	req.Host = bindings.Hostname
-	res := httptest.NewRecorder()
-	g.serve(active.Load(), res, req)
-	if res.Code != http.StatusNotFound {
-		t.Fatalf("internal operation returned %d on a later pass", res.Code)
+	for pass := 0; pass < 2; pass++ {
+		rec.apply(func() ([]registration, error) { return nil, nil })
+		for _, test := range []struct {
+			host, path string
+			want       int
+		}{
+			{"api.example.net", "/catalog/public/x", http.StatusServiceUnavailable},
+			{"catalog.example.net", "/public/x", http.StatusServiceUnavailable},
+			{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
+		} {
+			if got := probe(test.host, test.path); got != test.want {
+				t.Errorf("pass %d: %s%s returned %d, want %d", pass, test.host, test.path, got, test.want)
+			}
+		}
 	}
 }
 
@@ -165,16 +170,15 @@ func TestCascadingUndoNeverOmitsEstablishedService(t *testing.T) {
 	a2.rewrites = `[{from: {method: GET, path: /a/old}, to: {serviceName: z, path: /thing}}]`
 	got, r2 := compile([]registration{a2, contractFor("m", "/items", "x"), contractFor("z", "/other", "z")}, bindings, r1.accepted)
 	wantPaths(t, got, "/a/items", "/m/items", "/z/other")
+	// z moved its operation, so a2's rewrite is denied and warned on a. Nothing
+	// is undone: every service serves its current contract.
 	for _, name := range []string{"a", "m", "z"} {
-		if r2.services[name].serving == servingNone {
-			t.Errorf("established service %s omitted", name)
+		if r2.services[name].serving != servingCurrent || r2.services[name].rejection != "" {
+			t.Errorf("service %s: %+v", name, r2.services[name])
 		}
 	}
-	// a2 is rejected for its rewrite, so a1 keeps operationId x and m2 loses to it.
-	if r2.services["a"].serving != servingLastGood || !strings.Contains(r2.services["a"].rejection, "service a:") ||
-		r2.services["m"].serving != servingLastGood || !strings.Contains(r2.services["m"].rejection, "duplicate operationId") ||
-		r2.services["z"].serving != servingCurrent {
-		t.Fatalf("a=%+v m=%+v z=%+v", r2.services["a"], r2.services["m"], r2.services["z"])
+	if r2.services["a"].warning == "" || !slices.Contains(got.denied, operationKey{"GET", "/a/old"}) {
+		t.Fatalf("a = %+v denied=%v", r2.services["a"], got.denied)
 	}
 }
 
@@ -200,7 +204,7 @@ func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
 		t.Fatalf("distinct outcomes: %v", outcomes)
 	}
 	for outcome := range outcomes {
-		if !strings.HasPrefix(outcome, "a=last-good b=last-good c=current") {
+		if !strings.HasPrefix(outcome, "a=current b=current c=current") {
 			t.Fatalf("unexpected outcome %s", outcome)
 		}
 	}
@@ -214,13 +218,13 @@ func TestRegistrationOnlyDeploymentBecomesReadyWithoutContracts(t *testing.T) {
 	rec := &reconciler{gateway: newGateway(bindings), active: &active}
 	rec.apply(func() ([]registration, error) { return nil, nil })
 	if active.Load() == nil {
-		t.Fatalf("not ready: %q", rec.held)
+		t.Fatal("not ready")
 	}
 }
 
 func TestAliasToUnservedTargetIsDenied(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha"}, "beta": {Prefix: "/beta"},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "beta": {Prefix: "/beta", Origin: "http://beta.fixtures.svc.cluster.local:80"},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /thing}}]`}
@@ -251,41 +255,34 @@ func TestEstablishedServiceSurvivesNewerConflict(t *testing.T) {
 	}
 }
 
-func TestBrokenRewriteRejectsItsOwner(t *testing.T) {
+func TestBrokenRewriteIsDeniedAndWarnedOnItsOwner(t *testing.T) {
 	bindings := isolationBindings("alpha", "beta")
 	broken := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /missing}}]`}
 	beta := contractFor("beta", "/items", "listBeta")
 	got, report := compile([]registration{broken, beta}, bindings, nil)
-	wantPaths(t, got, "/beta/items")
-	if report.services["alpha"].serving != servingNone || report.services["beta"].serving != servingCurrent {
+	wantPaths(t, got, "/alpha/items", "/beta/items")
+	if report.services["alpha"].serving != servingCurrent || report.services["alpha"].warning == "" ||
+		report.services["beta"].serving != servingCurrent || !slices.Contains(got.denied, operationKey{"GET", "/alpha/old"}) {
 		t.Fatalf("alpha=%+v beta=%+v", report.services["alpha"], report.services["beta"])
 	}
+	// The same on an established pod.
 	_, r1 := compile([]registration{contractFor("alpha", "/items", "listAlpha"), beta}, bindings, nil)
-	_, r2 := compile([]registration{broken, beta}, bindings, r1.accepted)
-	if r2.services["alpha"].serving != servingLastGood || r2.services["alpha"].rejection == "" {
+	got2, r2 := compile([]registration{broken, beta}, bindings, r1.accepted)
+	if r2.services["alpha"].serving != servingCurrent || r2.services["alpha"].warning == "" || got2.revision != got.revision {
 		t.Fatalf("alpha = %+v", r2.services["alpha"])
 	}
-	edited := contractFor("beta", "/items", "listBeta", "      summary: edited\n")
-	got, r3 := compile([]registration{broken, edited}, bindings, r2.accepted)
-	wantPaths(t, got, "/alpha/items", "/beta/items")
-	if r3.services["beta"].serving != servingCurrent || r3.services["beta"].rejection != "" {
-		t.Fatalf("beta = %+v", r3.services["beta"])
-	}
-	// A change that removes a target an established rewrite needs is rejected.
-	_, s1 := compile([]registration{
-		{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
-			rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}, beta,
-	}, bindings, nil)
+	// A change that removes a target an established rewrite needs only denies
+	// the rewrite. Neither service is rejected.
+	rewrite := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
+		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}
+	_, s1 := compile([]registration{rewrite, beta}, bindings, nil)
 	moved := contractFor("beta", "/moved", "listBeta")
-	got, s2 := compile([]registration{
-		{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
-			rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: beta, path: /items}}]`}, moved,
-	}, bindings, s1.accepted)
-	if s2.services["beta"].serving != servingLastGood || s2.services["alpha"].serving != servingCurrent {
+	got, s2 := compile([]registration{rewrite, moved}, bindings, s1.accepted)
+	if s2.services["beta"].serving != servingCurrent || s2.services["alpha"].serving != servingCurrent || s2.services["alpha"].warning == "" {
 		t.Fatalf("alpha=%+v beta=%+v", s2.services["alpha"], s2.services["beta"])
 	}
-	wantPaths(t, got, "/alpha/items", "/alpha/old", "/beta/items")
+	wantPaths(t, got, "/alpha/items", "/beta/moved")
 }
 
 func TestConflictOrderUsesCreationTimeThenName(t *testing.T) {
@@ -314,28 +311,25 @@ func TestConflictOrderUsesCreationTimeThenName(t *testing.T) {
 	}
 }
 
-func TestFirstSnapshotWaitsForCompleteContractSet(t *testing.T) {
+func TestFirstSnapshotNeverWaitsOnContracts(t *testing.T) {
 	bindings := isolationBindings("alpha", "beta")
-	g := newGateway(bindings)
+	for name, regs := range map[string][]registration{
+		"no contracts":     nil,
+		"missing contract": {contractFor("alpha", "/items", "listAlpha")},
+		"rejected contract": {contractFor("alpha", "/items", "listAlpha"),
+			contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n")},
+	} {
+		var active atomic.Pointer[snapshot]
+		rec := &reconciler{gateway: newGateway(bindings), active: &active}
+		rec.apply(func() ([]registration, error) { return regs, nil })
+		if active.Load() == nil {
+			t.Fatalf("%s: pod did not become ready", name)
+		}
+	}
 	var active atomic.Pointer[snapshot]
-	rec := &reconciler{gateway: g, active: &active}
+	rec := &reconciler{gateway: newGateway(bindings), active: &active}
 	apply := func(regs ...registration) { rec.apply(func() ([]registration, error) { return regs, nil }) }
-	apply()
-	if active.Load() != nil {
-		t.Fatal("ready with no contracts")
-	}
-	apply(contractFor("alpha", "/items", "listAlpha"))
-	if active.Load() != nil {
-		t.Fatal("ready with a missing contract")
-	}
-	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n"))
-	if active.Load() != nil {
-		t.Fatal("ready with a rejected contract")
-	}
 	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"))
-	if active.Load() == nil {
-		t.Fatal("not ready with a complete set")
-	}
 	// Once ready, a bad contract keeps last-good and a deletion drops the service.
 	apply(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta", "      x-darban-visibility: bogus\n"))
 	if active.Load() == nil || len(active.Load().routes) != 2 {
@@ -393,7 +387,7 @@ func TestRevisionTracksServingServices(t *testing.T) {
 
 func TestStrictRejectsRewriteToServiceWithoutContract(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha"}, "archive": {Prefix: "/archive", RegistrationOnly: true},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", RegistrationOnly: true},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: archive, path: /thing}}]`}

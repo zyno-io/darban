@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"unicode/utf8"
 
@@ -29,6 +30,8 @@ const (
 
 type gatewayContractSpec struct {
 	ServiceName       string               `json:"serviceName"`
+	Upstream          string               `json:"upstream,omitempty"`
+	Prefix            string               `json:"prefix,omitempty"`
 	DefaultVisibility *operationVisibility `json:"defaultVisibility,omitempty"`
 	OpenAPI           gatewayOpenAPI       `json:"openapi"`
 	Rewrites          []rewriteRule        `json:"rewrites"`
@@ -124,35 +127,28 @@ func decodeGatewayContract(object *unstructured.Unstructured) (registration, err
 	}
 	return registration{
 		serviceName: spec.ServiceName, openAPI: string(openAPI), rewrites: string(rewrites),
+		upstream: spec.Upstream, prefix: spec.Prefix, namespace: object.GetNamespace(),
 		defaultVisibility: spec.DefaultVisibility, created: object.GetCreationTimestamp().Time,
 	}, nil
 }
 
-func loadClusterRegistrations(legacy, current cache.Store) ([]registration, error) {
+func loadClusterRegistrations(current cache.Store) ([]registration, error) {
 	registrations := make(map[string]registration)
 	for _, item := range current.List() {
 		object := item.(*unstructured.Unstructured)
 		reg, err := decodeGatewayContract(object)
 		if err != nil {
-			// A broken contract rejects its own service. It must not fall back to
-			// the legacy ConfigMap, so it still takes the service's slot.
+			// A broken contract rejects its own service and takes its slot.
 			invalid := fmt.Errorf("GatewayContract %s: %w", object.GetName(), err)
 			name, ok := nameFromResource(object.GetName())
 			if !ok {
-				return nil, invalid
+				// No service to attribute it to, so skip it rather than block the rest.
+				log.Printf("contract candidate rejected: %v", invalid)
+				continue
 			}
 			reg = registration{serviceName: name, invalid: invalid}
 		}
 		registrations[reg.serviceName] = reg
-	}
-	legacyRegs, err := registrationsFromStore(legacy)
-	if err != nil {
-		return nil, err
-	}
-	for _, reg := range legacyRegs {
-		if _, exists := registrations[reg.serviceName]; !exists {
-			registrations[reg.serviceName] = reg
-		}
 	}
 	result := make([]registration, 0, len(registrations))
 	for _, reg := range registrations {

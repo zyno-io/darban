@@ -59,15 +59,59 @@ func upstreamOrigin(address string, local bool) (*url.URL, error) {
 	host := target.Hostname()
 	clusterHost := serviceDNS.MatchString(host)
 	localHost := local && (host == "localhost" || net.ParseIP(host).IsLoopback())
-	if target.Scheme != "http" || (!clusterHost && !localHost) || target.Port() == "" ||
+	if (target.Scheme != "http" && target.Scheme != "https") || (!clusterHost && !localHost) || target.Port() == "" ||
 		target.Path != "" || target.RawQuery != "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("expected a private Kubernetes Service origin or local loopback")
 	}
 	return target, nil
 }
 
-func newTransport() *http.Transport {
+// dialVerified dials a TLS upstream when the config does its own verification.
+// The TLS state carries no server name for an IP literal (no SNI is sent), so
+// the dialed host is supplied to the verifier explicitly.
+func dialVerified(transport *http.Transport, base *tls.Config) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		config := base.Clone()
+		config.ServerName = host
+		config.VerifyConnection = func(state tls.ConnectionState) error {
+			state.ServerName = host
+			return base.VerifyConnection(state)
+		}
+		client := tls.Client(conn, config)
+		// DialTLSContext bypasses TLSHandshakeTimeout, so bound it here.
+		if timeout := transport.TLSHandshakeTimeout; timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		if err := client.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return client, nil
+	}
+}
+
+func newTransport(tlsConfig *tls.Config) *http.Transport {
+	transport := newBaseTransport(tlsConfig)
+	if tlsConfig != nil && tlsConfig.VerifyConnection != nil {
+		transport.DialTLSContext = dialVerified(transport, tlsConfig)
+	}
+	return transport
+}
+
+func newBaseTransport(tlsConfig *tls.Config) *http.Transport {
 	return &http.Transport{
+		TLSClientConfig:     tlsConfig,
+		TLSHandshakeTimeout: 2 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -81,9 +125,10 @@ func newTransport() *http.Transport {
 	}
 }
 
-func newDebugTransport() *http.Transport {
-	transport := newTransport()
+func newDebugTransport(tlsConfig *tls.Config) *http.Transport {
+	transport := newTransport(tlsConfig)
 	transport.DialContext = (&net.Dialer{Timeout: 350 * time.Millisecond}).DialContext
+	transport.TLSHandshakeTimeout = 350 * time.Millisecond
 	transport.ResponseHeaderTimeout = 600 * time.Millisecond
 	// Avoid implicit retries of debug requests with an Idempotency-Key.
 	transport.DisableKeepAlives = true
@@ -135,13 +180,15 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 
 type snapshot struct {
 	contractServices []string
-	unserved         map[string]bool
-	deniedTemplates  []operationKey
-	denied           map[operationKey]bool
-	revision         string
-	specYAML         []byte
-	specJSON         []byte
-	routes           map[operationKey]registeredRoute
+	// services holds the effective binding of each served contract service.
+	services        map[string]serviceBinding
+	unserved        map[string]bool
+	deniedTemplates []operationKey
+	denied          map[operationKey]bool
+	revision        string
+	specYAML        []byte
+	specJSON        []byte
+	routes          map[operationKey]registeredRoute
 }
 
 type gateway struct {
@@ -149,34 +196,35 @@ type gateway struct {
 	serviceProxies map[string]*httputil.ReverseProxy
 	legacyPrefixes map[string]string
 	bindings       upstreamBindings
-	targets        map[string]*url.URL
 	transport      *http.Transport
 	debugTransport *http.Transport
 	authClient     *http.Client
+	upstreamTLS    *upstreamVerifier
 	endpoints      endpointCatalog
 }
 
 func newGateway(bindings upstreamBindings) *gateway {
-	targets := make(map[string]*url.URL, len(bindings.Services))
-	for name, binding := range bindings.Services {
-		// loadBindings already validated the URL.
-		targets[name], _ = url.Parse(binding.Origin)
-	}
 	legacyPrefixes := make(map[string]string)
 	for prefix, route := range bindings.ServiceRoutes {
 		for _, host := range route.LegacyHosts {
 			legacyPrefixes[host] = prefix
 		}
 	}
+	verifier, err := newUpstreamVerifier(bindings.UpstreamTLS)
+	if err != nil {
+		// loadBindings already validated the options.
+		log.Fatal(err)
+	}
+	tlsConfig := verifier.tlsConfig()
 	return &gateway{
-		serviceProxies: newServiceProxies(bindings),
+		upstreamTLS:    verifier,
+		serviceProxies: newServiceProxies(bindings, tlsConfig),
 		legacyPrefixes: legacyPrefixes,
 		bindings:       bindings,
-		targets:        targets,
-		transport:      newTransport(),
-		debugTransport: newDebugTransport(),
+		transport:      newTransport(tlsConfig),
+		debugTransport: newDebugTransport(tlsConfig),
 		authClient: &http.Client{
-			Transport:     newTransport(),
+			Transport:     newTransport(tlsConfig),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
@@ -185,6 +233,7 @@ func newGateway(bindings upstreamBindings) *gateway {
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
 		contractServices: compiled.contractServices,
+		services:         compiled.services,
 		unserved:         make(map[string]bool, len(compiled.unserved)),
 		denied:           make(map[operationKey]bool, len(compiled.denied)),
 		revision:         compiled.revision,
@@ -203,10 +252,15 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		}
 	}
 	for _, route := range compiled.routes {
-		binding := g.bindings.Services[route.service]
+		binding, found := compiled.services[route.service]
+		if !found {
+			binding = g.bindings.Services[route.service]
+		}
+		// Validated when the contract or the bindings were loaded.
+		target, _ := url.Parse(binding.Origin)
 		registered := registeredRoute{
 			credentials: route.credentials,
-			proxy:       g.reverseProxy(route, g.targets[route.service], g.transport),
+			proxy:       g.reverseProxy(route, target, g.transport),
 		}
 		if binding.DebugOrigin != "" {
 			alternate, _ := url.Parse(binding.DebugOrigin)
@@ -318,7 +372,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 
 func main() {
 	manifest := flag.String("manifest", "", "local contract manifest YAML")
-	namespace := flag.String("namespace", "", "namespace of GatewayContracts and legacy ConfigMaps")
+	namespace := flag.String("namespace", "", "namespace of GatewayContracts")
 	printSpec := flag.Bool("print-spec", false, "compile local manifest once and print public OpenAPI")
 	bindingsPath := flag.String("bindings", "/config/bindings.json", "private service bindings")
 	cert := flag.String("cert", "/tls/tls.crt", "gateway TLS certificate")
@@ -349,13 +403,9 @@ func main() {
 	gateway := newGateway(bindings)
 	var active atomic.Pointer[snapshot]
 	reload := &reconciler{gateway: gateway, active: &active}
-	var legacy, current cache.SharedIndexInformer
+	var current cache.SharedIndexInformer
 	if *namespace != "" {
 		config, err := rest.InClusterConfig()
-		if err != nil {
-			log.Fatal(err)
-		}
-		legacy, err = newConfigMapInformer(config, *namespace, bindings.ContractAPIGroup)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -363,7 +413,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		gateway.endpoints, err = newEndpointCatalog(config, bindings)
+		gateway.endpoints, err = newEndpointCatalog(config, bindings, *namespace)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -434,6 +484,7 @@ func main() {
 	stopping, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	go refreshCertificate(stopping, *cert, *key, &currentCertificate)
+	go gateway.upstreamTLS.run(stopping)
 	gateway.endpoints.run(stopping)
 	failures := make(chan error, 3)
 	go func() { failures <- apiServer.ServeTLS(traffic, "", "") }()
@@ -442,7 +493,7 @@ func main() {
 		go reload.watchLocal(stopping, *manifest)
 	} else {
 		go func() {
-			if err := reload.watchCluster(stopping, legacy, current); err != nil {
+			if err := reload.watchCluster(stopping, current); err != nil {
 				failures <- err
 			}
 		}()

@@ -27,6 +27,12 @@ type registration struct {
 	invalid error
 	// created orders conflicts between changed contracts. Zero when unknown.
 	created time.Time
+	// upstream and prefix are the contract's spec.upstream and spec.prefix.
+	upstream, prefix string
+	// namespace is the contract's namespace. local marks a manifest contract,
+	// which may name loopback upstreams and any Service namespace.
+	namespace string
+	local     bool
 }
 
 type rewriteRule struct {
@@ -47,6 +53,40 @@ type serviceBinding struct {
 	DebugOrigin      string
 	Operations       []operationSelection
 	RegistrationOnly bool
+}
+
+// validate checks the fields of a service binding. Origins are optional
+// because a contract can supply them, so only present ones are checked. A
+// binding that came from the bindings file also checks its origins.
+func (b serviceBinding) validate(name string, bindings upstreamBindings, local, checkOrigins bool) error {
+	if !serviceName.MatchString(name) || (b.Prefix != "" && !prefixPath.MatchString(b.Prefix)) ||
+		(b.Mount != "" && !literalPath.MatchString(b.Mount)) {
+		return fmt.Errorf("invalid service binding %q", name)
+	}
+	for _, operation := range b.Operations {
+		if err := operation.Legacy.validate(); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
+		}
+	}
+	if b.RegistrationOnly && len(b.Operations) != 0 {
+		return fmt.Errorf("registration-only service %q cannot select operations", name)
+	}
+	if checkOrigins && b.Origin != "" {
+		if _, err := upstreamOrigin(b.Origin, local); err != nil {
+			return err
+		}
+	}
+	if b.DebugOrigin != "" {
+		if bindings.Debug == (debugConfig{}) {
+			return fmt.Errorf("service %q has a debug origin without a debug policy", name)
+		}
+		if checkOrigins {
+			if _, err := upstreamOrigin(b.DebugOrigin, local); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type operationSelection struct {
@@ -99,6 +139,7 @@ type upstreamBindings struct {
 	Services               map[string]serviceBinding
 	DefaultVisibility      *operationVisibility
 	OpenAPI                openAPIConfig
+	UpstreamTLS            upstreamTLSConfig
 }
 
 type openAPIConfig struct {
@@ -218,9 +259,14 @@ type candidate struct {
 	unserved []string
 	denied   []operationKey
 	routes   []compiledOperation
-	specYAML []byte
-	specJSON []byte
-	revision string
+	// services holds the effective binding of every assembled service.
+	services map[string]serviceBinding
+	// aliasWarnings holds, by owning service, why a rewrite of that service is
+	// denied although its target is served. It never rejects a contract.
+	aliasWarnings map[string]string
+	specYAML      []byte
+	specJSON      []byte
+	revision      string
 }
 
 var (
@@ -236,8 +282,16 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	if err := readJSON(path, &bindings); err != nil {
 		return bindings, err
 	}
-	if !dnsName.MatchString(bindings.Hostname) || len(bindings.Services) == 0 {
-		return bindings, errors.New("hostname and service bindings required")
+	if !dnsName.MatchString(bindings.Hostname) {
+		return bindings, errors.New("hostname required")
+	}
+	if err := bindings.UpstreamTLS.validate(); err != nil {
+		return bindings, err
+	}
+	if bindings.UpstreamTLS.CAFile != "" {
+		if _, err := loadCAPool(bindings.UpstreamTLS.CAFile); err != nil {
+			return bindings, fmt.Errorf("upstreamTLS.caFile: %w", err)
+		}
 	}
 	if bindings.Authz != "" {
 		if _, err := upstreamOrigin(bindings.Authz, local); err != nil {
@@ -279,33 +333,19 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	}
 	prefixes := make(map[string]string)
 	for name, binding := range bindings.Services {
-		if !serviceName.MatchString(name) || !prefixPath.MatchString(binding.Prefix) ||
-			(binding.Mount != "" && !literalPath.MatchString(binding.Mount)) {
-			return bindings, fmt.Errorf("invalid service binding %q", name)
+		if err := binding.validate(name, bindings, local, true); err != nil {
+			return bindings, err
+		}
+		if binding.Prefix == "" {
+			continue
+		}
+		if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.Mount != "" {
+			return bindings, fmt.Errorf("service %q has a mount, which a serviceRoutes prefix %s does not support", name, binding.Prefix)
 		}
 		if other, exists := prefixes[binding.Prefix]; exists {
 			return bindings, fmt.Errorf("prefix collision between %q and %q", name, other)
 		}
 		prefixes[binding.Prefix] = name
-		for _, operation := range binding.Operations {
-			if err := operation.Legacy.validate(); err != nil {
-				return bindings, fmt.Errorf("service %q: %w", name, err)
-			}
-		}
-		if binding.RegistrationOnly && len(binding.Operations) != 0 {
-			return bindings, fmt.Errorf("registration-only service %q cannot select operations", name)
-		}
-		if _, err := upstreamOrigin(binding.Origin, local); err != nil {
-			return bindings, err
-		}
-		if binding.DebugOrigin != "" {
-			if bindings.Debug == (debugConfig{}) {
-				return bindings, fmt.Errorf("service %q has a debug origin without a debug policy", name)
-			}
-			if _, err := upstreamOrigin(binding.DebugOrigin, local); err != nil {
-				return bindings, err
-			}
-		}
 	}
 	return bindings, nil
 }
@@ -645,6 +685,9 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 	return nil
 }
 
+// aliasTarget is a rewrite destination. key.path is the target's upstream
+// path; assemble maps it to a public path with the binding the target is
+// actually served with.
 type aliasTarget struct {
 	key     operationKey
 	service string
@@ -653,6 +696,8 @@ type aliasTarget struct {
 // serviceUnit is one service's contract after per-service validation. It is
 // the unit of isolation: the compiler keeps, replaces or drops whole units.
 type serviceUnit struct {
+	// binding is the effective binding the unit was compiled with.
+	binding          serviceBinding
 	digest           [sha256.Size]byte
 	openAPIDigest    [sha256.Size]byte
 	registrationOnly bool
@@ -667,26 +712,47 @@ const (
 	servingNone     = "none"
 )
 
+// Service states reported in /status.
+const (
+	stateServing           = "serving"
+	stateServingLastGood   = "serving_last_good"
+	stateNotInstalled      = "not_installed"
+	stateDirectRouteClosed = "direct_route_closed"
+)
+
 type serviceOutcome struct {
 	serving   string
 	rejection string
 	missing   bool
+	// state and reason are set by the reconciler.
+	state  string
+	reason string
+	// warning describes a rewrite denied because its target is served but
+	// does not offer the rewritten operation.
+	warning string
 }
 
 // compileReport describes what compile did with each service. accepted holds
 // the units that are serving and becomes the next call's lastGood.
 type compileReport struct {
-	services map[string]serviceOutcome
-	accepted map[string]*serviceUnit
+	// overrides describes where a contract overrides its bindings entry.
+	overrides map[string]string
+	services  map[string]serviceOutcome
+	accepted  map[string]*serviceUnit
 }
 
-func registrationDigest(reg registration) [sha256.Size]byte {
+// registrationDigest identifies everything a compiled unit depends on: the
+// contract and its effective binding. Rewrite destinations are resolved against
+// the served target binding in assemble, so they are not part of it.
+func registrationDigest(reg registration, binding serviceBinding) [sha256.Size]byte {
 	hash := sha256.New()
 	visibility := "-"
 	if reg.defaultVisibility != nil {
 		visibility = string(*reg.defaultVisibility)
 	}
 	fmt.Fprintf(hash, "%q %q %q %q", reg.serviceName, reg.openAPI, reg.rewrites, visibility)
+	encoded, _ := json.Marshal(binding)
+	fmt.Fprintf(hash, " %s", encoded)
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
 	return digest
@@ -709,7 +775,8 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		return nil, errors.New("requires a rewrites list")
 	}
 	unit := &serviceUnit{
-		digest:           registrationDigest(reg),
+		binding:          binding,
+		digest:           registrationDigest(reg, binding),
 		openAPIDigest:    sha256.Sum256([]byte(reg.openAPI)),
 		registrationOnly: binding.RegistrationOnly,
 		native:           make(map[operationKey]sourceOperation),
@@ -726,30 +793,31 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 	}
 	for _, rule := range rules {
 		from := operationKey{rule.From.Method, rule.From.Path}
-		target, approved := bindings.Services[rule.To.ServiceName]
-		destination, mapped := target.publicPath(rule.To.Path)
-		if !approved || !mapped || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
+		_, approved := bindings.Services[rule.To.ServiceName]
+		if !approved || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
 			!literalPath.MatchString(from.path) {
 			return nil, errors.New("rewrite outside its registered service bindings")
 		}
 		if _, exists := unit.aliases[from]; exists {
 			return nil, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
 		}
-		unit.aliases[from] = aliasTarget{operationKey{from.method, destination}, rule.To.ServiceName}
+		unit.aliases[from] = aliasTarget{operationKey{from.method, rule.To.Path}, rule.To.ServiceName}
 	}
 	return unit, nil
 }
 
-// compile builds one candidate from per-service contracts. A service whose
-// contract is unbound, invalid, or conflicts with another service is isolated:
-// it keeps its entry in lastGood when it has one, and is otherwise omitted.
-// Other services are unaffected.
+// compile builds one candidate from per-service contracts. Every contract is a
+// candidate: its effective binding comes from the contract, with the bindings
+// entry as the fallback. A service whose contract is invalid, resolves to no
+// upstream or conflicts with another service is isolated: it keeps its entry
+// in lastGood when it has one, and is otherwise omitted. Other services are
+// unaffected.
 func compile(regs []registration, bindings upstreamBindings, lastGood map[string]*serviceUnit) (candidate, compileReport) {
 	defaultVisibility := visibilityPublic
 	if bindings.DefaultVisibility != nil {
 		defaultVisibility = *bindings.DefaultVisibility
 	}
-	report := compileReport{services: make(map[string]serviceOutcome)}
+	report := compileReport{services: make(map[string]serviceOutcome), overrides: make(map[string]string)}
 	sorted := slices.SortedStableFunc(slices.Values(regs), func(a, b registration) int {
 		return strings.Compare(a.serviceName, b.serviceName)
 	})
@@ -761,29 +829,63 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	}
 	current := make(map[string]*serviceUnit)
 	rejected := make(map[string]string)
+	resolved := make(map[string]serviceBinding)
 	for _, reg := range sorted {
 		name := reg.serviceName
-		binding, bound := bindings.Services[name]
 		switch {
-		case !bound:
-			report.services[name] = serviceOutcome{serving: servingNone,
-				rejection: fmt.Sprintf("service %q is not in bindings.services; contract ignored", name)}
 		case count[name] > 1:
 			rejected[name] = fmt.Sprintf("service %s: duplicate contract registrations", name)
 		case reg.invalid != nil:
 			rejected[name] = fmt.Sprintf("service %s: %v", name, reg.invalid)
 		default:
-			if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg) {
-				current[name] = prev
-				continue
-			}
-			unit, err := compileService(reg, binding, bindings, defaultVisibility)
+			binding, note, err := resolveBinding(reg, bindings)
 			if err != nil {
 				rejected[name] = fmt.Sprintf("service %s: %v", name, err)
 				continue
 			}
-			current[name] = unit
+			resolved[name] = binding
+			if note != "" {
+				report.overrides[name] = note
+			}
 		}
+	}
+	// Rewrites may target any service with a contract, so validate them against
+	// the effective bindings.
+	effective := maps.Clone(bindings.Services)
+	if effective == nil {
+		effective = make(map[string]serviceBinding)
+	}
+	for name := range count {
+		if unit := lastGood[name]; unit != nil {
+			effective[name] = unit.binding
+		}
+	}
+	maps.Copy(effective, resolved)
+	// Approve a rewrite target whichever way it fails: any registration counts.
+	// Rewrites into a target that is not served stay denied in assemble.
+	for name := range count {
+		if _, known := effective[name]; !known {
+			effective[name] = serviceBinding{}
+		}
+	}
+	effectiveBindings := bindings
+	effectiveBindings.Services = effective
+	for _, reg := range sorted {
+		name := reg.serviceName
+		binding, ok := resolved[name]
+		if !ok {
+			continue
+		}
+		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding) {
+			current[name] = prev
+			continue
+		}
+		unit, err := compileService(reg, binding, effectiveBindings, defaultVisibility)
+		if err != nil {
+			rejected[name] = fmt.Sprintf("service %s: %v", name, err)
+			continue
+		}
+		current[name] = unit
 	}
 	preferred := maps.Clone(current)
 	for name := range rejected {
@@ -792,13 +894,10 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		}
 	}
 
-	out, accepted, conflicts := selectUnits(preferred, lastGood, created, bindings)
+	out, accepted, conflicts := selectUnits(preferred, lastGood, created, effectiveBindings)
 	report.accepted = accepted
 	for name := range count {
-		if _, bound := bindings.Services[name]; !bound {
-			continue
-		}
-		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name]}
+		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name], warning: out.aliasWarnings[name]}
 		if message, failed := conflicts[name]; failed {
 			outcome.rejection = message
 		}
@@ -810,13 +909,17 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		}
 		report.services[name] = outcome
 	}
+	// Only bindings entries declare that a service must have a contract and
+	// own a direct service route, so only they are reported missing or unserved.
 	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
-		if !bindings.Services[name].RegistrationOnly && count[name] == 0 {
+		binding := bindings.Services[name]
+		if binding.RegistrationOnly {
+			continue
+		}
+		if count[name] == 0 {
 			report.services[name] = serviceOutcome{serving: servingNone, missing: true}
 		}
-	}
-	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
-		if binding := bindings.Services[name]; !binding.RegistrationOnly && accepted[name] == nil {
+		if binding.Prefix != "" && accepted[name] == nil {
 			out.unserved = append(out.unserved, binding.Prefix)
 		}
 	}
@@ -966,8 +1069,22 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	owners := make(map[operationKey]string)
 	components := make(map[string]map[string]any)
 	out.contractServices = slices.Sorted(maps.Keys(units))
+	out.services = make(map[string]serviceBinding, len(units))
+	prefixOwners := make(map[string]string)
 	for _, name := range out.contractServices {
 		unit := units[name]
+		out.services[name] = unit.binding
+		if !unit.registrationOnly && unit.binding.Prefix != "" {
+			if other, taken := prefixOwners[unit.binding.Prefix]; taken {
+				// Blame the service being admitted, else the later one.
+				blamed, holder := name, other
+				if prefer == other {
+					blamed, holder = other, name
+				}
+				return out, &assemblyError{blamed, fmt.Errorf("prefix %s is already used by service %s", unit.binding.Prefix, holder)}
+			}
+			prefixOwners[unit.binding.Prefix] = name
+		}
 		if unit.registrationOnly {
 			registrationOnlyDigests[name] = unit.openAPIDigest
 			continue
@@ -996,14 +1113,33 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	})
 	for _, from := range aliasKeys {
 		alias := aliases[from]
-		if _, serving := units[alias.service]; !serving {
+		targetUnit, serving := units[alias.service]
+		if !serving {
 			// The target service has no serving contract. Deny the alias path so
 			// it cannot reach a direct service route.
 			delete(published, from)
 			out.denied = append(out.denied, from)
 			continue
 		}
-		to := alias.key
+		// A rewrite that cannot reach its served target is denied and reported
+		// on its owner. It never faults a service, so the outcome does not
+		// depend on arrival order or on what was served before.
+		deny := func(format string, args ...any) {
+			delete(published, from)
+			out.denied = append(out.denied, from)
+			if _, reported := out.aliasWarnings[owners[from]]; !reported {
+				if out.aliasWarnings == nil {
+					out.aliasWarnings = make(map[string]string)
+				}
+				out.aliasWarnings[owners[from]] = fmt.Sprintf(format, args...)
+			}
+		}
+		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
+		if !mapped {
+			deny("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)
+			continue
+		}
+		to := operationKey{alias.key.method, destination}
 		original := native[from]
 		target, exists := native[to]
 		if original.visibility == visibilityInternal || target.visibility == visibilityInternal {
@@ -1013,7 +1149,8 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		}
 		_, targetRewritten := aliases[to]
 		if !exists || targetRewritten {
-			return out, &assemblyError{owners[from], fmt.Errorf("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)}
+			deny("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)
+			continue
 		}
 		if original.visibility == visibilityUnlisted {
 			target.visibility = visibilityUnlisted
@@ -1095,6 +1232,10 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	hash := sha256.New()
 	hash.Write(out.specYAML)
 	fmt.Fprintf(hash, "services %v\n", out.contractServices)
+	for _, name := range out.contractServices {
+		binding := units[name].binding
+		fmt.Fprintf(hash, "upstream %s %s %s %s %s\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin)
+	}
 	for _, name := range slices.Sorted(maps.Keys(registrationOnlyDigests)) {
 		fmt.Fprintf(hash, "registered %s %x\n", name, registrationOnlyDigests[name])
 	}

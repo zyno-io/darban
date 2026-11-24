@@ -63,6 +63,11 @@ spec:
             - name: tls
               mountPath: /tls
               readOnly: true
+            {{- if or .Values.upstreamTLS.caSecretName .Values.upstreamTLS.caConfigMapName }}
+            - name: upstream-ca
+              mountPath: /etc/darban/upstream-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -70,3 +75,12 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Release.Name }}-backend-tls
+        {{- if .Values.upstreamTLS.caSecretName }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ .Values.upstreamTLS.caSecretName }}
+        {{- else if .Values.upstreamTLS.caConfigMapName }}
+        - name: upstream-ca
+          configMap:
+            name: {{ .Values.upstreamTLS.caConfigMapName }}
+        {{- end }}

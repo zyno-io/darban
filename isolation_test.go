@@ -19,7 +19,7 @@ func anonymousContract(path, operationID string, extra ...string) string {
 func isolationBindings(names ...string) upstreamBindings {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{}}
 	for _, name := range names {
-		bindings.Services[name] = serviceBinding{Prefix: "/" + name}
+		bindings.Services[name] = serviceBinding{Prefix: "/" + name, Origin: "http://" + name + ".fixtures.svc.cluster.local:80"}
 	}
 	return bindings
 }
@@ -44,13 +44,13 @@ func wantPaths(t *testing.T, c candidate, want ...string) {
 	}
 }
 
-func TestUnregisteredServiceContractIsIgnored(t *testing.T) {
+func TestContractWithoutUpstreamOrBindingIsRejected(t *testing.T) {
 	bindings := isolationBindings("alpha")
 	regs := []registration{contractFor("alpha", "/items", "listAlpha"), contractFor("ghost", "/items", "listGhost")}
 	got, report := compile(regs, bindings, nil)
 	wantPaths(t, got, "/alpha/items")
 	ghost := report.services["ghost"]
-	if !strings.Contains(ghost.rejection, "not in bindings.services") || ghost.serving != servingNone {
+	if !strings.Contains(ghost.rejection, "no upstream") || ghost.serving != servingNone {
 		t.Fatalf("unexpected ghost outcome: %+v", ghost)
 	}
 	if report.services["alpha"].rejection != "" || report.services["alpha"].serving != servingCurrent {
@@ -222,7 +222,7 @@ paths:
 `
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(),
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Operations: []operationSelection{{
+		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80", Operations: []operationSelection{{
 			Method: "get", Path: "/objects",
 			Legacy: &legacySecurity{Source: securityRequirements{{"staffBearer": {}}}, Profiles: []string{"sessionBearer"}},
 		}}}},
@@ -272,12 +272,12 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		}
 		return byName
 	}
-	// A fresh pod with a rejected and a missing contract stays unready but reports why.
+	// A fresh pod with a rejected and a missing contract is ready and reports why.
 	apply()
-	if active.Load() != nil {
-		t.Fatal("a fresh pod became ready with a rejected and a missing contract")
+	if active.Load() == nil {
+		t.Fatal("a fresh pod stayed unready with a rejected and a missing contract")
 	}
-	got := read(http.StatusServiceUnavailable)
+	got := read(http.StatusOK)
 	if alpha := got["alpha"]; alpha.Serving != servingNone || !alpha.Rejected || alpha.LastRejection == nil ||
 		!strings.Contains(alpha.LastRejection.Message, "x-darban-visibility") || alpha.LastRejection.Time != "2026-11-23T08:30:00Z" {
 		t.Fatalf("unexpected alpha status: %+v", got["alpha"])
@@ -292,12 +292,9 @@ func TestStatusReportsRejectionsAndServingState(t *testing.T) {
 		t.Fatalf("unexpected gamma status: %+v", gamma)
 	}
 
-	// With every bound service served, the pod becomes ready.
+	// Once every bound service is served the pod stays ready.
 	regs = []registration{contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"), gamma}
 	apply()
-	if active.Load() == nil {
-		t.Fatal("pod stayed unready with a complete contract set")
-	}
 	read(http.StatusOK)
 
 	// Alpha turns bad: the ready pod keeps serving last-good and reports it.

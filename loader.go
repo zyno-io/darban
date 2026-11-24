@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"log"
 	"maps"
 	"os"
@@ -15,10 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/yaml"
 )
@@ -28,6 +21,8 @@ const contractNamePrefix = "api-contract-"
 type localManifest struct {
 	Contracts []struct {
 		ServiceName       string               `json:"serviceName"`
+		Upstream          string               `json:"upstream,omitempty"`
+		Prefix            string               `json:"prefix,omitempty"`
 		OpenAPIPath       string               `json:"openapi.yaml"`
 		RewritesPath      string               `json:"rewrites.yaml"`
 		DefaultVisibility *operationVisibility `json:"defaultVisibility,omitempty"`
@@ -46,22 +41,38 @@ func loadLocal(path string) ([]registration, error) {
 	base := filepath.Dir(path)
 	regs := make([]registration, 0, len(manifest.Contracts))
 	for _, entry := range manifest.Contracts {
-		for _, file := range []string{entry.OpenAPIPath, entry.RewritesPath} {
-			if file == "" || !filepath.IsLocal(file) {
-				return nil, errors.New("contract paths must be relative to the manifest")
+		spec, rewrites, err := readLocalContract(base, entry.OpenAPIPath, entry.RewritesPath)
+		if err != nil {
+			// A broken entry rejects its own service, like a broken GatewayContract.
+			if !serviceName.MatchString(entry.ServiceName) {
+				return nil, err
 			}
+			regs = append(regs, registration{serviceName: entry.ServiceName, invalid: err, local: true})
+			continue
 		}
-		spec, err := os.ReadFile(filepath.Join(base, entry.OpenAPIPath))
-		if err != nil {
-			return nil, err
-		}
-		rewrites, err := os.ReadFile(filepath.Join(base, entry.RewritesPath))
-		if err != nil {
-			return nil, err
-		}
-		regs = append(regs, registration{serviceName: entry.ServiceName, openAPI: string(spec), rewrites: string(rewrites), defaultVisibility: entry.DefaultVisibility})
+		regs = append(regs, registration{
+			serviceName: entry.ServiceName, openAPI: spec, rewrites: rewrites,
+			upstream: entry.Upstream, prefix: entry.Prefix, local: true, defaultVisibility: entry.DefaultVisibility,
+		})
 	}
 	return regs, nil
+}
+
+func readLocalContract(base, openAPIPath, rewritesPath string) (string, string, error) {
+	for _, file := range []string{openAPIPath, rewritesPath} {
+		if file == "" || !filepath.IsLocal(file) {
+			return "", "", errors.New("contract paths must be relative to the manifest")
+		}
+	}
+	spec, err := os.ReadFile(filepath.Join(base, openAPIPath))
+	if err != nil {
+		return "", "", err
+	}
+	rewrites, err := os.ReadFile(filepath.Join(base, rewritesPath))
+	if err != nil {
+		return "", "", err
+	}
+	return string(spec), string(rewrites), nil
 }
 
 // nameFromResource recovers the service name from an api-contract-<service>
@@ -71,39 +82,6 @@ func nameFromResource(name string) (string, bool) {
 	return service, found && serviceName.MatchString(service)
 }
 
-func registrationsFromStore(store cache.Store) ([]registration, error) {
-	items := store.List()
-	regs := make([]registration, 0, len(items))
-	for _, item := range items {
-		cm := item.(*corev1.ConfigMap)
-		service, hasName := cm.Data["serviceName"]
-		spec, hasSpec := cm.Data["openapi.yaml"]
-		rewrites, hasRewrites := cm.Data["rewrites.yaml"]
-		if len(cm.BinaryData) != 0 || len(cm.Data) != 3 || !hasName || !hasSpec || !hasRewrites ||
-			cm.Name != contractNamePrefix+service {
-			invalid := fmt.Errorf("invalid registration ConfigMap %s", cm.Name)
-			if name, ok := nameFromResource(cm.Name); ok {
-				regs = append(regs, registration{serviceName: name, invalid: invalid})
-				continue
-			}
-			return nil, invalid
-		}
-		regs = append(regs, registration{serviceName: service, openAPI: spec, rewrites: rewrites, created: cm.CreationTimestamp.Time})
-	}
-	return regs, nil
-}
-
-func newConfigMapInformer(config *rest.Config, namespace, apiGroup string) (cache.SharedIndexInformer, error) {
-	client, err := coreclient.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	api := cache.NewFilteredListWatchFromClient(client.RESTClient(), "configmaps", namespace, func(options *metav1.ListOptions) {
-		options.LabelSelector = apiGroup + "/contract=true"
-	})
-	return cache.NewSharedIndexInformer(api, &corev1.ConfigMap{}, 0, cache.Indexers{}), nil
-}
-
 type reconciler struct {
 	gateway   *gateway
 	active    *atomic.Pointer[snapshot]
@@ -111,66 +89,50 @@ type reconciler struct {
 	// lastGood holds the units serving in the active snapshot, by service.
 	lastGood map[string]*serviceUnit
 	logged   map[string]string
-	now      func() time.Time
-	held     string
-	// tombstones keep the deny list of a service whose contract was deleted, by
-	// public prefix, so its internal operations stay denied without an outage.
-	tombstones map[string][]operationKey
+	// warned holds the last logged rewrite warning per service.
+	warned map[string]string
+	// overrides remembers the contract-over-binding messages already logged.
+	overrides map[string]string
+	now       func() time.Time
 }
 
-// applyTombstones records each serving service's deny list and, for a service
-// that lost its contract after being served on this pod, restores that list and
-// lets the direct service route keep proxying. Services never served stay
-// unserved and fail closed.
-func (r *reconciler) applyTombstones(compiled *candidate, report compileReport) {
-	if r.tombstones == nil {
-		r.tombstones = make(map[string][]operationKey)
+// classify sets each service's explicit state and reason. Services whose
+// prefix has a direct service route fail closed (503) until a good contract
+// arrives, including after the contract was deleted; every other unaccepted
+// service is simply not installed.
+func (r *reconciler) classify(report *compileReport) {
+	bindings := r.gateway.bindings
+	names := make(map[string]bool, len(report.services)+len(bindings.Services))
+	for name := range report.services {
+		names[name] = true
 	}
-	var restored []string
-	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
-		binding := r.gateway.bindings.Services[name]
-		if binding.RegistrationOnly {
-			continue
-		}
-		if report.accepted[name] != nil {
-			r.tombstones[binding.Prefix] = slices.DeleteFunc(slices.Clone(compiled.denied), func(key operationKey) bool {
-				return key.path != binding.Prefix && !strings.HasPrefix(key.path, binding.Prefix+"/")
-			})
-			continue
-		}
-		if denied, ok := r.tombstones[binding.Prefix]; ok {
-			restored = append(restored, binding.Prefix)
-			compiled.denied = append(compiled.denied, denied...)
+	for name, binding := range bindings.Services {
+		if !binding.RegistrationOnly && binding.Prefix != "" {
+			names[name] = true
 		}
 	}
-	if len(restored) == 0 {
-		return
-	}
-	slices.SortFunc(compiled.denied, compareOperationKeys)
-	compiled.denied = slices.Compact(compiled.denied)
-	compiled.unserved = slices.DeleteFunc(compiled.unserved, func(prefix string) bool { return slices.Contains(restored, prefix) })
-	hash := sha256.New()
-	fmt.Fprintf(hash, "%s tombstoned %v", compiled.revision, restored)
-	for _, key := range compiled.denied {
-		fmt.Fprintf(hash, " %s %s", key.method, key.path)
-	}
-	compiled.revision = hex.EncodeToString(hash.Sum(nil))
-}
-
-func (r *reconciler) firstSnapshotBlock(report compileReport) string {
-	for _, name := range slices.Sorted(maps.Keys(r.gateway.bindings.Services)) {
-		if r.gateway.bindings.Services[name].RegistrationOnly {
-			continue
-		}
+	for name := range names {
 		outcome := report.services[name]
-		if outcome.missing {
-			return fmt.Sprintf("service %s has no contract", name)
+		reason := outcome.rejection
+		if reason == "" && outcome.missing || reason == "" && report.accepted[name] == nil {
+			reason = "no GatewayContract"
 		}
-		if outcome.rejection != "" {
-			return outcome.rejection
+		switch {
+		case outcome.serving == servingCurrent:
+			outcome.state, reason = stateServing, ""
+		case outcome.serving == servingLastGood:
+			outcome.state = stateServingLastGood
+		default:
+			outcome.state = stateNotInstalled
+			binding := bindings.Services[name]
+			if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && !binding.RegistrationOnly && binding.Prefix != "" {
+				outcome.state = stateDirectRouteClosed
+				reason += "; direct service route returns 503 until a good contract is seen"
+			}
 		}
+		outcome.reason = reason
+		report.services[name] = outcome
 	}
-	return ""
 }
 
 func (r *reconciler) apply(load func() ([]registration, error)) {
@@ -186,26 +148,17 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
-	r.applyTombstones(&compiled, report)
+	r.classify(&report)
 	r.logRejections(report)
+	r.logOverrides(report)
 	now := time.Now
 	if r.now != nil {
 		now = r.now
 	}
 	r.gateway.contractStatus.update(report, now())
 	old := r.active.Load()
-	if old == nil {
-		// A new pod only becomes ready with a complete, valid contract set, so a
-		// bad rollout never replaces serving pods. Once ready it keeps isolation.
-		if reason := r.firstSnapshotBlock(report); reason != "" {
-			if reason != r.held {
-				log.Printf("contract snapshot not ready: %s", reason)
-				r.held = reason
-			}
-			return
-		}
-		r.held = ""
-	}
+	// The first apply always stores a snapshot, so a pod is ready once its
+	// contracts are loaded whether or not any of them is valid.
 	if old == nil || old.revision != compiled.revision {
 		r.active.Store(r.gateway.build(compiled))
 		log.Printf("contract snapshot active revision=%s", compiled.revision)
@@ -234,6 +187,44 @@ func (r *reconciler) logRejections(report compileReport) {
 			delete(r.logged, name)
 		}
 	}
+	if r.warned == nil {
+		r.warned = make(map[string]string)
+	}
+	for _, name := range slices.Sorted(maps.Keys(report.services)) {
+		warning := report.services[name].warning
+		if warning == "" {
+			delete(r.warned, name)
+			continue
+		}
+		if r.warned[name] != warning {
+			log.Printf("contract rewrite denied: %s (service=%s)", strings.ReplaceAll(warning, "\n", " "), name)
+			r.warned[name] = warning
+		}
+	}
+	for name := range r.warned {
+		if _, present := report.services[name]; !present {
+			delete(r.warned, name)
+		}
+	}
+}
+
+// logOverrides logs where a contract disagrees with its bindings entry, once
+// per distinct message.
+func (r *reconciler) logOverrides(report compileReport) {
+	if r.overrides == nil {
+		r.overrides = make(map[string]string)
+	}
+	for _, name := range slices.Sorted(maps.Keys(report.overrides)) {
+		if r.overrides[name] != report.overrides[name] {
+			log.Print(report.overrides[name])
+			r.overrides[name] = report.overrides[name]
+		}
+	}
+	for name := range r.overrides {
+		if _, present := report.overrides[name]; !present {
+			delete(r.overrides, name)
+		}
+	}
 }
 
 func (r *reconciler) watchLocal(ctx context.Context, path string) {
@@ -250,7 +241,7 @@ func (r *reconciler) watchLocal(ctx context.Context, path string) {
 	}
 }
 
-func (r *reconciler) watchCluster(ctx context.Context, legacy, current cache.SharedIndexInformer) error {
+func (r *reconciler) watchCluster(ctx context.Context, current cache.SharedIndexInformer) error {
 	changed := make(chan struct{}, 1)
 	mark := func() {
 		select {
@@ -263,17 +254,15 @@ func (r *reconciler) watchCluster(ctx context.Context, legacy, current cache.Sha
 		UpdateFunc: func(any, any) { mark() },
 		DeleteFunc: func(any) { mark() },
 	}
-	for _, informer := range []cache.SharedIndexInformer{legacy, current} {
-		if _, err := informer.AddEventHandler(handler); err != nil {
-			return err
-		}
-		go informer.RunWithContext(ctx)
+	if _, err := current.AddEventHandler(handler); err != nil {
+		return err
 	}
-	if !cache.WaitForCacheSync(ctx.Done(), legacy.HasSynced, current.HasSynced) {
+	go current.RunWithContext(ctx)
+	if !cache.WaitForCacheSync(ctx.Done(), current.HasSynced) {
 		return nil
 	}
 	load := func() ([]registration, error) {
-		return loadClusterRegistrations(legacy.GetStore(), current.GetStore())
+		return loadClusterRegistrations(current.GetStore())
 	}
 	r.apply(load)
 	for {

@@ -14,8 +14,7 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/yaml"
 )
@@ -168,7 +167,7 @@ paths:
         '200': {description: OK}
 `
 	binding := serviceBinding{
-		Prefix: "/observatory",
+		Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80",
 		Operations: []operationSelection{{
 			Method: "get", Path: "/sky/objects",
 			Legacy: &legacySecurity{Profiles: []string{"sessionBearer"}},
@@ -199,7 +198,7 @@ paths:
 	}
 }
 
-func TestLocalAndConfigMapCandidatesMatch(t *testing.T) {
+func TestLocalAndGatewayContractCandidatesMatch(t *testing.T) {
 	bindings, err := loadBindings(filepath.Join("testdata", "bindings.json"), true)
 	if err != nil {
 		t.Fatal(err)
@@ -214,15 +213,24 @@ func TestLocalAndConfigMapCandidatesMatch(t *testing.T) {
 	}
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	for _, reg := range local {
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: contractNamePrefix + reg.serviceName, Namespace: "darban-fixtures"},
-			Data:       map[string]string{"serviceName": reg.serviceName, "openapi.yaml": reg.openAPI, "rewrites.yaml": reg.rewrites},
+		var rewrites []any
+		if err := yaml.Unmarshal([]byte(reg.rewrites), &rewrites); err != nil {
+			t.Fatal(err)
 		}
-		if err := store.Add(cm); err != nil {
+		object := plainGatewayContract(reg.serviceName, reg.openAPI)
+		if err := unstructured.SetNestedSlice(object.Object, rewrites, "spec", "rewrites"); err != nil {
+			t.Fatal(err)
+		}
+		if reg.defaultVisibility != nil {
+			if err := unstructured.SetNestedField(object.Object, string(*reg.defaultVisibility), "spec", "defaultVisibility"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.Add(object); err != nil {
 			t.Fatal(err)
 		}
 	}
-	watched, err := registrationsFromStore(store)
+	watched, err := loadClusterRegistrations(store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +365,10 @@ components:
 	internal, unlisted := visibilityInternal, visibilityUnlisted
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(), DefaultVisibility: &internal,
-		Services: map[string]serviceBinding{"observatory": {Prefix: "/observatory"}, "herbarium": {Prefix: "/herbarium"}},
+		Services: map[string]serviceBinding{
+			"observatory": {Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80"},
+			"herbarium":   {Prefix: "/herbarium", Origin: "http://herbarium.fixtures.svc.cluster.local:80"},
+		},
 	}
 	regs := []registration{
 		{serviceName: "observatory", openAPI: raw, rewrites: rewrites, defaultVisibility: &unlisted},
@@ -461,8 +472,8 @@ paths:
 		{serviceName: "catalog", openAPI: raw, rewrites: "[]"},
 	}
 	bindings := upstreamBindings{Services: map[string]serviceBinding{
-		"night-sky": {Prefix: "/night-sky"},
-		"catalog":   {Prefix: "/catalog"},
+		"night-sky": {Prefix: "/night-sky", Origin: "http://night-sky.fixtures.svc.cluster.local:80"},
+		"catalog":   {Prefix: "/catalog", Origin: "http://catalog.fixtures.svc.cluster.local:80"},
 	}}
 	_, err := compileStrict(regs, bindings)
 	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "listObjects"`) {

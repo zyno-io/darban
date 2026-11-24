@@ -23,13 +23,17 @@ type contractRejection struct {
 }
 
 // contractStatus reports one service's contract. Serving is current,
-// last-good, or none. Rejected is true while the service's latest contract is
+// last-good, or none. State is the explicit outcome: serving, serving_last_good,
+// not_installed or direct_route_closed, with the Reason. Rejected is true while the service's latest contract is
 // being rejected; LastRejection stays after the contract is fixed.
 type contractStatus struct {
 	Service       string             `json:"service"`
 	Serving       string             `json:"serving"`
 	Rejected      bool               `json:"rejected"`
 	Missing       bool               `json:"missing,omitempty"`
+	State         string             `json:"state"`
+	Reason        string             `json:"reason,omitempty"`
+	Warning       string             `json:"warning,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -43,7 +47,8 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	defer s.mu.Unlock()
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
-		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing}
+		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
+			State: outcome.state, Reason: outcome.reason, Warning: outcome.warning}
 		previous := s.services[name]
 		entry.LastRejection = previous.LastRejection
 		if entry.Rejected && !(previous.Rejected && previous.LastRejection != nil && previous.LastRejection.Message == outcome.rejection) {
@@ -78,8 +83,16 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 		stopping := draining.Load()
 		report := statusResponse{Status: "ready", Ready: snapshot != nil && !stopping}
 		report.Upstreams = append(report.Upstreams, upstreamStatus{"authz", "authorization", g.endpoints.state(g.bindings.Authz)})
-		for _, name := range slices.Sorted(maps.Keys(g.bindings.Services)) {
-			binding := g.bindings.Services[name]
+		// Contracts can add upstreams at runtime, so merge the served ones.
+		services := maps.Clone(g.bindings.Services)
+		if snapshot != nil {
+			if services == nil {
+				services = make(map[string]serviceBinding)
+			}
+			maps.Copy(services, snapshot.services)
+		}
+		for _, name := range slices.Sorted(maps.Keys(services)) {
+			binding := services[name]
 			report.Upstreams = append(report.Upstreams,
 				upstreamStatus{name, "primary", g.endpoints.state(binding.Origin)},
 				upstreamStatus{name, "debug", g.endpoints.state(binding.DebugOrigin)},

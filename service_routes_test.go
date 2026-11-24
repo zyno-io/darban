@@ -231,7 +231,7 @@ func TestServiceRouteBlocksInternalOperationsOutsideSelection(t *testing.T) {
 	bindings := upstreamBindings{
 		Hostname: "api.example.net",
 		Services: map[string]serviceBinding{
-			"catalog": {Prefix: "/catalog", Operations: []operationSelection{{Method: "get", Path: "/prices"}}},
+			"catalog": {Prefix: "/catalog", Origin: "http://catalog.default.svc.cluster.local:3000", Operations: []operationSelection{{Method: "get", Path: "/prices"}}},
 		},
 		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: "http://catalog.default.svc.cluster.local:3000"}},
 	}
