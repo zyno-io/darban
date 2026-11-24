@@ -59,15 +59,16 @@ func upstreamOrigin(address string, local bool) (*url.URL, error) {
 	host := target.Hostname()
 	clusterHost := serviceDNS.MatchString(host)
 	localHost := local && (host == "localhost" || net.ParseIP(host).IsLoopback())
-	if target.Scheme != "http" || (!clusterHost && !localHost) || target.Port() == "" ||
+	if (target.Scheme != "http" && target.Scheme != "https") || (!clusterHost && !localHost) || target.Port() == "" ||
 		target.Path != "" || target.RawQuery != "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("expected a private Kubernetes Service origin or local loopback")
 	}
 	return target, nil
 }
 
-func newTransport() *http.Transport {
+func newTransport(tlsConfig *tls.Config) *http.Transport {
 	return &http.Transport{
+		TLSClientConfig: tlsConfig,
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -81,8 +82,8 @@ func newTransport() *http.Transport {
 	}
 }
 
-func newDebugTransport() *http.Transport {
-	transport := newTransport()
+func newDebugTransport(tlsConfig *tls.Config) *http.Transport {
+	transport := newTransport(tlsConfig)
 	transport.DialContext = (&net.Dialer{Timeout: 350 * time.Millisecond}).DialContext
 	transport.ResponseHeaderTimeout = 600 * time.Millisecond
 	// Avoid implicit retries of debug requests with an Idempotency-Key.
@@ -153,6 +154,7 @@ type gateway struct {
 	transport      *http.Transport
 	debugTransport *http.Transport
 	authClient     *http.Client
+	upstreamTLS    *upstreamVerifier
 	endpoints      endpointCatalog
 }
 
@@ -168,15 +170,22 @@ func newGateway(bindings upstreamBindings) *gateway {
 			legacyPrefixes[host] = prefix
 		}
 	}
+	verifier, err := newUpstreamVerifier(bindings.UpstreamTLS)
+	if err != nil {
+		// loadBindings already validated the options.
+		log.Fatal(err)
+	}
+	tlsConfig := verifier.tlsConfig()
 	return &gateway{
-		serviceProxies: newServiceProxies(bindings),
+		upstreamTLS:    verifier,
+		serviceProxies: newServiceProxies(bindings, tlsConfig),
 		legacyPrefixes: legacyPrefixes,
 		bindings:       bindings,
 		targets:        targets,
-		transport:      newTransport(),
-		debugTransport: newDebugTransport(),
+		transport:      newTransport(tlsConfig),
+		debugTransport: newDebugTransport(tlsConfig),
 		authClient: &http.Client{
-			Transport:     newTransport(),
+			Transport:     newTransport(tlsConfig),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
@@ -430,6 +439,7 @@ func main() {
 	stopping, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	go refreshCertificate(stopping, *cert, *key, &currentCertificate)
+	go gateway.upstreamTLS.run(stopping)
 	gateway.endpoints.run(stopping)
 	failures := make(chan error, 3)
 	go func() { failures <- apiServer.ServeTLS(traffic, "", "") }()

@@ -99,6 +99,7 @@ type upstreamBindings struct {
 	Services               map[string]serviceBinding
 	DefaultVisibility      *operationVisibility
 	OpenAPI                openAPIConfig
+	UpstreamTLS            upstreamTLSConfig
 }
 
 type openAPIConfig struct {
@@ -238,6 +239,14 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	}
 	if !dnsName.MatchString(bindings.Hostname) || len(bindings.Services) == 0 {
 		return bindings, errors.New("hostname and service bindings required")
+	}
+	if err := bindings.UpstreamTLS.validate(); err != nil {
+		return bindings, err
+	}
+	if bindings.UpstreamTLS.CAFile != "" {
+		if _, err := loadCAPool(bindings.UpstreamTLS.CAFile); err != nil {
+			return bindings, fmt.Errorf("upstreamTLS.caFile: %w", err)
+		}
 	}
 	if bindings.Authz != "" {
 		if _, err := upstreamOrigin(bindings.Authz, local); err != nil {

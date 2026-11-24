@@ -188,6 +188,31 @@ chart creates a ClusterIP Service. Set `ingress.enabled`, `ingress.namespace`,
 and `ingress.gatewayName` to restrict its traffic port to a Gateway API
 controller's labeled pods.
 
+### HTTPS upstreams
+
+Service origins (`services[*].origin`, `debugOrigin`, `serviceRoutes[*].origin`)
+and `authz` accept `http://` or `https://`. The host rules, the required port
+and the ban on path, query, userinfo and fragment are unchanged. Upstream TLS
+uses TLS 1.2 or later and applies to every upstream transport.
+
+```json
+"upstreamTLS": { "caFile": "/etc/darban/upstream-ca/ca.crt", "insecureSkipVerify": false }
+```
+
+- With neither option, Darban verifies upstreams against the system roots.
+- `caFile` verifies against only the certificates in that PEM bundle,
+  replacing the system roots. Hostname verification stays on. The file must
+  parse at startup or Darban exits. It is re-read every 10 seconds, like the
+  serving certificate. A bundle that fails to parse keeps the last good one
+  and logs each distinct error once. New connections use the current bundle.
+- `insecureSkipVerify: true` disables verification and logs a warning at
+  startup. Setting it together with `caFile` is a configuration error.
+
+In the chart, set `upstreamTLS.caSecretName` or `upstreamTLS.caConfigMapName`
+(not both) and optionally `upstreamTLS.key` (default `ca.crt`). The chart
+mounts it at `/etc/darban/upstream-ca` and sets `bindings.upstreamTLS.caFile`
+to match. Leaving them unset changes nothing.
+
 ### Contract isolation
 
 Darban compiles each service's contract on its own, so one service cannot

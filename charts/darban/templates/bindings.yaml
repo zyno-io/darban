@@ -1,3 +1,13 @@
+{{- $bindings := deepCopy (required "bindings are required" .Values.bindings) }}
+{{- $ca := .Values.upstreamTLS }}
+{{- if and $ca.caSecretName $ca.caConfigMapName }}
+{{- fail "set only one of upstreamTLS.caSecretName and upstreamTLS.caConfigMapName" }}
+{{- end }}
+{{- if or $ca.caSecretName $ca.caConfigMapName }}
+{{- $tls := deepCopy (default dict $bindings.upstreamTLS) }}
+{{- $_ := set $tls "caFile" (printf "/etc/darban/upstream-ca/%s" ($ca.key | default "ca.crt")) }}
+{{- $_ := set $bindings "upstreamTLS" $tls }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,4 +15,4 @@ metadata:
   labels:
     {{- include "app.labels" . | nindent 4 }}
 data:
-  bindings.json: {{ required "bindings are required" .Values.bindings | toJson | quote }}
+  bindings.json: {{ $bindings | toJson | quote }}
