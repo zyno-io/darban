@@ -594,3 +594,54 @@ components:
 		t.Fatalf("default example: %v", ref)
 	}
 }
+
+func TestPassthroughPatternNeverShadowsAnInternalParameter(t *testing.T) {
+	bindings := shopBindings()
+	bindings.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: []operationSelection{{Method: "get", Path: "/sel"}}}
+	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {BackendAuth: true}}
+	h := newTemplateHarness(t, bindings,
+		anonymousOperation("get", "/sel", "sel"),
+		anonymousOperation("get", "/v1/items{batch}", "batch"),
+		"  /v1/{id}:\n    get:\n      x-darban-visibility: internal\n",
+	)
+	// TSF routes /v1/items:batch to the literal and anything else, including
+	// /v1/itemsZ, to the internal /v1/:id. The pattern cannot tell them apart,
+	// so the denial wins.
+	for path, want := range map[string]int{"/shop/v1/itemsZ": 404, "/shop/v1/items:batch": 404, "/shop/v1/other": 404, "/shop/sel": 418} {
+		if code, _ := h.do("GET", path); code != want {
+			t.Errorf("GET %s = %d, want %d", path, code, want)
+		}
+	}
+}
+
+func TestExampleDataIsNotParsed(t *testing.T) {
+	schemas, operation := composedComponents(t, `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Pet'}
+              examples:
+                sample: {value: {discriminator: cat, $ref: kept}}
+components:
+  schemas:
+    Pet:
+      type: object
+      examples: [{discriminator: cat, $ref: kept}]
+`)
+	media := operation["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)
+	value := media["examples"].(map[string]any)["sample"].(map[string]any)["value"].(map[string]any)
+	data := schemas["zoo.Pet"]["examples"].([]any)[0].(map[string]any)
+	for _, example := range []map[string]any{value, data} {
+		if example["discriminator"] != "cat" || example["$ref"] != "kept" {
+			t.Errorf("example data changed: %v", example)
+		}
+	}
+}

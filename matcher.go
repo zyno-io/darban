@@ -165,6 +165,14 @@ func (n *routeNode) match(segments []string) *routeEntry {
 	for _, pattern := range n.patterns {
 		if pattern.match.MatchString(segments[0]) {
 			if entry := pattern.node.match(segments[1:]); entry != nil {
+				// A pattern is looser than the backend's literal, so it may claim
+				// a path the backend gives to a parameter. It never passes such a
+				// path through when the parameter branch denies it.
+				if entry.kind != entryDenied {
+					if denied := n.param.match(segments[1:]); denied != nil && denied.kind == entryDenied {
+						return denied
+					}
+				}
 				return entry
 			}
 		}

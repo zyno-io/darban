@@ -100,8 +100,8 @@ schema that no mapping value targets. For a base schema without `oneOf` or
 that a published operation already references. It never publishes an
 extender for this alone.
 
-Values under `example`, `default`, `const` and `enum` are data and are copied
-as written. Where those words are names instead, such as a property called
+Values under `example`, `default`, `const` and `enum`, an Example Object's
+`value` and a schema's list of `examples` are data and are copied as written. Where those words are names instead, such as a property called
 `default`, the `default` response or a `default` entry under `examples`,
 their objects are imported and their references renamed.
 
@@ -139,7 +139,10 @@ route `HEAD`. The caller gets the response headers without the body.
 
 When a service's bindings select `operations`, the unselected ones still
 take part in matching, as written like `internal` ones, so a selected template
-cannot capture their paths.
+cannot capture their paths. A template inside an unselected operation's
+segment may claim more than the backend's literal does, so it never wins over
+an `internal` parameter: with an unselected `/v1/items{batch}` and an internal
+`/v1/{id}`, `/v1/itemsZ` and `/v1/items:batch` return `404`.
 On a prefix with a [direct Service route](#direct-service-routes) they go to
 that route with its own policy, and elsewhere they return `404`.
 

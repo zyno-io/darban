@@ -533,7 +533,7 @@ func importComponent(service, kind, name string, source sourceDoc, out map[strin
 // whose values are objects to import. A name such as default or $ref is then
 // not a keyword.
 var nameMaps = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
-	"responses", "headers", "content", "encoding", "links", "schemas", "requestBodies", "parameters", "securitySchemes", "examples"}
+	"responses", "headers", "content", "encoding", "links", "schemas", "requestBodies", "parameters", "securitySchemes"}
 
 func importReferences(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
 	return importValue(value, false, service, source, out)
@@ -574,9 +574,22 @@ func importValue(value any, names bool, service string, source sourceDoc, out ma
 					return nil, err
 				}
 				copy[key] = expanded
-			case "example", "default", "const", "enum":
-				// Singular example and schema values contain data, not references.
+			case "example", "default", "const", "enum", "value":
+				// Singular example and schema values, and an Example Object's
+				// value, contain data, not references.
 				copy[key] = val
+			case "examples":
+				// A map of Example Objects is a field of names. A list is a
+				// schema's example data.
+				if _, isMap := val.(map[string]any); !isMap {
+					copy[key] = val
+					continue
+				}
+				expanded, err := importValue(val, true, service, source, out)
+				if err != nil {
+					return nil, err
+				}
+				copy[key] = expanded
 			default:
 				_, isMap := val.(map[string]any)
 				expanded, err := importValue(val, isMap && slices.Contains(nameMaps, key), service, source, out)
