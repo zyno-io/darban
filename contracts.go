@@ -546,8 +546,14 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 					return nil, err
 				}
 				copy[key] = "#/components/" + parts[2] + "/" + name
-			case "$id", "$dynamicRef", "discriminator":
+			case "$id", "$dynamicRef":
 				return nil, fmt.Errorf("unsupported reference feature %q", key)
+			case "discriminator":
+				expanded, err := importDiscriminator(val, service, source, out)
+				if err != nil {
+					return nil, err
+				}
+				copy[key] = expanded
 			case "example", "examples", "default", "const", "enum":
 				// Singular example and schema values contain data, not references.
 				// Examples maps can hold OpenAPI Reference Objects.
@@ -582,6 +588,49 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 	default:
 		return value, nil
 	}
+}
+
+// importDiscriminator imports the schemas a Discriminator Object maps to and
+// renames its mapping values like a $ref. A mapping value is a schema
+// reference or a bare schema name, and keeps its form. Any other value, such
+// as the schema of a property named discriminator, is imported as a schema.
+func importDiscriminator(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
+	object, ok := value.(map[string]any)
+	if _, named := object["propertyName"].(string); !ok || !named {
+		return importReferences(value, service, source, out)
+	}
+	mapping, hasMapping := object["mapping"].(map[string]any)
+	for key := range object {
+		if key != "propertyName" && !strings.HasPrefix(key, "x-") && !(key == "mapping" && hasMapping) {
+			return importReferences(value, service, source, out)
+		}
+	}
+	for _, target := range mapping {
+		if _, ok := target.(string); !ok {
+			return importReferences(value, service, source, out)
+		}
+	}
+	imported := maps.Clone(object)
+	if hasMapping {
+		renamed := make(map[string]any, len(mapping))
+		for _, key := range slices.Sorted(maps.Keys(mapping)) {
+			target := mapping[key].(string)
+			name, isRef := strings.CutPrefix(target, "#/components/schemas/")
+			if !componentID.MatchString(name) {
+				return nil, fmt.Errorf("unsupported discriminator mapping %q", target)
+			}
+			prefixed, err := importComponent(service, "schemas", name, source, out)
+			if err != nil {
+				return nil, err
+			}
+			if isRef {
+				prefixed = "#/components/schemas/" + prefixed
+			}
+			renamed[key] = prefixed
+		}
+		imported["mapping"] = renamed
+	}
+	return imported, nil
 }
 
 func parseOpenAPI(openAPI string) (sourceDoc, error) {

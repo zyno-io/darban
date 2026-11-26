@@ -86,6 +86,13 @@ The composed OpenAPI preserves upstream `operationId` values and rejects
 duplicates among published operations. A rewrite keeps the ID of the
 original route when it has one.
 
+A schema's `discriminator` is imported with it. Each `mapping` value, a
+`#/components/schemas/X` reference or a bare `X`, imports `X` and is renamed
+like a `$ref`, to `#/components/schemas/<service>.X` or `<service>.X`. A
+discriminator has a string `propertyName`, an optional `mapping` of strings
+and `x-` extensions. Any other value under that key, such as the schema of a
+property named `discriminator`, is imported as a schema.
+
 `openapi.prefixTags` controls how Darban groups operations for SDK generation.
 The default `all` prefixes every tag with the lower-camel-case service name
 and capitalizes the first letter of the upstream tag. For example, `items`

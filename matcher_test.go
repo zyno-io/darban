@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 func anonymousOperation(method, path, operationID string) string {
@@ -186,6 +188,80 @@ func TestOperationPathValidation(t *testing.T) {
 		_, report := compile([]registration{reg}, bindings, nil)
 		if rejected := report.services["shop"].rejection != ""; rejected == test.valid {
 			t.Errorf("%s: rejection %q", name, report.services["shop"].rejection)
+		}
+	}
+}
+
+func TestDiscriminatorMappingIsImportedAndRenamed(t *testing.T) {
+	contract := `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Pet'}
+components:
+  schemas:
+    Pet:
+      oneOf: [{$ref: '#/components/schemas/Cat'}, {$ref: '#/components/schemas/Dog'}]
+      discriminator:
+        propertyName: kind
+        x-note: kept
+        mapping: {cat: '#/components/schemas/Cat', dog: Dog, bird: Bird}
+      properties:
+        discriminator: {$ref: '#/components/schemas/Tag'}
+    Cat: {type: object}
+    Dog: {type: object}
+    Bird: {type: object}
+    Tag: {type: string}
+    Unused: {type: object}
+`
+	got, report := compile([]registration{{serviceName: "zoo", rewrites: "[]", openAPI: contract}}, isolationBindings("zoo"), nil)
+	if rejection := report.services["zoo"].rejection; rejection != "" {
+		t.Fatal(rejection)
+	}
+	var document struct {
+		Components struct {
+			Schemas map[string]map[string]any `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := yaml.Unmarshal(got.specYAML, &document); err != nil {
+		t.Fatal(err)
+	}
+	schemas := document.Components.Schemas
+	for _, name := range []string{"zoo.Pet", "zoo.Cat", "zoo.Dog", "zoo.Bird", "zoo.Tag"} {
+		if _, ok := schemas[name]; !ok {
+			t.Errorf("%s not imported: %v", name, schemas)
+		}
+	}
+	if _, ok := schemas["zoo.Unused"]; ok {
+		t.Error("an unreferenced schema was imported")
+	}
+	discriminator := schemas["zoo.Pet"]["discriminator"].(map[string]any)
+	mapping := discriminator["mapping"].(map[string]any)
+	if mapping["cat"] != "#/components/schemas/zoo.Cat" || mapping["dog"] != "zoo.Dog" || mapping["bird"] != "zoo.Bird" ||
+		discriminator["propertyName"] != "kind" || discriminator["x-note"] != "kept" {
+		t.Fatalf("discriminator %v", discriminator)
+	}
+	property := schemas["zoo.Pet"]["properties"].(map[string]any)["discriminator"].(map[string]any)
+	if property["$ref"] != "#/components/schemas/zoo.Tag" {
+		t.Fatalf("property named discriminator %v", property)
+	}
+
+	for name, mapping := range map[string]string{
+		"external document": "{cat: 'other.yaml#/components/schemas/Cat'}",
+		"unknown schema":    "{cat: Missing}",
+	} {
+		bad := strings.Replace(contract, "{cat: '#/components/schemas/Cat', dog: Dog, bird: Bird}", mapping, 1)
+		_, report := compile([]registration{{serviceName: "zoo", rewrites: "[]", openAPI: bad}}, isolationBindings("zoo"), nil)
+		if report.services["zoo"].rejection == "" {
+			t.Errorf("%s: accepted", name)
 		}
 	}
 }
