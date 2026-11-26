@@ -56,6 +56,11 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		}
 		summary["services"]++
 	}
+	// The checks -print-spec applies beyond rejections.
+	for _, problem := range rewritesWithoutContract(report) {
+		fmt.Fprintf(w, "problem: %s\n", oneLine(problem))
+		ok = false
+	}
 
 	for _, name := range slices.Sorted(maps.Keys(byName)) {
 		reg := byName[name]
@@ -106,10 +111,14 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
 			target := unit.aliases[from]
 			result := reportOutcome(from, name, unit.binding, true, bindings, table)
+			summary[result]++
+			summary["rewrites"]++
 			lines = append(lines, fmt.Sprintf("%s %s %s rewrite to=%s:%s -> %s", from.method, from.path, name, target.service, target.key.path, result))
 		}
 		for _, extra := range unit.extras {
 			result := reportOutcome(extra.key, name, unit.binding, true, bindings, table)
+			summary[result]++
+			summary["extras"]++
 			auth := extraAuthNone
 			if extra.protected {
 				auth = extraAuthGateway

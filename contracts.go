@@ -336,7 +336,7 @@ type candidate struct {
 	// counts holds, by service, its routed, documented and denied keys.
 	counts map[string]serviceCounts
 	// shadow holds the operations of each docs-only service, by service.
-	shadow   map[string][]shadowOperation
+	shadow   map[string]shadowContract
 	specYAML []byte
 	specJSON []byte
 	revision string
@@ -1194,15 +1194,25 @@ func compileStrict(regs []registration, bindings upstreamBindings) (candidate, e
 			return out, fmt.Errorf("missing contract for service %q", name)
 		}
 	}
+	if problems := rewritesWithoutContract(report); len(problems) > 0 {
+		return out, errors.New(problems[0])
+	}
+	return out, nil
+}
+
+// rewritesWithoutContract describes each served rewrite whose target service
+// has no accepted contract, which one-shot checks treat as errors.
+func rewritesWithoutContract(report compileReport) []string {
+	var problems []string
 	for _, name := range slices.Sorted(maps.Keys(report.accepted)) {
 		unit := report.accepted[name]
 		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
 			if target := unit.aliases[from].service; report.accepted[target] == nil {
-				return out, fmt.Errorf("service %s: rewrite %s %s targets service %q without a contract", name, from.method, from.path, target)
+				problems = append(problems, fmt.Sprintf("service %s: rewrite %s %s targets service %q without a contract", name, from.method, from.path, target))
 			}
 		}
 	}
-	return out, nil
+	return problems
 }
 
 // selectUnits assembles every preferred unit together. When that fails it
@@ -1406,9 +1416,9 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		if !unit.binding.routed() {
 			unroutedDigests[name] = unit.openAPIDigest
 			if out.shadow == nil {
-				out.shadow = make(map[string][]shadowOperation)
+				out.shadow = make(map[string]shadowContract)
 			}
-			out.shadow[name] = unit.shadow
+			out.shadow[name] = shadowContract{unit.openAPIDigest, unit.shadow}
 		}
 		maps.Copy(native, unit.native)
 		for key := range unit.native {

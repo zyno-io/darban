@@ -175,12 +175,24 @@ func loadContractList(path string) ([]registration, error) {
 	if list.Items == nil {
 		return nil, fmt.Errorf("%s: expected a list with items", path)
 	}
+	// Cluster mode watches one namespace, where each name is one service.
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
-	for _, item := range list.Items {
+	namespace, names := "", make(map[string]bool, len(list.Items))
+	for i, item := range list.Items {
 		object := &unstructured.Unstructured{Object: item}
 		if kind := object.GetKind(); kind != "" && kind != "GatewayContract" {
 			return nil, fmt.Errorf("%s: unexpected %s %s", path, kind, object.GetName())
 		}
+		if i == 0 {
+			namespace = object.GetNamespace()
+		}
+		if object.GetNamespace() != namespace {
+			return nil, fmt.Errorf("%s: contracts from namespaces %q and %q; list one namespace", path, namespace, object.GetNamespace())
+		}
+		if names[object.GetName()] {
+			return nil, fmt.Errorf("%s: %s is listed twice", path, object.GetName())
+		}
+		names[object.GetName()] = true
 		if err := store.Add(object); err != nil {
 			return nil, err
 		}

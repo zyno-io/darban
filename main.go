@@ -304,10 +304,10 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		active.passthrough[key] = true
 	}
 	active.shadow = make(map[string]*shadowTable)
-	for service, operations := range compiled.shadow {
+	for service, contract := range compiled.shadow {
 		if prefix := compiled.services[service].Prefix; prefix != "" {
 			if _, direct := g.bindings.ServiceRoutes[prefix]; direct {
-				active.shadow[prefix] = newShadowTable(service, operations, g.shadow.counters(service))
+				active.shadow[prefix] = newShadowTable(service, contract, g.shadow.counters(service, contract.digest))
 			}
 		}
 	}
@@ -430,8 +430,15 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		}
 		// Without a routed service, the route's own path policy decides.
 		if !active.routed[prefix] {
-			if shadow := active.shadow[prefix]; shadow != nil {
-				shadow.observe(method, path, r.URL.Path, legacyPrefix, route.BackendAuth)
+			// Shadow mode compares what the route does today with the contract.
+			// A preflight is about another request, so it is not compared.
+			if shadow := active.shadow[prefix]; shadow != nil && !(r.Method == http.MethodOptions && requested != "") {
+				shadow.observe(shadowRequest{
+					method: r.Method, raw: path, decoded: r.URL.Path, legacyPrefix: legacyPrefix,
+					allowed:     route.allowsPath(servicePath),
+					skipAuth:    route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath),
+					backendAuth: route.BackendAuth,
+				})
 			}
 			g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method, route.BackendCORS && corsPreflight)
 			return

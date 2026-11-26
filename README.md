@@ -611,18 +611,32 @@ contract: its traffic stays on the direct route either way.
 prefix, including the rewrites it owns, that the active snapshot routes,
 documents and denies. `warnings` lists the service's rewrites that are denied
 although their target is served, and the operations a publish-only service
-leaves out of the document. For a `route: false` service on a direct route, `shadow` compares its real
-traffic with its contract. Each request the route serves is also matched
-against the contract's operations, of any visibility: `matched`,
-`wouldDeny` (an `internal` operation), `unmatched`, and of the matched ones
-`wouldSkipAuth` (anonymous, or a `backendAuth` route) and `wouldAuthorize`.
-Up to 20 distinct `samples` per kind read `kind METHOD template`: the
-operation's template, or for an unmatched request its path with every
-segment that is not a plain lowercase word replaced by `{}`, cut after six
-segments. They never hold a query, an identifier or a raw path. The counts
-survive contract updates and reset when the pod restarts. An unmatched sample
-is a path the service needs to declare, or to list in `extraRoutes`, before
-it moves to `route: true`.
+leaves out of the document.
+
+For a `route: false` service on a direct route, `shadow` compares its real
+traffic with its contract:
+
+- A request the route's own rules refuse today counts as `refusedToday` and
+  is not compared. Preflights are not compared either.
+- Every other request is matched against the contract's operations, of any
+  visibility: `matched`, `wouldDeny` (an `internal` operation, which the
+  route serves today) or `unmatched` (a path the contract does not declare).
+- A matched request counts as `wouldSkipAuth` (anonymous, or a `backendAuth`
+  route) or `wouldAuthorize` under the contract. `nowAuthzWouldSkip` and
+  `nowSkipWouldAuthorize` count those whose authorization changes from
+  today's, where `publicPaths` and `backendAuth` decide.
+- `samples` lists, per kind, the 20 most frequent `METHOD template` entries
+  with their counts. A matched request's template is its operation's. An
+  unmatched one keeps only segments that are literals of the contract's
+  templates, writes `{}` for any other, and stops after six segments. A
+  method outside the standard ones is `OTHER`. Samples never hold a query,
+  an identifier or a raw path. Each kind counts up to 256 distinct samples,
+  and `overflow` counts the requests beyond them.
+
+The counts reset when the contract changes or the pod restarts. An unmatched
+sample is a path the service needs to declare, or to list in `extraRoutes`,
+before it moves to `route: true`.
+
 The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
