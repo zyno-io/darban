@@ -100,6 +100,24 @@ func validBrowserOrigin(target *url.URL, local bool) bool {
 		target.Fragment == "" && target.Opaque == ""
 }
 
+// canonicalPath reports whether a request path, as sent and as decoded, has
+// one meaning: no empty, . or .. segment (also when encoded), no encoded / or
+// \, no \, and nothing that path.Clean changes other than one trailing slash.
+func canonicalPath(raw, decoded string) bool {
+	lower := strings.ToLower(raw)
+	if strings.Contains(raw, "//") || strings.Contains(raw, `\`) ||
+		strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") {
+		return false
+	}
+	for _, segment := range strings.Split(raw, "/") {
+		if value, err := url.PathUnescape(segment); err != nil || value == "." || value == ".." {
+			return false
+		}
+	}
+	cleaned := path.Clean(decoded)
+	return decoded == cleaned || decoded == cleaned+"/"
+}
+
 func routePrefix(rawPath string) string {
 	if !strings.HasPrefix(rawPath, "/") {
 		return ""
