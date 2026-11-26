@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -41,8 +43,8 @@ components:
     account: {type: http, scheme: bearer}
 `
 
-// proxyRig serves the shop service, with a direct route when route is set,
-// and records what the upstream and the authorizer receive.
+// proxyRig serves the shop service with the given settings, and records what
+// the upstream and the authorizer receive.
 type proxyRig struct {
 	h          *skipHarness
 	upstream   *http.Request
@@ -50,7 +52,7 @@ type proxyRig struct {
 	authzCode  int
 }
 
-func newProxyRig(t *testing.T, route *serviceRoute, binding serviceBinding) *proxyRig {
+func newProxyRig(t *testing.T, binding serviceBinding) *proxyRig {
 	r := &proxyRig{authzCode: http.StatusNoContent}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		r.upstream = q.Clone(q.Context())
@@ -80,13 +82,8 @@ func newProxyRig(t *testing.T, route *serviceRoute, binding serviceBinding) *pro
 			ResponseHeaders: []string{"X-Id"}, StripHeaderPrefixes: []string{"X-Id-"}},
 		Services: map[string]serviceBinding{"shop": binding},
 	}
-	if route != nil {
-		route.Origin = upstream.URL
-		bindings.ServiceRoutes = map[string]serviceRoute{"/shop": *route}
-	} else {
-		binding.Origin = upstream.URL
-		bindings.Services["shop"] = binding
-	}
+	binding.Origin = upstream.URL
+	bindings.Services["shop"] = binding
 	r.h = newSkipHarness(t, bindings)
 	r.h.apply(registration{serviceName: "shop", rewrites: "[]", openAPI: proxyContract})
 	if status := r.h.status()["shop"]; status.Rejected {
@@ -107,9 +104,9 @@ func (r *proxyRig) do(method, path string, headers map[string]string) *httptest.
 	return res
 }
 
-func TestRoutedServiceAuthorizationModel(t *testing.T) {
-	for name, route := range map[string]*serviceRoute{"direct": {}, "contract only": nil} {
-		r := newProxyRig(t, route, serviceBinding{Prefix: "/shop"})
+func TestServiceAuthorizationModel(t *testing.T) {
+	for name, binding := range map[string]serviceBinding{"service": {Prefix: "/shop"}} {
+		r := newProxyRig(t, binding)
 		spoofed := map[string]string{"X-Id": "forged", "X-Id-Extra": "forged", "X-Tenant": "t1"}
 
 		// Any scheme goes to the authorizer as sent. The upstream gets the
@@ -159,9 +156,9 @@ func TestRoutedServiceAuthorizationModel(t *testing.T) {
 		}
 	}
 
-	// A backendAuth route leaves every operation's authorization to the
+	// A backendAuth service leaves every operation's authorization to the
 	// backend, with the caller's Authorization.
-	r := newProxyRig(t, &serviceRoute{BackendAuth: true}, serviceBinding{Prefix: "/shop"})
+	r := newProxyRig(t, serviceBinding{Prefix: "/shop", BackendAuth: true})
 	res := r.do("GET", "/shop/items/1", map[string]string{"Authorization": "Bearer abc"})
 	if res.Code != http.StatusTeapot || r.authorizer != nil || r.upstream.Header.Get("Authorization") != "Bearer abc" {
 		t.Errorf("backendAuth: %d %v", res.Code, r.upstream)
@@ -171,17 +168,17 @@ func TestRoutedServiceAuthorizationModel(t *testing.T) {
 	}
 }
 
-func TestRoutedServiceUsesTheDirectRouteTransport(t *testing.T) {
-	r := newProxyRig(t, &serviceRoute{UpstreamHost: "shop.internal.example", LegacyHosts: []string{"shop.example.net"}}, serviceBinding{Prefix: "/shop"})
+func TestServiceTransportSettings(t *testing.T) {
+	r := newProxyRig(t, serviceBinding{Prefix: "/shop", UpstreamHost: "shop.internal.example", LegacyHosts: []string{"shop.example.net"}})
 
-	// Longer than the contract transport's 2s, within the route's timeout.
+	// Within the regular 60s response-header timeout.
 	if res := r.do("GET", "/shop/slow", nil); res.Code != http.StatusTeapot {
 		t.Errorf("slow handler = %d", res.Code)
 	}
 	if r.upstream.Host != "shop.internal.example" || r.upstream.URL.Path != "/slow" {
 		t.Errorf("upstream host %q path %q", r.upstream.Host, r.upstream.URL.Path)
 	}
-	// Redirects and cookies are scoped to the prefix, as on the route.
+	// Redirects and cookies are scoped to the prefix.
 	res := r.do("GET", "/shop/redirect", nil)
 	if res.Code != http.StatusFound || res.Header().Get("Location") != "/shop/items/next" {
 		t.Errorf("redirect %d %q", res.Code, res.Header().Get("Location"))
@@ -217,8 +214,8 @@ func TestRoutedServiceUsesTheDirectRouteTransport(t *testing.T) {
 	}
 }
 
-func TestBackendCORSRouteLeavesPreflightToTheBackend(t *testing.T) {
-	r := newProxyRig(t, &serviceRoute{BackendCORS: true}, serviceBinding{Prefix: "/shop"})
+func TestBackendCORSServiceLeavesPreflightToTheBackend(t *testing.T) {
+	r := newProxyRig(t, serviceBinding{Prefix: "/shop", BackendCORS: true})
 	// A preflight carries no credentials, so it goes to the backend as is.
 	res := r.do("OPTIONS", "/shop/items/1", map[string]string{"Origin": "https://unknown.example", "Access-Control-Request-Method": "GET"})
 	if r.upstream == nil || r.authorizer != nil || res.Header().Get("Access-Control-Allow-Origin") != "https://backend.example" {
@@ -238,8 +235,8 @@ func TestExtraRoutes(t *testing.T) {
 		// An operation of the same shape keeps its own policy.
 		{Method: "GET", Path: "/items/{key}", Auth: extraAuthNone},
 	}}
-	for name, route := range map[string]*serviceRoute{"direct": {}, "contract only": nil} {
-		r := newProxyRig(t, route, binding)
+	for name, binding := range map[string]serviceBinding{"service": binding} {
+		r := newProxyRig(t, binding)
 		for _, test := range []struct {
 			path, authorization string
 			code                int
@@ -294,35 +291,51 @@ func TestExtraRoutesValidation(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	unrouted := `{"hostname": "api.example.net", "services": {"shop": {"route": false, "publish": false, "extraRoutes": [{"method": "GET", "path": "/x", "auth": "none"}]}}}`
-	if err := writeBindings(t, unrouted); err == nil {
-		t.Error("extraRoutes on a route: false service accepted")
+	ignored := `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80", "authorization": {"path": "/authz"},
+		"services": {"shop": {"backendAuth": true, "extraRoutes": [{"method": "GET", "path": "/x", "auth": "gateway"}]}}}`
+	if err := writeBindings(t, ignored); err == nil {
+		t.Error("auth gateway on a backendAuth service accepted")
 	}
 }
 
-func TestRoutedContractMustUseTheDirectRouteOrigin(t *testing.T) {
+func TestDiscoveryDefaultsAndBindingOverrides(t *testing.T) {
 	bindings := contractOnlyBindings()
 	bindings.Authz = "http://authz.zyno-alpha.svc.cluster.local:80"
-	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {Origin: "http://shop.zyno-alpha.svc.cluster.local:3000"}}
-	bindings.Services["shop"] = serviceBinding{Prefix: "/shop"}
-	for upstream, ok := range map[string]bool{
-		"http://shop:3000": true,
-		"HTTP://SHOP.zyno-alpha.svc.cluster.local:3000":    true,
-		"http://shop.zyno-alpha.svc.cluster.local:3001":    false,
-		"https://shop.zyno-alpha.svc.cluster.local:3000":   false,
-		"http://other.zyno-alpha.svc.cluster.local:3000":   false,
-		"http://shop.zyno-alpha.svc.cluster.local:3000/v1": false,
-	} {
-		reg := clusterContract("shop", "/items", "listShop", upstream, "")
-		_, report := compile([]registration{reg}, bindings, nil)
-		if rejected := report.services["shop"].rejection != ""; rejected == ok {
-			t.Errorf("%s: rejection %q", upstream, report.services["shop"].rejection)
+	// No entry: the contract's upstream, mount and prefix.
+	plain := clusterContract("plain", "/api/items", "listPlain", "http://plain:3000/api", "")
+	// An entry overrides the contract's origin, adds settings, and keeps the
+	// contract's mount.
+	bindings.Services["shop"] = serviceBinding{Origin: "http://shop-v2." + testNamespace + ".svc.cluster.local:8080",
+		UpstreamHost: "shop.internal.example", BackendAuth: true}
+	shop := clusterContract("shop", "/api/items", "listShop", "http://shop:3000/api", "/store")
+	// An entry with its own prefix wins over the contract's.
+	bindings.Services["desk"] = serviceBinding{Prefix: "/help"}
+	desk := clusterContract("desk", "/items", "listDesk", "http://desk:3000", "/desk")
+	got, report := compile([]registration{plain, shop, desk}, bindings, nil)
+	for _, name := range []string{"plain", "shop", "desk"} {
+		if outcome := report.services[name]; outcome.serving != servingCurrent {
+			t.Fatalf("%s: %+v", name, outcome)
 		}
 	}
-	// Without spec.upstream, the contract uses the route's origin.
-	reg := contractFor("shop", "/items", "listShop")
-	got, report := compile([]registration{reg}, bindings, nil)
-	if report.services["shop"].rejection != "" || got.services["shop"].Origin != "http://shop.zyno-alpha.svc.cluster.local:3000" {
-		t.Fatalf("fallback: %+v %+v", report.services["shop"], got.services["shop"])
+	wantPaths(t, got, "/help/items", "/plain/items", "/store/items")
+	want := map[string]serviceBinding{
+		"plain": {Origin: "http://plain." + testNamespace + ".svc.cluster.local:3000", Mount: "/api", Prefix: "/plain"},
+		"shop": {Origin: "http://shop-v2." + testNamespace + ".svc.cluster.local:8080", Mount: "/api", Prefix: "/store",
+			UpstreamHost: "shop.internal.example", BackendAuth: true},
+		"desk": {Origin: "http://desk." + testNamespace + ".svc.cluster.local:3000", Prefix: "/help"},
+	}
+	for name, binding := range want {
+		if !reflect.DeepEqual(got.services[name], binding) {
+			t.Errorf("%s: %+v, want %+v", name, got.services[name], binding)
+		}
+	}
+	if !strings.Contains(report.overrides["shop"], "origin") || !strings.Contains(report.overrides["desk"], "prefix") || report.overrides["plain"] != "" {
+		t.Errorf("overrides %v", report.overrides)
+	}
+	// An entry without a contract fails closed.
+	bindings.Services["idle"] = serviceBinding{Origin: "http://idle." + testNamespace + ".svc.cluster.local:80"}
+	got, report = compile([]registration{plain}, bindings, nil)
+	if !report.services["idle"].missing || !slices.Contains(got.unserved, "/idle") || !slices.Contains(got.unserved, "/shop") {
+		t.Errorf("idle %+v unserved %v", report.services["idle"], got.unserved)
 	}
 }

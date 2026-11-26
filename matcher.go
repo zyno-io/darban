@@ -81,7 +81,7 @@ const (
 	entryDenied routeEntryKind = iota
 	entryRoute
 	// entryPassthrough is an operation the service's bindings leave
-	// unselected. It is not routed through the contract, but it keeps a
+	// unselected. It is refused like an undeclared path, and it keeps a
 	// selected template from capturing its path.
 	entryPassthrough
 )

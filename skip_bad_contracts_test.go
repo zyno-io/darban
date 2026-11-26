@@ -67,20 +67,29 @@ func originBindings(origin string, names ...string) upstreamBindings {
 	return bindings
 }
 
-func TestBadFirstContractIsNotInstalledOthersServe(t *testing.T) {
+func TestBadFirstContractFailsClosedOthersServe(t *testing.T) {
 	h := newSkipHarness(t, originBindings(teapotUpstream(t), "alpha", "beta"))
-	h.apply(contractFor("alpha", "/items", "listAlpha", badVisibility), contractFor("beta", "/items", "listBeta"))
+	// gamma has no bindings entry, so nothing reserves its prefix.
+	gamma := clusterContract("gamma", "/items", "listGamma", "http://gamma", "")
+	gamma.openAPI = anonymousContract("/items", "listGamma", badVisibility)
+	h.apply(contractFor("alpha", "/items", "listAlpha", badVisibility), contractFor("beta", "/items", "listBeta"), gamma)
 	if h.active.Load() == nil {
 		t.Fatal("not ready")
 	}
-	if code := h.get("/alpha/items"); code != http.StatusNotFound {
-		t.Errorf("bad first contract: %d, want 404", code)
+	if code := h.get("/alpha/items"); code != http.StatusServiceUnavailable {
+		t.Errorf("bad first contract: %d, want 503", code)
+	}
+	if code := h.get("/gamma/items"); code != http.StatusNotFound {
+		t.Errorf("bad first discovered contract: %d, want 404", code)
+	}
+	if got := h.status()["gamma"]; got.State != stateNotInstalled || !got.Rejected {
+		t.Errorf("gamma status: %+v", got)
 	}
 	if code := h.get("/beta/items"); code != http.StatusTeapot {
 		t.Errorf("other service: %d, want 418", code)
 	}
 	got := h.status()
-	if got["alpha"].State != stateNotInstalled || !got["alpha"].Rejected || !strings.Contains(got["alpha"].Reason, "x-darban-visibility") {
+	if got["alpha"].State != stateClosed || !got["alpha"].Rejected || !strings.Contains(got["alpha"].Reason, "x-darban-visibility") {
 		t.Errorf("alpha status: %+v", got["alpha"])
 	}
 	if got["beta"].State != stateServing || got["beta"].Reason != "" {
@@ -101,21 +110,23 @@ func TestBadUpdateKeepsLastGoodUnit(t *testing.T) {
 	}
 }
 
-func TestBoundServiceWithoutContractIs404(t *testing.T) {
+func TestBoundServiceWithoutContractIs503(t *testing.T) {
 	h := newSkipHarness(t, originBindings(teapotUpstream(t), "alpha", "beta"))
 	h.apply(contractFor("beta", "/items", "listBeta"))
-	if code := h.get("/alpha/items"); code != http.StatusNotFound {
-		t.Fatalf("bound service without a contract: %d, want 404", code)
+	for _, path := range []string{"/alpha/items", "/alpha", "/alpha/anything/else"} {
+		if code := h.get(path); code != http.StatusServiceUnavailable {
+			t.Fatalf("bound service without a contract: %s %d, want 503", path, code)
+		}
 	}
 	alpha := h.status()["alpha"]
-	if alpha.State != stateNotInstalled || !alpha.Missing || alpha.Reason != "no GatewayContract" {
+	if alpha.State != stateClosed || !alpha.Missing || !strings.HasPrefix(alpha.Reason, "no GatewayContract") {
 		t.Fatalf("alpha status: %+v", alpha)
 	}
 }
 
-func TestDirectRouteWithoutGoodContractFailsClosedOnly(t *testing.T) {
+func TestBoundServiceWithoutGoodContractFailsClosedOnly(t *testing.T) {
 	origin := teapotUpstream(t)
-	bindings := directRouteBindings(origin)
+	bindings := catalogBindings(origin)
 	bindings.Services["other"] = serviceBinding{Prefix: "/other", Origin: origin}
 	for name, regs := range map[string][]registration{
 		"missing":  {contractFor("other", "/items", "listOther")},
@@ -124,7 +135,7 @@ func TestDirectRouteWithoutGoodContractFailsClosedOnly(t *testing.T) {
 		h := newSkipHarness(t, bindings)
 		h.apply(regs...)
 		if code := h.get("/catalog/anything"); code != http.StatusServiceUnavailable {
-			t.Errorf("%s: direct route %d, want 503", name, code)
+			t.Errorf("%s: bound service %d, want 503", name, code)
 		}
 		if code := h.get("/other/items"); code != http.StatusTeapot {
 			t.Errorf("%s: other service %d, want 418", name, code)
@@ -133,15 +144,15 @@ func TestDirectRouteWithoutGoodContractFailsClosedOnly(t *testing.T) {
 			t.Errorf("%s: unknown path %d, want 404", name, code)
 		}
 		catalog := h.status()["catalog"]
-		if catalog.State != stateDirectRouteClosed || !strings.Contains(catalog.Reason, "503") {
+		if catalog.State != stateClosed || !strings.Contains(catalog.Reason, "503") {
 			t.Errorf("%s: catalog status: %+v", name, catalog)
 		}
 	}
 }
 
-func TestDeletedContractRemovesServiceAndFailsDirectRouteClosed(t *testing.T) {
+func TestDeletedContractFailsTheBoundServiceClosed(t *testing.T) {
 	origin := teapotUpstream(t)
-	bindings := directRouteBindings(origin)
+	bindings := catalogBindings(origin)
 	bindings.Services["other"] = serviceBinding{Prefix: "/other", Origin: origin}
 	h := newSkipHarness(t, bindings)
 	catalog := registration{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}
@@ -151,9 +162,9 @@ func TestDeletedContractRemovesServiceAndFailsDirectRouteClosed(t *testing.T) {
 		t.Fatalf("served: %d", code)
 	}
 	h.apply(other)
-	// The service is gone: its direct route fails closed like a fresh pod.
+	// The contract is gone: the service fails closed like a fresh pod.
 	if code := h.get("/catalog/anything"); code != http.StatusServiceUnavailable {
-		t.Errorf("direct route after deletion: %d, want 503", code)
+		t.Errorf("after deletion: %d, want 503", code)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/catalog/private/42", nil)
 	req.Host = bindings.Hostname
@@ -163,7 +174,7 @@ func TestDeletedContractRemovesServiceAndFailsDirectRouteClosed(t *testing.T) {
 		t.Errorf("internal operation after deletion: %d, want 503", res.Code)
 	}
 	got := h.status()["catalog"]
-	if got.State != stateDirectRouteClosed || !got.Missing || strings.Contains(got.Reason, "retained") || !strings.Contains(got.Reason, "503") {
+	if got.State != stateClosed || !got.Missing || strings.Contains(got.Reason, "retained") || !strings.Contains(got.Reason, "503") {
 		t.Errorf("catalog status: %+v", got)
 	}
 	// The contract returns and the service is installed again.
@@ -171,19 +182,21 @@ func TestDeletedContractRemovesServiceAndFailsDirectRouteClosed(t *testing.T) {
 	if code := h.get("/catalog/prices"); code != http.StatusTeapot {
 		t.Errorf("restored: %d, want 418", code)
 	}
-	// A deleted contract without a direct route removes its prefix (404).
+	// Every bound service fails closed the same way.
 	h.apply()
-	if code := h.get("/other/items"); code != http.StatusNotFound {
-		t.Errorf("deleted contract prefix: %d, want 404", code)
+	if code := h.get("/other/items"); code != http.StatusServiceUnavailable {
+		t.Errorf("deleted contract prefix: %d, want 503", code)
 	}
-	if got := h.status()["other"]; got.State != stateNotInstalled {
+	if got := h.status()["other"]; got.State != stateClosed {
 		t.Errorf("other status: %+v", got)
 	}
 }
 
 func TestPodBecomesReadyWithBadOrNoContracts(t *testing.T) {
 	bindings := originBindings(teapotUpstream(t), "alpha")
-	bindings.ServiceRoutes = map[string]serviceRoute{"/alpha": {Origin: "http://alpha.fixtures.svc.cluster.local:80", BackendAuth: true}}
+	alpha := bindings.Services["alpha"]
+	alpha.BackendAuth = true
+	bindings.Services["alpha"] = alpha
 	for name, regs := range map[string][]registration{
 		"bad contract": {contractFor("alpha", "/items", "listAlpha", badVisibility)},
 		"zero":         nil,
@@ -217,10 +230,10 @@ func TestLocalManifestSkipsBrokenEntry(t *testing.T) {
 	}
 	h := newSkipHarness(t, originBindings(teapotUpstream(t), "alpha", "beta"))
 	h.rec.apply(func() ([]registration, error) { return regs, nil })
-	if h.active.Load() == nil || h.get("/alpha/items") != http.StatusNotFound || h.get("/beta/items") != http.StatusTeapot {
+	if h.active.Load() == nil || h.get("/alpha/items") != http.StatusServiceUnavailable || h.get("/beta/items") != http.StatusTeapot {
 		t.Fatal("broken local entry was not isolated")
 	}
-	if h.status()["alpha"].State != stateNotInstalled {
+	if h.status()["alpha"].State != stateClosed {
 		t.Fatalf("alpha: %+v", h.status()["alpha"])
 	}
 }

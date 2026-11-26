@@ -1,0 +1,37 @@
+service archive publish=false state=missing routes=0 documented=0 denied=0
+service bad publish=true state=rejected routes=0 documented=0 denied=0
+  rejected: service bad: get /public/{id}: explicit credential policy required
+service hub publish=true state=missing routes=0 documented=0 denied=0
+service shop publish=true state=current routes=5 documented=3 denied=3
+service suite publish=true state=current routes=2 documented=1 denied=2
+service talk publish=false state=current routes=5 documented=0 denied=2
+problem: service shop: rewrite GET /shop/archived targets service "archive" without a contract
+GET /bad/admin/stats bad internal documented=no -> 503 closed
+GET /bad/hidden bad unlisted documented=no -> 503 closed
+DELETE /bad/items/{id} bad public documented=no -> 503 closed
+GET /bad/items/{id} bad public documented=no -> 503 closed
+GET /bad/public/{id} bad public documented=no -> 503 closed
+POST /bad/zrpc/{method} bad internal documented=no -> 503 closed
+GET /shop/admin/stats shop internal documented=no -> 404 internal
+GET /shop/archived shop rewrite to=archive:/items -> 404 internal
+GET /shop/hidden shop unlisted documented=no -> proxy auth=authz
+DELETE /shop/items/{id} shop public documented=yes -> proxy auth=authz
+GET /shop/items/{id} shop public documented=yes -> proxy auth=authz
+GET /shop/old shop rewrite to=shop:/hidden -> proxy auth=authz
+GET /shop/public/{id} shop public documented=yes -> proxy auth=none
+POST /shop/zrpc/{method} shop internal documented=no -> 404 internal
+GET /suite/admin/stats suite internal documented=no -> 404 internal
+GET /suite/health suite extra auth=none -> proxy auth=none
+GET /suite/hidden suite unlisted documented=no -> 404 unselected
+DELETE /suite/items/{id} suite public documented=no -> 404 unselected
+GET /suite/items/{id} suite public documented=yes -> proxy auth=authz
+GET /suite/public/{id} suite public documented=no -> 404 unselected
+POST /suite/zrpc/{method} suite internal documented=no -> 404 internal
+GET /talk/admin/stats talk internal documented=no -> 404 internal
+GET /talk/healthz talk extra auth=none -> proxy auth=none
+GET /talk/hidden talk unlisted documented=no -> proxy auth=authz
+DELETE /talk/items/{id} talk public documented=no -> proxy auth=authz
+GET /talk/items/{id} talk public documented=no -> proxy auth=authz
+GET /talk/public/{id} talk public documented=no -> proxy auth=none
+POST /talk/zrpc/{method} talk internal documented=no -> 404 internal
+summary ok=false 404-internal=7 404-unselected=3 503-closed=6 extras=2 operations=24 proxy-authz=8 proxy-none=4 rewrites=2 services=6

@@ -14,11 +14,13 @@ import (
 // writeReport writes what the gateway would do with a contract set and
 // bindings, as a stable table for diffing two configurations: one line per
 // service, contract operation, rewrite and extra route, then a summary. It
-// reports false when a contract is rejected or missing.
+// reports false when a contract is rejected or a rewrite targets a service
+// without a contract. A bound service without a contract shows as missing and
+// fails closed, which is not an error.
 //
-// A route: false service's operations are evaluated against its direct
-// route's rules, so the report shows the traffic of today. Compare it with a
-// report for route: true to see what a cutover changes.
+// Each outcome comes from the snapshot's route table, so it is what a request
+// for that template gets. Compare two reports to see what a change of
+// contracts or bindings does.
 func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (bool, error) {
 	compiled, report := compile(regs, bindings, nil)
 	active := newGateway(bindings).build(compiled)
@@ -42,12 +44,12 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		state := outcome.serving
 		switch {
 		case outcome.missing:
-			state, ok = "missing", false
+			state = "missing"
 		case outcome.rejection != "":
 			state, ok = "rejected", false
 		}
-		fmt.Fprintf(w, "service %s route=%v publish=%v state=%s routes=%d documented=%d denied=%d\n",
-			name, outcome.route, outcome.publish, state, outcome.counts.routes, outcome.counts.documented, outcome.counts.denied)
+		fmt.Fprintf(w, "service %s publish=%v state=%s routes=%d documented=%d denied=%d\n",
+			name, outcome.publish, state, outcome.counts.routes, outcome.counts.documented, outcome.counts.denied)
 		if outcome.rejection != "" {
 			fmt.Fprintf(w, "  rejected: %s\n", oneLine(outcome.rejection))
 		}
@@ -99,7 +101,8 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 				}
 				key := operationKey{strings.ToUpper(method), public}
 				_, documented := document.Paths[public][method]
-				result := reportOutcome(key, name, binding, accepted, bindings, table)
+				_, bound := bindings.Services[name]
+				result := reportOutcome(key, accepted, bound, table, compiled.services)
 				summary[result]++
 				summary["operations"]++
 				lines = append(lines, fmt.Sprintf("%s %s %s %s documented=%s -> %s", key.method, key.path, name, vis, yesNo(documented), result))
@@ -110,13 +113,13 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		unit := report.accepted[name]
 		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
 			target := unit.aliases[from]
-			result := reportOutcome(from, name, unit.binding, true, bindings, table)
+			result := reportOutcome(from, true, true, table, compiled.services)
 			summary[result]++
 			summary["rewrites"]++
 			lines = append(lines, fmt.Sprintf("%s %s %s rewrite to=%s:%s -> %s", from.method, from.path, name, target.service, target.key.path, result))
 		}
 		for _, extra := range unit.extras {
-			result := reportOutcome(extra.key, name, unit.binding, true, bindings, table)
+			result := reportOutcome(extra.key, true, true, table, compiled.services)
 			summary[result]++
 			summary["extras"]++
 			auth := extraAuthNone
@@ -145,30 +148,14 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 }
 
 // reportOutcome says what a request for an operation's template gets: 404
-// internal, 404 unmatched, 404 route-rule (refused by the direct route's path
-// rules), 503 closed (a routed service on a direct route without an accepted
-// contract), or proxy with the authorization and the policy that serves it.
-func reportOutcome(key operationKey, service string, binding serviceBinding, accepted bool, bindings upstreamBindings, table routeTable) string {
-	route, direct := bindings.ServiceRoutes[binding.Prefix]
-	servicePath := strings.TrimPrefix(key.path, binding.Prefix)
-	byRoute := func() string {
-		if !direct {
-			return "404 unmatched"
-		}
-		if templateMatches(route.DeniedPaths, servicePath, false) ||
-			len(route.AllowedPaths) > 0 && !templateMatches(route.AllowedPaths, servicePath, true) {
-			return "404 route-rule"
-		}
-		auth := "authz"
-		if route.BackendAuth || templateMatches(route.PublicPaths, servicePath, true) {
-			auth = "backend"
-		}
-		return "proxy auth=" + auth + " via=service-route"
-	}
+// internal, 404 unselected (left out by the service's operations), 404
+// unmatched, 503 closed (a bound service without an accepted contract), or
+// proxy with the authorization that applies: authz (the gateway's
+// authorizer), none (an anonymous operation) or backend (a backendAuth
+// service).
+func reportOutcome(key operationKey, accepted, bound bool, table routeTable, services map[string]serviceBinding) string {
 	switch {
-	case !binding.routed():
-		return byRoute()
-	case !accepted && direct:
+	case !accepted && bound:
 		return "503 closed"
 	case !accepted:
 		return "404 unmatched"
@@ -180,19 +167,19 @@ func reportOutcome(key operationKey, service string, binding serviceBinding, acc
 	case entry.kind == entryDenied:
 		return "404 internal"
 	case entry.kind == entryPassthrough:
-		return byRoute()
-	case entry.route.protected && direct && route.BackendAuth && entry.route.direct != "":
-		return "proxy auth=backend via=contract"
+		return "404 unselected"
+	case entry.route.protected && services[entry.route.service].BackendAuth:
+		return "proxy auth=backend"
 	case entry.route.protected:
-		return "proxy auth=authz via=contract"
+		return "proxy auth=authz"
 	default:
-		return "proxy auth=none via=contract"
+		return "proxy auth=none"
 	}
 }
 
-// summaryLabel turns an outcome such as "proxy auth=authz via=contract" into
-// a summary label such as proxy-authz-contract.
-var summaryLabel = strings.NewReplacer(" auth=", "-", " via=", "-", " ", "-")
+// summaryLabel turns an outcome such as "proxy auth=authz" into a summary
+// label such as proxy-authz.
+var summaryLabel = strings.NewReplacer(" auth=", "-", " ", "-")
 
 func yesNo(value bool) string {
 	if value {

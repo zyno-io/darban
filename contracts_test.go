@@ -464,7 +464,7 @@ components:
 	}
 	bindings.OpenAPI.YAMLPath = "/observatory/listed"
 	if _, err := compileStrict(regs, bindings); err == nil {
-		t.Fatal("accepted an OpenAPI endpoint that would shadow an operation")
+		t.Fatal("accepted an OpenAPI endpoint that would hide an operation")
 	}
 }
 
@@ -541,7 +541,7 @@ func TestTagOptions(t *testing.T) {
 	}
 }
 
-func TestUnroutedContractDoesNotChangeRoutesOrDocument(t *testing.T) {
+func TestUnpublishedContractRoutesWithoutChangingTheDocument(t *testing.T) {
 	bindings, err := loadBindings("testdata/bindings.json", true)
 	if err != nil {
 		t.Fatal(err)
@@ -550,15 +550,15 @@ func TestUnroutedContractDoesNotChangeRoutesOrDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindings.Services["archive"] = serviceBinding{
-		Origin:  "http://localhost:9000",
-		Prefix:  "/archive",
-		Route:   new(false),
-		Publish: new(false),
-	}
+	bindings.Services["archive"] = serviceBinding{Origin: "http://localhost:9000", Prefix: "/archive", Publish: new(false)}
+	// A bound service without a contract fails closed; the document and the
+	// other routes do not depend on it.
 	before, err := compileStrict(registrations, bindings)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Contains(before.unserved, "/archive") {
+		t.Fatalf("unserved = %v", before.unserved)
 	}
 	catalog := registration{
 		serviceName: "archive",
@@ -580,30 +580,12 @@ paths:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(before.routes, after.routes) ||
-		!reflect.DeepEqual(before.denied, after.denied) ||
-		string(before.specYAML) != string(after.specYAML) {
-		t.Fatal("an unrouted contract changed routing or the combined spec")
+	if string(before.specYAML) != string(after.specYAML) || !slices.Contains(routePaths(after), "/archive/items/{id}") ||
+		!slices.Contains(after.denied, operationKey{"GET", "/archive/private/{id}"}) || slices.Contains(after.unserved, "/archive") {
+		t.Fatalf("routes %v denied %v unserved %v", routePaths(after), after.denied, after.unserved)
 	}
-	if !slices.Contains(after.contractServices, "archive") || before.revision == after.revision {
-		t.Fatal("the active snapshot does not account for the unrouted contract")
-	}
-	if _, err := compileStrict([]registration{catalog}, bindings); err == nil {
-		t.Fatal("missing contract for an active route binding was accepted")
-	}
-	catalog.rewrites = "[{}]"
+	catalog.openAPI = strings.Replace(catalog.openAPI, "      x-darban-policy: anonymous\n", "", 1)
 	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
-		t.Fatal("unrouted rewrite was accepted")
-	}
-	catalog.rewrites = "[]"
-	valid := catalog.openAPI
-	catalog.openAPI = "openapi: 3.0.0"
-	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
-		t.Fatal("invalid unrouted OpenAPI was accepted")
-	}
-	// The operations are validated in full, as they would be if routed.
-	catalog.openAPI = strings.Replace(valid, "      x-darban-policy: anonymous\n", "", 1)
-	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
-		t.Fatal("an unrouted operation without a credential policy was accepted")
+		t.Fatal("an unpublished operation without a credential policy was accepted")
 	}
 }

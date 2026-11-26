@@ -187,17 +187,16 @@ func TestUpstreamTLSGatewayTransports(t *testing.T) {
 	ca := newTestCA(t, "upstream-ca")
 	server := tlsUpstream(t, ca)
 	g := newGateway(upstreamBindings{UpstreamTLS: upstreamTLSConfig{CAFile: writeCA(t, ca.pem)}})
-	for name, rt := range map[string]http.RoundTripper{"normal": g.transport, "debug": g.debugTransport, "authz": g.authClient.Transport} {
+	for name, rt := range map[string]http.RoundTripper{
+		"regular": g.transports.get(regularResponseHeaderTimeout, false), "long": g.transports.get(time.Hour, false),
+		"debug": g.transports.get(regularResponseHeaderTimeout, true), "authz": g.authClient.Transport,
+	} {
 		resp, err := (&http.Client{Transport: rt}).Get(server.URL)
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
 			continue
 		}
 		resp.Body.Close()
-	}
-	proxies := newServiceProxies(upstreamBindings{ServiceRoutes: map[string]serviceRoute{"/x": {Origin: server.URL}}}, g.upstreamTLS.tlsConfig())
-	if proxies["/x"] == nil {
-		t.Fatal("no service proxy")
 	}
 }
 
