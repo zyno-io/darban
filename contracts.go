@@ -412,23 +412,25 @@ var (
 )
 
 func loadBindings(path string, local bool) (upstreamBindings, error) {
-	bindings, _, err := readBindings(path, local)
+	bindings, _, err := readBindings(path, local, true)
 	return bindings, err
 }
 
 // readBindings loads and validates a bindings file, and returns the SHA-256
-// of its content as its revision.
-func readBindings(path string, local bool) (upstreamBindings, string, error) {
+// of its content as its revision. readCA also checks that upstreamTLS.caFile
+// parses; a reload skips that, since upstreamTLS cannot change at runtime and
+// the verifier re-reads the file on its own.
+func readBindings(path string, local, readCA bool) (upstreamBindings, string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return upstreamBindings{}, "", err
 	}
 	sum := sha256.Sum256(raw)
-	bindings, err := parseBindings(raw, path, local)
+	bindings, err := parseBindings(raw, path, local, readCA)
 	return bindings, hex.EncodeToString(sum[:]), err
 }
 
-func parseBindings(raw []byte, path string, local bool) (upstreamBindings, error) {
+func parseBindings(raw []byte, path string, local, readCA bool) (upstreamBindings, error) {
 	var bindings upstreamBindings
 	if err := decodeJSON(raw, path, &bindings); err != nil {
 		return bindings, err
@@ -439,9 +441,9 @@ func parseBindings(raw []byte, path string, local bool) (upstreamBindings, error
 	if err := bindings.UpstreamTLS.validate(); err != nil {
 		return bindings, err
 	}
-	if bindings.UpstreamTLS.CAFile != "" {
+	if readCA && bindings.UpstreamTLS.CAFile != "" {
 		if _, err := loadCAPool(bindings.UpstreamTLS.CAFile); err != nil {
-			return bindings, retryableError{fmt.Errorf("upstreamTLS.caFile: %w", err)}
+			return bindings, fmt.Errorf("upstreamTLS.caFile: %w", err)
 		}
 	}
 	if bindings.Authz != "" {
@@ -1045,6 +1047,9 @@ type compileReport struct {
 	overrides map[string]string
 	services  map[string]serviceOutcome
 	accepted  map[string]*serviceUnit
+	// dropped describes each last-good unit that no longer compiles with the
+	// bindings, which the service lost.
+	dropped map[string]string
 }
 
 // registrationDigest identifies everything a compiled unit depends on: the
@@ -1117,7 +1122,7 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		// A rewrite into a service that is not served, or not known at all, is
 		// denied when the units are assembled. Rejecting it here would let one
 		// service's contract deletion take another service offline.
-		if rule.To.ServiceName == "" || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
+		if !serviceName.MatchString(rule.To.ServiceName) || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
 			!literalPath.MatchString(from.path) {
 			return nil, errors.New("rewrite outside its registered service bindings")
 		}
@@ -1193,7 +1198,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	}
 	effectiveBindings := bindings
 	effectiveBindings.Services = effective
-	lastGood = refreshUnits(lastGood, bindings, effectiveBindings, defaultVisibility)
+	lastGood, report.dropped = refreshUnits(lastGood, bindings, effectiveBindings, defaultVisibility)
 	for _, reg := range sorted {
 		name := reg.serviceName
 		binding, ok := resolved[name]
@@ -1269,10 +1274,12 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 // refreshUnits compiles each last-good unit again from its contract when the
 // bindings it depends on changed, so that a service kept on its last good
 // contract follows new bindings too. A unit that no longer compiles is
-// dropped, as if it had never been accepted.
-func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBindings, defaultVisibility operationVisibility) map[string]*serviceUnit {
+// dropped, as if it had never been accepted, and described in dropped.
+func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBindings, defaultVisibility operationVisibility) (map[string]*serviceUnit, map[string]string) {
 	var out map[string]*serviceUnit
-	for name, unit := range units {
+	var dropped map[string]string
+	for _, name := range slices.Sorted(maps.Keys(units)) {
+		unit := units[name]
 		binding, _, err := resolveBinding(unit.reg, bindings)
 		if err == nil && unit.digest == registrationDigest(unit.reg, binding, effective) {
 			continue
@@ -1281,17 +1288,23 @@ func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBin
 			out = maps.Clone(units)
 		}
 		delete(out, name)
+		var fresh *serviceUnit
+		if err == nil {
+			fresh, err = compileService(unit.reg, binding, effective, defaultVisibility)
+		}
 		if err != nil {
+			if dropped == nil {
+				dropped = make(map[string]string)
+			}
+			dropped[name] = fmt.Sprintf("service %s: last good contract no longer compiles with the bindings: %v", name, err)
 			continue
 		}
-		if fresh, err := compileService(unit.reg, binding, effective, defaultVisibility); err == nil {
-			out[name] = fresh
-		}
+		out[name] = fresh
 	}
 	if out == nil {
-		return units
+		return units, nil
 	}
-	return out
+	return out, dropped
 }
 
 // compileStrict treats any rejected contract, and any rewrite into a service
@@ -1548,10 +1561,7 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 			out.aliasWarnings[owner] = append(out.aliasWarnings[owner], fmt.Sprintf(format, args...))
 		}
 		if !serving {
-			// The target service has no serving contract, so the alias path is
-			// denied.
-			delete(published, from)
-			deny(from, owner)
+			warn("rewrite %s %s targets service %s, which has no serving contract", from.method, from.path, alias.service)
 			continue
 		}
 		if !targetUnit.binding.enabled() {

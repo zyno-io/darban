@@ -99,7 +99,11 @@ type reconciler struct {
 	warned map[string]string
 	// overrides remembers the binding-over-contract messages already logged.
 	overrides map[string]string
-	now       func() time.Time
+	// dropped holds, per service, why a bindings change cost it its last
+	// good contract, until it is accepted again.
+	dropped     map[string]string
+	lastDropped []string
+	now         func() time.Time
 }
 
 // classify sets each service's explicit state and reason. A bound service
@@ -141,6 +145,12 @@ func (r *reconciler) classify(report *compileReport) {
 				reason += "; its prefix returns 503 until a good contract is seen"
 			}
 		}
+		if dropped := r.dropped[name]; dropped != "" {
+			if reason != "" {
+				reason += "; "
+			}
+			reason += dropped
+		}
 		outcome.reason = reason
 		report.services[name] = outcome
 	}
@@ -166,6 +176,19 @@ func (r *reconciler) applyLocked() {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
+	for _, name := range slices.Sorted(maps.Keys(report.dropped)) {
+		log.Print(report.dropped[name])
+		if r.dropped == nil {
+			r.dropped = make(map[string]string)
+		}
+		r.dropped[name] = report.dropped[name]
+		r.lastDropped = append(r.lastDropped, report.dropped[name])
+	}
+	for name := range r.dropped {
+		if report.accepted[name] != nil {
+			delete(r.dropped, name)
+		}
+	}
 	r.classify(&report)
 	r.logRejections(report)
 	r.logOverrides(report)

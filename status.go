@@ -78,16 +78,17 @@ func (s *contractStatusStore) list() []contractStatus {
 }
 
 type statusResponse struct {
-	Status            string             `json:"status"`
-	Ready             bool               `json:"ready"`
-	BindingsRevision  string             `json:"bindingsRevision,omitempty"`
-	BindingsLoadedAt  string             `json:"bindingsLoadedAt,omitempty"`
-	LastBindingsError *contractRejection `json:"lastBindingsError,omitempty"`
-	ContractServices  []string           `json:"contractServices,omitempty"`
-	ContractRevision  string             `json:"contractRevision,omitempty"`
-	Contracts         []contractStatus   `json:"contracts,omitempty"`
-	RouteCount        int                `json:"routeCount"`
-	Upstreams         []upstreamStatus   `json:"upstreams"`
+	Status            string           `json:"status"`
+	Ready             bool             `json:"ready"`
+	BindingsRevision  string           `json:"bindingsRevision,omitempty"`
+	BindingsLoadedAt  string           `json:"bindingsLoadedAt,omitempty"`
+	LastBindingsError *bindingsError   `json:"lastBindingsError,omitempty"`
+	BindingsWarnings  []string         `json:"bindingsWarnings,omitempty"`
+	ContractServices  []string         `json:"contractServices,omitempty"`
+	ContractRevision  string           `json:"contractRevision,omitempty"`
+	Contracts         []contractStatus `json:"contracts,omitempty"`
+	RouteCount        int              `json:"routeCount"`
+	Upstreams         []upstreamStatus `json:"upstreams"`
 }
 
 func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atomic.Bool) http.HandlerFunc {
@@ -107,7 +108,7 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 		if !g.bindingsLoadedAt.IsZero() {
 			report.BindingsLoadedAt = g.bindingsLoadedAt.UTC().Format(time.RFC3339)
 		}
-		report.LastBindingsError = g.bindingsStatus.lastError()
+		report.LastBindingsError, report.BindingsWarnings = g.bindingsStatus.read()
 		report.Upstreams = append(report.Upstreams, upstreamStatus{"authz", "authorization", g.endpoints.state(g.bindings.Authz)})
 		// Contracts can add upstreams at runtime, so merge the served ones.
 		services := maps.Clone(g.bindings.Services)

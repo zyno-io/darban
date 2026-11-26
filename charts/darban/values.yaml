@@ -2,6 +2,10 @@ version: dev
 image: ''
 replicas: 2
 
+# Darban matches bindings keys in any letter case, but the chart reads
+# contractAPIGroup, upstreamTLS, authz, services.*.origin and
+# services.*.debugOrigin by their exact names to decide when to roll the pods.
+# Spell every key exactly as documented.
 bindings:
   contractAPIGroup: darban.zyno.io
 

@@ -424,7 +424,7 @@ func main() {
 	case *contracts != "" && !oneShot:
 		log.Fatal("-contracts needs -print-spec or -report")
 	}
-	bindings, bindingsRevision, err := readBindings(*bindingsPath, *manifest != "")
+	bindings, bindingsRevision, err := readBindings(*bindingsPath, *manifest != "", true)
 	if err != nil {
 		log.Fatal(err)
 	}

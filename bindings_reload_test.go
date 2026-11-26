@@ -73,7 +73,7 @@ func reloadBindingsJSON(origin, extra string) string {
 
 func newReloadRig(t *testing.T, body string) *reloadRig {
 	r := &reloadRig{t: t, files: newConfigMapDir(t, body), done: make(chan struct{})}
-	bindings, revision, err := readBindings(r.files.path(), true)
+	bindings, revision, err := readBindings(r.files.path(), true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestBindingsReloadKeepsServingWhenARewriteTargetGoes(t *testing.T) {
 		t.Errorf("alpha %d, alpha/old %d, beta %d", r.get("/alpha/items"), r.get("/alpha/old"), r.get("/beta/items"))
 	}
 	// A fresh compile agrees.
-	bindings, _, err := readBindings(r.files.path(), true)
+	bindings, _, err := readBindings(r.files.path(), true, true)
 	if err != nil {
 		t.Fatal(err)
 	}

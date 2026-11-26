@@ -41,6 +41,10 @@ type identityKey struct{}
 
 var forwardedMetadata = []string{"X-Original-Method", "X-Original-URI", "X-Original-URL"}
 
+// hopByHopHeaders belong to one connection, so they are never copied to the
+// authorizer or an upstream.
+var hopByHopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+
 func (a *authorizationConfig) validate(origin string) error {
 	if (origin != "" || a.Path != "") && (origin == "" || a.Path != "/" && !docPath.MatchString(a.Path)) {
 		return errors.New("authorization requires a private origin and a path")
@@ -51,6 +55,11 @@ func (a *authorizationConfig) validate(origin string) error {
 				return fmt.Errorf("invalid authorization header or prefix %q", name)
 			}
 			headers[i] = http.CanonicalHeaderKey(name)
+		}
+	}
+	for _, name := range a.RequestHeaders {
+		if slices.Contains(hopByHopHeaders, name) {
+			return fmt.Errorf("authorization cannot forward hop-by-hop header %q", name)
 		}
 	}
 	for _, name := range a.ResponseHeaders {
