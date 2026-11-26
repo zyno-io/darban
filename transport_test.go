@@ -99,6 +99,8 @@ func newTransportRig(t *testing.T, shop serviceBinding, options ...func(*upstrea
 		}
 		bindings.Services[name] = binding
 	}
+	// The rig's requests come from 192.0.2.10, the ingress.
+	bindings.ClientIP = clientIPConfig{TrustedProxies: []string{"192.0.2.0/24"}}
 	for _, option := range options {
 		option(&bindings)
 	}
@@ -245,23 +247,25 @@ func TestBackendAuthPreservesMethodQueryAndCredentials(t *testing.T) {
 }
 
 func TestClientIPIsAlwaysSetAndCannotBeSpoofed(t *testing.T) {
+	ingress := clientIPConfig{TrustedProxies: []string{"10.0.0.0/8"}}
 	for name, test := range map[string]struct {
 		config  clientIPConfig
 		remote  string
 		headers http.Header
 		want    string
 	}{
-		"from the ingress":         {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "203.0.113.9"},
-		"mapped address":           {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"::ffff:203.0.113.9"}}, "203.0.113.9"},
-		"no header":                {clientIPConfig{}, "10.0.0.5:1", nil, "10.0.0.5"},
-		"two values":               {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9", "198.51.100.1"}}, "10.0.0.5"},
-		"not an address":           {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"evil"}}, "10.0.0.5"},
-		"zone":                     {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"fe80::1%eth0"}}, "10.0.0.5"},
-		"forwarded-for is ignored": {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Forwarded-For": {"203.0.113.9"}}, "10.0.0.5"},
+		"no trusted proxies":       {clientIPConfig{}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "10.0.0.5"},
+		"from the ingress":         {ingress, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "203.0.113.9"},
+		"mapped address":           {ingress, "10.0.0.5:1", http.Header{"X-Real-Ip": {"::ffff:203.0.113.9"}}, "203.0.113.9"},
+		"no header":                {ingress, "10.0.0.5:1", nil, "10.0.0.5"},
+		"two values":               {ingress, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9", "198.51.100.1"}}, "10.0.0.5"},
+		"not an address":           {ingress, "10.0.0.5:1", http.Header{"X-Real-Ip": {"evil"}}, "10.0.0.5"},
+		"zone":                     {ingress, "10.0.0.5:1", http.Header{"X-Real-Ip": {"fe80::1%eth0"}}, "10.0.0.5"},
+		"forwarded-for is ignored": {ingress, "10.0.0.5:1", http.Header{"X-Forwarded-For": {"203.0.113.9"}}, "10.0.0.5"},
 		"trusted proxy":            {clientIPConfig{TrustedProxies: []string{"10.0.0.0/8"}}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "203.0.113.9"},
 		"untrusted peer":           {clientIPConfig{TrustedProxies: []string{"10.0.0.0/8"}}, "192.0.2.10:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "192.0.2.10"},
 		"single trusted address":   {clientIPConfig{TrustedProxies: []string{"10.0.0.5"}}, "10.0.0.5:1", http.Header{"X-Real-Ip": {"203.0.113.9"}}, "203.0.113.9"},
-		"other header":             {clientIPConfig{Header: "CF-Connecting-IP"}, "10.0.0.5:1", http.Header{"Cf-Connecting-Ip": {"203.0.113.9"}, "X-Real-Ip": {"198.51.100.1"}}, "203.0.113.9"},
+		"other header":             {clientIPConfig{Header: "CF-Connecting-IP", TrustedProxies: []string{"10.0.0.0/8"}}, "10.0.0.5:1", http.Header{"Cf-Connecting-Ip": {"203.0.113.9"}, "X-Real-Ip": {"198.51.100.1"}}, "203.0.113.9"},
 	} {
 		if err := test.config.validate(); err != nil {
 			t.Fatalf("%s: %v", name, err)

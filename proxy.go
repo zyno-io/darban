@@ -18,10 +18,10 @@ import (
 )
 
 // clientIPConfig says where the caller's IP comes from. Header, X-Real-IP by
-// default, is read only from a peer in TrustedProxies, every peer by default,
-// which suits a listener only an ingress that overwrites the header can
-// reach. A request from any other peer, or without exactly one valid address
-// in the header, gets the peer's own address.
+// default, is read only from a peer in TrustedProxies, which is empty by
+// default, so no header is trusted until the ingress is listed. A request
+// from any other peer, or without exactly one valid address in the header,
+// gets the peer's own address.
 type clientIPConfig struct {
 	Header         string
 	TrustedProxies []string
@@ -66,7 +66,7 @@ func (c clientIPConfig) clientIP(r *http.Request) string {
 	} else if parsed, err := netip.ParseAddr(r.RemoteAddr); err == nil {
 		address = parsed.Unmap()
 	}
-	trusted := len(c.proxies) == 0 || slices.ContainsFunc(c.proxies, func(prefix netip.Prefix) bool { return prefix.Contains(address) })
+	trusted := address.IsValid() && slices.ContainsFunc(c.proxies, func(prefix netip.Prefix) bool { return prefix.Contains(address) })
 	if values := r.Header.Values(c.header()); trusted && len(values) == 1 {
 		if sent, err := netip.ParseAddr(strings.TrimSpace(values[0])); err == nil && sent.Zone() == "" {
 			return sent.Unmap().String()

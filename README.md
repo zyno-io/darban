@@ -34,7 +34,7 @@ contract:
 
 - a line per service with `publish`, its state and its counts, and any
   rejection or warning. A bindings entry without a contract shows as
-  `state=missing`;
+  `state=missing`, and a disabled service as `state=disabled`;
 - a line per contract operation:
   `METHOD path service visibility documented=yes|no -> outcome`;
 - a line per rewrite and per extra route;
@@ -42,7 +42,8 @@ contract:
 
 The outcome is `404 internal`, `404 unselected` (left out by the service's
 `operations`), `404 unmatched`, `503 closed` (a bound service without an
-accepted contract) or `proxy auth=authz|none|backend`. `authz` is the
+accepted contract), `503 disabled` (a service with `enabled: false`) or
+`proxy auth=authz|none|backend`. `authz` is the
 gateway's authorizer, `none` an anonymous operation or extra route, and
 `backend` a `backendAuth` service. `-print-spec` fails on the same rejections
 and rewrites, but not on a missing contract, which only closes that service.
@@ -65,6 +66,15 @@ Every service is described by its contract, and optionally by an entry under
   nothing: its prefix and its legacy hosts return `503` for every request,
   extra routes included, until a good contract arrives. A contract with
   neither `spec.upstream` nor an entry `origin` is rejected.
+- **Kill switch.** An entry with `enabled: false`, which may be all it says,
+  turns the service off. Its prefix and legacy hosts return `503` for every
+  request: nothing is proxied, extra routes included, and its operations
+  leave the combined OpenAPI. Its contract is still validated, reported and
+  kept as last good, and it keeps its prefix and legacy hosts, so no other
+  contract can claim them while it is off. A rewrite from another service
+  into it is denied, with a warning on the owner, and never rejects the
+  owner's contract. Remove the field, or set it to `true`, to turn the
+  service back on.
 - **Local mode.** A `-manifest` entry may set `upstream` and `prefix`, and
   merges with bindings the same way.
 
@@ -96,6 +106,7 @@ Every field is optional.
 | `prefix` | `spec.prefix`, else `/<name>` | The public path segment. |
 | `origin` | from `spec.upstream` | The upstream's scheme, host and port: a private Service. |
 | `mount` | path of `spec.upstream` | The upstream path that `prefix` stands for. |
+| `enabled` | `true` | `false` serves nothing, with `503`, and keeps the prefix. |
 | `publish` | `true` | `false` keeps the service out of the combined OpenAPI. |
 | `operations` | every operation | Serve only the listed contract operations (see [Operation paths](#operation-paths)). |
 | `extraRoutes` | none | Paths the contract cannot declare (see [Extra routes](#extra-routes)). |
@@ -244,13 +255,15 @@ Every upstream request carries the caller's address in `X-Real-IP`. Darban
 removes every caller copy first, so a caller cannot choose the value:
 
 ```json
-"clientIP": {"header": "X-Real-IP", "trustedProxies": ["10.0.0.0/8"]}
+"clientIP": {"header": "X-Real-IP", "trustedProxies": ["10.200.0.0/16"]}
 ```
 
-1. The connection's peer is trusted when it is in `trustedProxies`, a list of
-   CIDRs or addresses. Without the list, every peer is trusted, which suits a
-   listener that only the ingress can reach, as the chart's NetworkPolicy
-   arranges with `ingress.enabled`.
+1. The connection's peer is trusted only when it is in `trustedProxies`, a
+   list of CIDRs or addresses. The list is empty by default, so no peer is
+   trusted and every upstream sees the peer address. **A deployment behind an
+   ingress must list the ingress's addresses**, such as the cluster's pod
+   CIDR when a NetworkPolicy already limits the gateway's traffic port to the
+   ingress pods (the chart's `ingress.enabled`).
 2. From a trusted peer, `header` (default `X-Real-IP`) gives the address when
    it holds exactly one valid IP address, without a zone. An IPv4-mapped
    IPv6 address is sent as IPv4.
@@ -619,10 +632,13 @@ bindings entry without a contract:
   `lastRejection` holds the latest message and its RFC3339 time and remains
   after the contract is fixed.
 - `missing` marks a bindings entry with no contract.
+- `enabled` is false for a service turned off with `enabled: false`.
 - `state` is the outcome, with a `reason`: `serving`, `serving_last_good`
   (the current contract was rejected), `closed` (a bindings entry without an
-  accepted contract, whose prefix returns `503`), or `not_installed` (a
-  discovered contract that was never accepted; its prefix returns `404`).
+  accepted contract, whose prefix returns `503`), `disabled` (turned off with
+  `enabled: false`; its prefix returns `503`, whatever its contract), or
+  `not_installed` (a discovered contract that was never accepted; its prefix
+  returns `404`).
 - `publish` is the service's binding setting.
 - `routes`, `documented` and `denied` count the public operation keys under
   the service's prefix, including the rewrites it owns and its extra routes,
