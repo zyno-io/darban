@@ -43,7 +43,10 @@ func jsonToYAML(raw []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		w.out.WriteString(text + "\n")
+		w.out.WriteString(text)
+		if last, _ := utf8.DecodeLastRuneInString(text); !strings.ContainsRune(yamlBreaks, last) {
+			w.out.WriteByte('\n')
+		}
 	}
 	return w.out.Bytes(), nil
 }

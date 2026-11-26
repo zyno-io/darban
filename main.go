@@ -218,6 +218,9 @@ type snapshot struct {
 	passthrough map[operationKey]bool
 	routes      map[operationKey]registeredRoute
 	extras      map[operationKey]registeredRoute
+	// shadow holds, by direct route prefix, the contract of a service with
+	// route: false to compare its traffic with.
+	shadow map[string]*shadowTable
 	// routed holds the prefixes of routed services with an accepted contract.
 	// Their contract and extra routes decide which requests pass.
 	routed    map[string]bool
@@ -241,6 +244,7 @@ type routeParamsKey struct{}
 
 type gateway struct {
 	contractStatus contractStatusStore
+	shadow         shadowRegistry
 	serviceProxies map[string]*httputil.ReverseProxy
 	legacyPrefixes map[string]string
 	bindings       upstreamBindings
@@ -298,6 +302,14 @@ func (g *gateway) build(compiled candidate) *snapshot {
 	active.passthrough = make(map[operationKey]bool, len(compiled.passthrough))
 	for _, key := range compiled.passthrough {
 		active.passthrough[key] = true
+	}
+	active.shadow = make(map[string]*shadowTable)
+	for service, contract := range compiled.shadow {
+		if prefix := compiled.services[service].Prefix; prefix != "" {
+			if _, direct := g.bindings.ServiceRoutes[prefix]; direct {
+				active.shadow[prefix] = newShadowTable(service, contract, g.shadow.counters(service, contract.digest))
+			}
+		}
 	}
 	active.routed = make(map[string]bool)
 	for _, binding := range compiled.services {
@@ -418,6 +430,16 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		}
 		// Without a routed service, the route's own path policy decides.
 		if !active.routed[prefix] {
+			// Shadow mode compares what the route does today with the contract.
+			// A preflight is about another request, so it is not compared.
+			if shadow := active.shadow[prefix]; shadow != nil && !(r.Method == http.MethodOptions && requested != "") {
+				shadow.observe(shadowRequest{
+					method: r.Method, raw: path, decoded: r.URL.Path, legacyPrefix: legacyPrefix,
+					allowed:     route.allowsPath(servicePath),
+					skipAuth:    route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath),
+					backendAuth: route.BackendAuth,
+				})
+			}
 			g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method, route.BackendCORS && corsPreflight)
 			return
 		}
@@ -504,23 +526,54 @@ func (g *gateway) serveByRoutePolicy(w http.ResponseWriter, r *http.Request, pre
 func main() {
 	manifest := flag.String("manifest", "", "local contract manifest YAML")
 	namespace := flag.String("namespace", "", "namespace of GatewayContracts")
-	printSpec := flag.Bool("print-spec", false, "compile local manifest once and print public OpenAPI")
+	contracts := flag.String("contracts", "", "GatewayContract list JSON, as kubectl get gatewaycontracts -o json prints it; one-shot only")
+	printSpec := flag.Bool("print-spec", false, "compile the contracts once and print the public OpenAPI")
+	printReport := flag.Bool("report", false, "compile the contracts once, print what the gateway does with each operation, and exit 1 on a rejection")
 	bindingsPath := flag.String("bindings", "/config/bindings.json", "private service bindings")
 	cert := flag.String("cert", "/tls/tls.crt", "gateway TLS certificate")
 	key := flag.String("key", "/tls/tls.key", "gateway TLS key")
 	flag.Parse()
 
-	if (*manifest == "") == (*namespace == "") || (*printSpec && *manifest == "") {
-		log.Fatal("specify exactly one of -manifest or -namespace; -print-spec requires -manifest")
+	sources := 0
+	for _, source := range []string{*manifest, *namespace, *contracts} {
+		if source != "" {
+			sources++
+		}
+	}
+	oneShot := *printSpec || *printReport
+	switch {
+	case sources != 1:
+		log.Fatal("specify exactly one of -manifest, -namespace or -contracts")
+	case *printSpec && *printReport:
+		log.Fatal("specify at most one of -print-spec and -report")
+	case oneShot && *namespace != "":
+		log.Fatal("-print-spec and -report need -manifest or -contracts")
+	case *contracts != "" && !oneShot:
+		log.Fatal("-contracts needs -print-spec or -report")
 	}
 	bindings, err := loadBindings(*bindingsPath, *manifest != "")
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *printSpec {
-		regs, err := loadLocal(*manifest)
+	if oneShot {
+		var regs []registration
+		if *contracts != "" {
+			regs, err = loadContractList(*contracts)
+		} else {
+			regs, err = loadLocal(*manifest)
+		}
 		if err != nil {
 			log.Fatal(err)
+		}
+		if *printReport {
+			ok, err := writeReport(os.Stdout, regs, bindings)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if !ok {
+				os.Exit(1)
+			}
+			return
 		}
 		compiled, err := compileStrict(regs, bindings)
 		if err != nil {

@@ -305,6 +305,14 @@ type compiledOperation struct {
 	protected bool
 }
 
+// shadowOperation is an operation of a docs-only service, which shadow mode
+// matches real requests against.
+type shadowOperation struct {
+	key       operationKey
+	protected bool
+	internal  bool
+}
+
 // serviceCounts is what the assembled snapshot does with one service's
 // public operation keys, including the rewrites it owns.
 type serviceCounts struct {
@@ -326,7 +334,9 @@ type candidate struct {
 	// denied although its target is served. It never rejects a contract.
 	aliasWarnings map[string][]string
 	// counts holds, by service, its routed, documented and denied keys.
-	counts   map[string]serviceCounts
+	counts map[string]serviceCounts
+	// shadow holds the operations of each docs-only service, by service.
+	shadow   map[string]shadowContract
 	specYAML []byte
 	specJSON []byte
 	revision string
@@ -890,6 +900,8 @@ type serviceUnit struct {
 	denied        []operationKey
 	passthrough   []operationKey
 	extras        []compiledOperation
+	// shadow lists a docs-only unit's operations for shadow mode.
+	shadow []shadowOperation
 	// warnings lists operations a docs-only unit leaves out of the document
 	// because its direct route would refuse them.
 	warnings []string
@@ -980,6 +992,17 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		return nil, err
 	}
 	if !binding.routed() {
+		// Shadow mode compares real traffic with every operation of the
+		// contract, whatever its visibility.
+		for key, op := range unit.native {
+			if op.visibility != visibilityInternal {
+				unit.shadow = append(unit.shadow, shadowOperation{key, op.protected, false})
+			}
+		}
+		for _, key := range unit.denied {
+			unit.shadow = append(unit.shadow, shadowOperation{key, false, true})
+		}
+		slices.SortFunc(unit.shadow, func(a, b shadowOperation) int { return compareOperationKeys(a.key, b.key) })
 		// A docs-only contract has no traffic effect: no routes and no denials.
 		// Its service keeps its serviceRoutes entry. Only the operations it
 		// documents are kept, so its component references are imported, and
@@ -1171,15 +1194,25 @@ func compileStrict(regs []registration, bindings upstreamBindings) (candidate, e
 			return out, fmt.Errorf("missing contract for service %q", name)
 		}
 	}
+	if problems := rewritesWithoutContract(report); len(problems) > 0 {
+		return out, errors.New(problems[0])
+	}
+	return out, nil
+}
+
+// rewritesWithoutContract describes each served rewrite whose target service
+// has no accepted contract, which one-shot checks treat as errors.
+func rewritesWithoutContract(report compileReport) []string {
+	var problems []string
 	for _, name := range slices.Sorted(maps.Keys(report.accepted)) {
 		unit := report.accepted[name]
 		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
 			if target := unit.aliases[from].service; report.accepted[target] == nil {
-				return out, fmt.Errorf("service %s: rewrite %s %s targets service %q without a contract", name, from.method, from.path, target)
+				problems = append(problems, fmt.Sprintf("service %s: rewrite %s %s targets service %q without a contract", name, from.method, from.path, target))
 			}
 		}
 	}
-	return out, nil
+	return problems
 }
 
 // selectUnits assembles every preferred unit together. When that fails it
@@ -1382,6 +1415,10 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		}
 		if !unit.binding.routed() {
 			unroutedDigests[name] = unit.openAPIDigest
+			if out.shadow == nil {
+				out.shadow = make(map[string]shadowContract)
+			}
+			out.shadow[name] = shadowContract{unit.openAPIDigest, unit.shadow}
 		}
 		maps.Copy(native, unit.native)
 		for key := range unit.native {

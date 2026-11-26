@@ -265,3 +265,10 @@ components:
 		t.Fatalf("security %v", security)
 	}
 }
+
+func TestJSONToYAMLTopLevelScalars(t *testing.T) {
+	for _, value := range yamlStrings {
+		raw, _ := json.Marshal(value)
+		assertSameYAML(t, fmt.Sprintf("top-level %q", value), raw)
+	}
+}

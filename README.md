@@ -14,6 +14,41 @@ go run . -manifest testdata/local.yaml -bindings testdata/bindings.json -print-s
 ```
 
 Set `-namespace` for Kubernetes discovery or `-manifest` for local files.
+
+### Pre-flight checks
+
+`-contracts FILE` reads a `GatewayContract` list, as
+`kubectl get gatewaycontracts -o json` prints it, and decodes each item
+exactly as cluster mode does. It is one-shot only, with `-print-spec` or
+`-report`:
+
+```bash
+kubectl get gatewaycontracts -n zyno-alpha -o json > contracts.json
+darban -contracts contracts.json -bindings bindings.json -print-spec
+darban -contracts contracts.json -bindings bindings.json -report
+```
+
+`-report` prints a stable, diffable table of what the gateway does, and exits
+`1` when a contract is rejected or missing:
+
+- a line per service with `route`, `publish`, its state and its counts, and
+  any rejection or warning;
+- a line per contract operation:
+  `METHOD path service visibility documented=yes|no -> outcome`;
+- a line per rewrite and per extra route;
+- a summary of the outcomes.
+
+The outcome is `404 internal`, `404 unmatched`, `404 route-rule` (refused by
+the direct route's path rules), `503 closed` (a routed service on a direct
+route without an accepted contract) or
+`proxy auth=authz|none|backend via=contract|service-route`. `authz` is the
+gateway's authorizer, `none` an anonymous operation, and `backend` a route
+that leaves authorization to the backend. A `route: false` service's
+operations are judged by its direct route's rules, as its traffic is today, so
+a diff of the reports for the same contracts with `route: false` and with
+`route: true` shows what a cutover changes. A template is judged against
+every path it stands for, as for [publish-only](#route-and-publish)
+omissions.
 The gateway reads bindings JSON from `/config/bindings.json` and its TLS
 certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
@@ -576,7 +611,33 @@ contract: its traffic stays on the direct route either way.
 prefix, including the rewrites it owns, that the active snapshot routes,
 documents and denies. `warnings` lists the service's rewrites that are denied
 although their target is served, and the operations a publish-only service
-leaves out of the document. The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+leaves out of the document.
+
+For a `route: false` service on a direct route, `shadow` compares its real
+traffic with its contract:
+
+- A request the route's own rules refuse today counts as `refusedToday` and
+  is not compared. Preflights are not compared either.
+- Every other request is matched against the contract's operations, of any
+  visibility: `matched`, `wouldDeny` (an `internal` operation, which the
+  route serves today) or `unmatched` (a path the contract does not declare).
+- A matched request counts as `wouldSkipAuth` (anonymous, or a `backendAuth`
+  route) or `wouldAuthorize` under the contract. `nowAuthzWouldSkip` and
+  `nowSkipWouldAuthorize` count those whose authorization changes from
+  today's, where `publicPaths` and `backendAuth` decide.
+- `samples` lists, per kind, the 20 most frequent `METHOD template` entries
+  with their counts. A matched request's template is its operation's. An
+  unmatched one keeps only segments that are literals of the contract's
+  templates, writes `{}` for any other, and stops after six segments. A
+  method outside the standard ones is `OTHER`. Samples never hold a query,
+  an identifier or a raw path. Each kind counts up to 256 distinct samples,
+  and `overflow` counts the requests beyond them.
+
+The counts reset when the contract changes or the pod restarts. An unmatched
+sample is a path the service needs to declare, or to list in `extraRoutes`,
+before it moves to `route: true`.
+
+The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
 

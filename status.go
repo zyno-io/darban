@@ -30,18 +30,21 @@ type contractRejection struct {
 // count the public operation keys under the service's prefix that the active
 // snapshot routes, documents and denies.
 type contractStatus struct {
-	Service       string             `json:"service"`
-	Serving       string             `json:"serving"`
-	Rejected      bool               `json:"rejected"`
-	Missing       bool               `json:"missing,omitempty"`
-	State         string             `json:"state"`
-	Reason        string             `json:"reason,omitempty"`
-	Route         bool               `json:"route"`
-	Publish       bool               `json:"publish"`
-	Routes        int                `json:"routes"`
-	Documented    int                `json:"documented"`
-	Denied        int                `json:"denied"`
-	Warnings      []string           `json:"warnings,omitempty"`
+	Service    string   `json:"service"`
+	Serving    string   `json:"serving"`
+	Rejected   bool     `json:"rejected"`
+	Missing    bool     `json:"missing,omitempty"`
+	State      string   `json:"state"`
+	Reason     string   `json:"reason,omitempty"`
+	Route      bool     `json:"route"`
+	Publish    bool     `json:"publish"`
+	Routes     int      `json:"routes"`
+	Documented int      `json:"documented"`
+	Denied     int      `json:"denied"`
+	Warnings   []string `json:"warnings,omitempty"`
+	// Shadow compares a route: false service's direct-route traffic with its
+	// contract.
+	Shadow        *shadowStatus      `json:"shadow,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -113,6 +116,11 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 			report.Upstreams = append(report.Upstreams, upstreamStatus{prefix, "service", g.endpoints.state(route.Origin)})
 		}
 		report.Contracts = g.contractStatus.list()
+		for i := range report.Contracts {
+			if !report.Contracts[i].Route {
+				report.Contracts[i].Shadow = g.shadow.status(report.Contracts[i].Service)
+			}
+		}
 		if snapshot != nil {
 			report.ContractRevision = snapshot.revision
 			report.ContractServices = snapshot.contractServices

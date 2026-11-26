@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -155,4 +156,46 @@ func loadClusterRegistrations(current cache.Store) ([]registration, error) {
 		result = append(result, reg)
 	}
 	return result, nil
+}
+
+// loadContractList reads a GatewayContract list, such as the output of
+// kubectl get gatewaycontracts -o json, and decodes it exactly as cluster mode
+// decodes its informer's store.
+func loadContractList(path string) ([]registration, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if list.Items == nil {
+		return nil, fmt.Errorf("%s: expected a list with items", path)
+	}
+	// Cluster mode watches one namespace, where each name is one service.
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	namespace, names := "", make(map[string]bool, len(list.Items))
+	for i, item := range list.Items {
+		object := &unstructured.Unstructured{Object: item}
+		if kind := object.GetKind(); kind != "" && kind != "GatewayContract" {
+			return nil, fmt.Errorf("%s: unexpected %s %s", path, kind, object.GetName())
+		}
+		if i == 0 {
+			namespace = object.GetNamespace()
+		}
+		if object.GetNamespace() != namespace {
+			return nil, fmt.Errorf("%s: contracts from namespaces %q and %q; list one namespace", path, namespace, object.GetNamespace())
+		}
+		if names[object.GetName()] {
+			return nil, fmt.Errorf("%s: %s is listed twice", path, object.GetName())
+		}
+		names[object.GetName()] = true
+		if err := store.Add(object); err != nil {
+			return nil, err
+		}
+	}
+	return loadClusterRegistrations(store)
 }
