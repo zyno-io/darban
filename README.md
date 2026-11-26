@@ -90,18 +90,20 @@ A schema's `discriminator` is imported with it. Each `mapping` value, a
 `#/components/schemas/X` reference or a bare `X`, imports `X` and is renamed
 like a `$ref`, to `#/components/schemas/<service>.X` or `<service>.X`. A
 discriminator has a string `propertyName`, an optional `mapping` of strings
-and `x-` extensions, whose references are renamed too. Any other value under
-that key, such as the schema of a property named `discriminator`, is imported
-as a schema. Without a full `mapping`, a discriminator infers a value from
-each schema's name, which renaming would change. Darban therefore adds a
-`mapping` entry, under the original name, for each `oneOf` or `anyOf` schema,
-or each schema that extends the base schema with `allOf`, that no mapping
-value targets.
+and `x-` extensions, whose references are renamed too. Any other shape is
+rejected. A property named `discriminator` is a name, not a discriminator, and
+is imported as a schema. Without a full `mapping`, a discriminator infers a
+value from each schema's name, which renaming would change. Darban therefore
+adds a `mapping` entry, under the original name, for each `oneOf` or `anyOf`
+schema that no mapping value targets. For a base schema without `oneOf` or
+`anyOf`, it does the same for each schema that extends it with `allOf` and
+that a published operation already references. It never publishes an
+extender for this alone.
 
 Values under `example`, `default`, `const` and `enum` are data and are copied
 as written. Where those words are names instead, such as a property called
-`default` or the `default` response, their objects are imported and their
-references renamed.
+`default`, the `default` response or a `default` entry under `examples`,
+their objects are imported and their references renamed.
 
 `openapi.prefixTags` controls how Darban groups operations for SDK generation.
 The default `all` prefixes every tag with the lower-camel-case service name
@@ -120,8 +122,9 @@ such as `/files/{name}.txt`, a repeated parameter name, an empty segment and a
 trailing `/` are rejected, as are two operations with the same method and path
 shape, such as `GET /items/{id}` and `GET /items/{itemId}`. That includes
 `internal` operations. An `internal` operation may have any path: it is
-denied as written, with a template inside a segment matching any text, so
-`/items{batch}` denies `/items:batch`.
+denied as written, with a template inside a segment matching one or more
+characters, so `/items{batch}` denies `/items:batch`. That also denies
+`/itemsX`, which fails closed.
 
 A request matches one segment at a time: a literal, then an `internal`
 operation's in-segment template, then a parameter. It backtracks when the
@@ -129,13 +132,14 @@ rest of the path does not match. So `GET /items/new` wins over
 `GET /items/{id}`, and `/items/new/reviews` still matches
 `/items/{id}/reviews`. A parameter matches one non-empty segment. The
 upstream receives the operation's upstream path with the decoded parameters,
-escaped only where needed: the path that was matched, not the caller's
-spelling of it. `HEAD` matches a `GET` operation unless the contract declares
+re-encoded by Go's `url.URL` path escaping: the path that was matched, not the
+caller's spelling of it. `HEAD` matches a `GET` operation unless the contract declares
 `HEAD` for the path, and is then sent upstream as `GET`, so a backend need not
 route `HEAD`. The caller gets the response headers without the body.
 
 When a service's bindings select `operations`, the unselected ones still
-take part in matching, so a selected template cannot capture their paths.
+take part in matching, as written like `internal` ones, so a selected template
+cannot capture their paths.
 On a prefix with a [direct Service route](#direct-service-routes) they go to
 that route with its own policy, and elsewhere they return `404`.
 

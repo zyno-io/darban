@@ -109,6 +109,27 @@ func TestTemplatedRoutesMatchLiteralFirstWithBacktracking(t *testing.T) {
 	}
 }
 
+func TestLiteralWinsOverParameterBetweenRoutes(t *testing.T) {
+	h := newTemplateHarness(t, shopBindings(),
+		anonymousOperation("get", "/api/items/{id}", "getItem"),
+		anonymousOperation("get", "/api/items/special", "getSpecial"),
+		anonymousOperation("get", "/api/items/special/{part}/view", "viewSpecial"),
+		anonymousOperation("get", "/api/items/{id}/reviews/latest", "latestReview"),
+	)
+	table := h.active.Load().routeTable()
+	for path, want := range map[string]string{
+		"/shop/items/special":                "/shop/items/special",
+		"/shop/items/42":                     "/shop/items/{id}",
+		"/shop/items/special/x/view":         "/shop/items/special/{part}/view",
+		"/shop/items/special/reviews/latest": "/shop/items/{id}/reviews/latest",
+	} {
+		entry := table.lookup(http.MethodGet, strings.Split(strings.TrimPrefix(path, "/"), "/"))
+		if entry == nil || entry.kind != entryRoute || entry.key != (operationKey{http.MethodGet, want}) {
+			t.Errorf("GET %s matched %+v, want %s", path, entry, want)
+		}
+	}
+}
+
 func TestExplicitHeadOperationWinsOverGet(t *testing.T) {
 	h := newTemplateHarness(t, shopBindings(),
 		anonymousOperation("get", "/api/items/{id}", "getItem")+
@@ -454,7 +475,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf: [{$ref: '#/components/schemas/Pet'}, {$ref: '#/components/schemas/Animal'}]
+                oneOf: [{$ref: '#/components/schemas/Pet'}, {$ref: '#/components/schemas/Animal'}, {$ref: '#/components/schemas/Fish'}]
 components:
   schemas:
     Pet:
@@ -472,7 +493,7 @@ components:
     Fish:
       allOf: [{$ref: '#/components/schemas/Animal'}, {type: object}]
     Snake:
-      allOf: [{$ref: '#/components/schemas/Animal'}]
+      allOf: [{$ref: '#/components/schemas/Animal'}, {$ref: '#/components/schemas/Missing'}]
 `)
 	pet := schemas["zoo.Pet"]["discriminator"].(map[string]any)
 	if ref := pet["x-default"].(map[string]any)["$ref"]; ref != "#/components/schemas/zoo.Cat" {
@@ -484,13 +505,92 @@ components:
 		t.Errorf("Pet mapping %v, want %v", mapping, want)
 	}
 	animal := schemas["zoo.Animal"]["discriminator"].(map[string]any)
-	want = map[string]any{"Fish": "#/components/schemas/zoo.Fish", "Snake": "#/components/schemas/zoo.Snake"}
+	// Only extenders that a published operation already imports are mapped. An
+	// unreferenced one, even a broken one, is neither published nor checked.
+	want = map[string]any{"Fish": "#/components/schemas/zoo.Fish"}
 	if mapping, _ := animal["mapping"].(map[string]any); !maps.Equal(mapping, want) {
 		t.Errorf("Animal mapping %v, want %v", mapping, want)
 	}
-	for _, name := range []string{"zoo.Fish", "zoo.Snake"} {
-		if _, ok := schemas[name]; !ok {
-			t.Errorf("%s not imported", name)
+	if _, ok := schemas["zoo.Snake"]; ok {
+		t.Error("an unreferenced extender was published")
+	}
+}
+
+func TestUnselectedOperationsCountAsWritten(t *testing.T) {
+	paths := []string{
+		anonymousOperation("get", "/v1/{collection}", "getCollection"),
+		anonymousOperation("get", "/v1/items{batch}", "batchItems"),
+		anonymousOperation("get", "/v1/jobs:run", "runJobs"),
+	}
+	selection := []operationSelection{{Method: "get", Path: "/v1/{collection}"}}
+	direct := shopBindings()
+	direct.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
+	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {AuthProfiles: []string{"account"}}}
+	direct.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	plain := isolationBindings("shop")
+	plain.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
+	// The selected template is anonymous. Unselected paths must not reach it:
+	// the direct route requires credentials, and without one they are 404.
+	for name, test := range map[string]struct {
+		bindings   upstreamBindings
+		unselected int
+	}{"direct": {direct, 401}, "plain": {plain, 404}} {
+		h := newTemplateHarness(t, test.bindings, paths...)
+		for path, want := range map[string]int{"/shop/v1/things": 418, "/shop/v1/items:batch": test.unselected, "/shop/v1/jobs:run": test.unselected} {
+			if code, _ := h.do("GET", path); code != want {
+				t.Errorf("%s: GET %s = %d, want %d", name, path, code, want)
+			}
 		}
+	}
+}
+
+func TestMalformedDiscriminatorIsRejected(t *testing.T) {
+	contract := `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf: [{$ref: '#/components/schemas/Cat'}]
+                discriminator: {propertyName: kind, bogus: 1, mapping: {cat: Cat}}
+components:
+  schemas:
+    Cat: {type: object}
+`
+	_, report := compile([]registration{{serviceName: "zoo", rewrites: "[]", openAPI: contract}}, isolationBindings("zoo"), nil)
+	if !strings.Contains(report.services["zoo"].rejection, "discriminator") {
+		t.Fatalf("rejection %q", report.services["zoo"].rejection)
+	}
+}
+
+func TestNamedExamplesAreRenamed(t *testing.T) {
+	_, operation := composedComponents(t, `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              examples:
+                default: {$ref: '#/components/examples/Sample'}
+components:
+  examples:
+    Sample: {value: {name: cat}}
+`)
+	examples := operation["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["examples"].(map[string]any)
+	if ref := examples["default"].(map[string]any)["$ref"]; ref != "#/components/examples/zoo.Sample" {
+		t.Fatalf("default example: %v", ref)
 	}
 }

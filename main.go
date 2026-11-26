@@ -345,10 +345,10 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	if legacyPrefix != "" {
 		prefix = legacyPrefix
 	} else if routePrefix(r.URL.Path) != prefix {
-		// An encoded prefix would skip the policy keyed by its decoded form.
-		// Contract routes match the path as sent and direct routes are keyed
-		// by it, so nothing is served on an encoded prefix today; this keeps
-		// it that way for any lookup that decodes.
+		// An encoded prefix would skip the policy keyed by its decoded form:
+		// direct routes are keyed by the prefix as sent, but the operation
+		// matcher decodes it, so /sh%6Fp/x would reach a contract operation
+		// under /shop without that prefix's direct-route policy.
 		writeStatus(w, http.StatusNotFound)
 		return
 	}

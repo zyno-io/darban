@@ -525,16 +525,6 @@ func importComponent(service, kind, name string, source sourceDoc, out map[strin
 	if err != nil {
 		return "", err
 	}
-	// Without oneOf or anyOf, a base schema's discriminator infers the names of
-	// the schemas that extend it with allOf. Map them, since importing renames
-	// them.
-	if schema, ok := component.(map[string]any); ok && kind == "schemas" && schema["oneOf"] == nil && schema["anyOf"] == nil {
-		if _, ok := discriminatorObject(schema["discriminator"]); ok {
-			if err := mapInferredDiscriminator(component, expanded, schemasExtending(name, source), service, source, out); err != nil {
-				return "", err
-			}
-		}
-	}
 	out[kind][prefixed] = expanded
 	return prefixed, nil
 }
@@ -543,7 +533,7 @@ func importComponent(service, kind, name string, source sourceDoc, out map[strin
 // whose values are objects to import. A name such as default or $ref is then
 // not a keyword.
 var nameMaps = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
-	"responses", "headers", "content", "encoding", "links", "schemas", "requestBodies", "parameters", "securitySchemes"}
+	"responses", "headers", "content", "encoding", "links", "schemas", "requestBodies", "parameters", "securitySchemes", "examples"}
 
 func importReferences(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
 	return importValue(value, false, service, source, out)
@@ -665,12 +655,13 @@ func mappedSchema(target string) (string, bool) {
 
 // importDiscriminator imports the schemas a Discriminator Object maps to and
 // renames its mapping values like a $ref. A mapping value is a schema
-// reference or a bare schema name, and keeps its form. Any other value, such
-// as the schema of a property named discriminator, is imported as a schema.
+// reference or a bare schema name, and keeps its form. A property named
+// discriminator is imported as a name (see nameMaps), so any other value here
+// is a malformed discriminator.
 func importDiscriminator(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
 	object, ok := discriminatorObject(value)
 	if !ok {
-		return importReferences(value, service, source, out)
+		return nil, errors.New("a discriminator needs a string propertyName, an optional mapping of strings and x- extensions only")
 	}
 	imported := make(map[string]any, len(object))
 	for _, key := range slices.Sorted(maps.Keys(object)) {
@@ -748,22 +739,37 @@ func mapInferredDiscriminator(source any, imported any, candidates []string, ser
 	return nil
 }
 
-// schemasExtending lists, in order, the schemas whose allOf references the
-// named schema directly.
-func schemasExtending(name string, source sourceDoc) []string {
-	var names []string
-	ref := "#/components/schemas/" + name
-	for _, other := range slices.Sorted(maps.Keys(source.Components["schemas"])) {
-		schema, _ := source.Components["schemas"][other].(map[string]any)
+// mapImportedExtenders maps, for each imported base schema of a service whose
+// discriminator has no oneOf or anyOf, the imported schemas that extend it
+// with allOf. Their inferred names change with renaming. It runs after the
+// import so it adds no schema that no operation references.
+func mapImportedExtenders(service string, source sourceDoc, out map[string]map[string]any) error {
+	schemas := source.Components["schemas"]
+	imported := func(name string) bool {
+		_, ok := out["schemas"][service+"."+name]
+		return ok
+	}
+	extenders := make(map[string][]string)
+	for _, name := range slices.Sorted(maps.Keys(schemas)) {
+		schema, _ := schemas[name].(map[string]any)
 		parts, _ := schema["allOf"].([]any)
-		if slices.ContainsFunc(parts, func(part any) bool {
-			value, _ := part.(map[string]any)
-			return value["$ref"] == ref
-		}) {
-			names = append(names, other)
+		for _, part := range parts {
+			ref, _ := part.(map[string]any)["$ref"].(string)
+			if base, ok := strings.CutPrefix(ref, "#/components/schemas/"); ok && imported(name) {
+				extenders[base] = append(extenders[base], name)
+			}
 		}
 	}
-	return names
+	for _, base := range slices.Sorted(maps.Keys(extenders)) {
+		schema, _ := schemas[base].(map[string]any)
+		if !imported(base) || schema["oneOf"] != nil || schema["anyOf"] != nil {
+			continue
+		}
+		if err := mapInferredDiscriminator(schema, out["schemas"][service+"."+base], extenders[base], service, source, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func parseOpenAPI(openAPI string) (sourceDoc, error) {
@@ -831,8 +837,10 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 				shapes[shape] = path
 			}
 			if excluded {
-				if mapped && visibility != visibilityInternal {
-					*passthrough = append(*passthrough, operationKey{strings.ToUpper(key), publicPath})
+				// Like an internal operation, an unselected one counts as written,
+				// even when its path is not a valid template.
+				if suffix, ok := strings.CutPrefix(path, binding.Mount); ok && strings.HasPrefix(suffix, "/") && visibility != visibilityInternal {
+					*passthrough = append(*passthrough, operationKey{strings.ToUpper(key), binding.Prefix + suffix})
 				}
 				continue
 			}
@@ -1475,6 +1483,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	paths := make(map[string]map[string]any)
 	operationIDs := make(map[string]operationKey)
 	unlistedComponents := make(map[string]map[string]any)
+	documentedSources := make(map[string]*sourceDoc)
 	out.counts = make(map[string]serviceCounts, len(units))
 	count := func(owner string, update func(*serviceCounts)) {
 		counts := out.counts[owner]
@@ -1501,6 +1510,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		if source.visibility == visibilityUnlisted {
 			continue
 		}
+		documentedSources[source.service] = source.source
 		if paths[key.path] == nil {
 			paths[key.path] = make(map[string]any)
 		}
@@ -1537,6 +1547,11 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		}
 		paths[key.path][strings.ToLower(key.method)] = operation
 		count(keyOwners[key], func(c *serviceCounts) { c.documented++ })
+	}
+	for _, service := range slices.Sorted(maps.Keys(documentedSources)) {
+		if err := mapImportedExtenders(service, *documentedSources[service], components); err != nil {
+			return out, &assemblyError{service, err}
+		}
 	}
 
 	document := map[string]any{

@@ -59,7 +59,8 @@ type routeTable map[string]*routeNode
 type routeNode struct {
 	literals map[string]*routeNode
 	// patterns hold segments with a template inside them, such as
-	// items{batch}. Only an internal operation can have one, so it is denied.
+	// items{batch}. Only an internal or unselected operation can have one, so
+	// it is never routed. Each template matches one or more characters.
 	patterns []routePattern
 	param    *routeNode
 	entry    *routeEntry
