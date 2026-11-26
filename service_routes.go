@@ -246,10 +246,12 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 					r.Out.Host = route.UpstreamHost
 				}
 				r.Out.URL.Path = stripServicePrefix(r.In.URL.Path, prefix)
-				if r.In.URL.RawPath != "" {
-					r.Out.URL.RawPath = stripServicePrefix(r.In.URL.RawPath, prefix)
-				}
 			}
+			// Send the decoded path that was gated, re-encoded by Go's url.URL
+			// path escaping, rather than the caller's spelling of it. A backend
+			// that routes on the encoded path would otherwise see /m%65 where
+			// the gateway checked /me.
+			r.Out.URL.RawPath = ""
 			stripForwardedIdentity(r.Out.Header, bindings.Authorization)
 			for _, header := range requestHeaders {
 				if values := r.In.Header.Values(header); len(values) > 0 {

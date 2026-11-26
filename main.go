@@ -324,14 +324,18 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		prefix = legacyPrefix
 	} else if routePrefix(r.URL.Path) != prefix {
 		// An encoded prefix would skip the policy keyed by its decoded form.
+		// Contract routes match the path as sent and direct routes are keyed
+		// by it, so nothing is served on an encoded prefix today; this keeps
+		// it that way for any lookup that decodes.
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
 	servicePath := ""
 	if service, found := g.bindings.ServiceRoutes[prefix]; found {
-		// The policy below sees the cleaned path, but the route forwards the
-		// path as sent, and backends resolve dot segments differently than
-		// path.Clean. Refuse any path where the two could disagree.
+		// The policy below checks path.Clean of the decoded path, but the route
+		// forwards the decoded path uncleaned, and backends resolve dot
+		// segments differently than path.Clean. Refuse any path where the two
+		// could disagree.
 		if !canonicalPath(path, r.URL.Path) {
 			writeStatus(w, http.StatusNotFound)
 			return

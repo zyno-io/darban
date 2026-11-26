@@ -158,11 +158,14 @@ subrequest or explicitly sets `backendAuth` for an origin that authenticates
 requests itself. `publicPaths` lists exceptions to gateway authorization.
 `allowedPaths` can restrict the exposed surface and `deniedPaths` can exclude
 paths within it. A trailing `/*` matches a path subtree. The rules see the
-cleaned, decoded path, and the route forwards the path as sent, so a direct
-route returns `404` for any path where the two could differ: an empty, `.`
-or `..` segment (also when encoded), an encoded `/` or `\` (`%2F`, `%5C`), a
-`\`, or anything else `path.Clean` changes beyond one trailing `/`. Darban
-also returns `404` for a request whose first path segment is encoded. Registered operations
+decoded path. A direct route returns `404` for a path that is not canonical:
+one with an empty, `.` or `..` segment (also when encoded), an encoded `/` or
+`\` (`%2F`, `%5C`), a `\`, or anything else `path.Clean` changes beyond one
+trailing `/`. It forwards the decoded path, re-encoded by Go's `url.URL` path
+escaping, not the caller's spelling, so `/sdk/m%65` reaches the backend as
+`/sdk/me` and `/a(1)` as `/a%281%29`.
+Darban also returns `404` for a request whose first path segment is encoded.
+Registered operations
 and internal-route exclusions take precedence.
 
 `browserOrigins` lists the exact origins for gateway CORS, and
