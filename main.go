@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -159,7 +160,8 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 			if r.In.Host != g.bindings.Hostname {
 				r.Out.Host = r.In.Host
 			}
-			r.Out.URL.Path, r.Out.URL.RawPath = route.path, ""
+			params, _ := r.In.Context().Value(routeParamsKey{}).(map[string]routeParam)
+			r.Out.URL.Path, r.Out.URL.RawPath = upstreamPath(route.path, params)
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
 			stripForwardedIdentity(r.Out.Header, g.bindings.Authorization)
 			for _, header := range g.bindings.UpstreamRequestHeaders {
@@ -193,15 +195,29 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 type snapshot struct {
 	contractServices []string
 	// services holds the effective binding of each served contract service.
-	services        map[string]serviceBinding
-	unserved        map[string]bool
-	deniedTemplates []operationKey
-	denied          map[operationKey]bool
-	revision        string
-	specYAML        []byte
-	specJSON        []byte
-	routes          map[operationKey]registeredRoute
+	services map[string]serviceBinding
+	unserved map[string]bool
+	// routes and denied are keyed by public path template. table matches
+	// requests against both; it is built on first use.
+	denied    map[operationKey]bool
+	routes    map[operationKey]registeredRoute
+	table     routeTable
+	tableOnce sync.Once
+	revision  string
+	specYAML  []byte
+	specJSON  []byte
 }
+
+func (s *snapshot) routeTable() routeTable {
+	s.tableOnce.Do(func() { s.table = newRouteTable(s.routes, s.denied) })
+	return s.table
+}
+
+func (s *snapshot) match(method string, r *http.Request, legacyPrefix string) routeMatch {
+	return s.routeTable().matchRequest(method, r, legacyPrefix)
+}
+
+type routeParamsKey struct{}
 
 type gateway struct {
 	contractStatus contractStatusStore
@@ -257,11 +273,7 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		active.unserved[prefix] = true
 	}
 	for _, key := range compiled.denied {
-		if strings.Contains(key.path, "{") {
-			active.deniedTemplates = append(active.deniedTemplates, key)
-		} else {
-			active.denied[key] = true
-		}
+		active.denied[key] = true
 	}
 	for _, route := range compiled.routes {
 		binding, found := compiled.services[route.service]
@@ -281,11 +293,14 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		}
 		active.routes[route.key] = registered
 	}
+	active.routeTable()
 	return active
 }
 
 func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request) {
-	path, _, _ := strings.Cut(r.RequestURI, "?")
+	// The escaped path, also for an absolute-form request target, so the prefix
+	// policy and the operation match see the same path.
+	path := r.URL.EscapedPath()
 	legacyPrefix := g.legacyPrefixes[r.Host]
 	if r.Host != g.bindings.Hostname && legacyPrefix == "" {
 		writeStatus(w, http.StatusNotFound)
@@ -318,7 +333,6 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	if preflight {
 		method = r.Header.Get("Access-Control-Request-Method")
 	}
-	contractPath := path
 	prefix := routePrefix(path)
 	if legacyPrefix != "" {
 		prefix = legacyPrefix
@@ -341,12 +355,12 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			return
 		}
 		// Apply the same policy to alternate spellings of the same path.
-		contractPath = pathpkg.Clean(r.URL.Path)
+		cleaned := pathpkg.Clean(r.URL.Path)
 		if legacyPrefix != "" {
-			contractPath = prefix + contractPath
+			cleaned = prefix + cleaned
 		}
-		servicePath = stripServicePrefix(contractPath, prefix)
-		if routePrefix(contractPath) != prefix || !service.allowsPath(servicePath) {
+		servicePath = stripServicePrefix(cleaned, prefix)
+		if routePrefix(cleaned) != prefix || !service.allowsPath(servicePath) {
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
@@ -357,22 +371,16 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	key := operationKey{method, contractPath}
-	if active.denied[key] {
+	match := active.match(method, r, legacyPrefix)
+	switch {
+	case match.denied || match.invalid:
 		writeStatus(w, http.StatusNotFound)
 		return
-	}
-	route, ok := active.routes[key]
-	if !ok {
-		for _, blocked := range active.deniedTemplates {
-			if blocked.method == method && matchesPathTemplate(blocked.path, contractPath) {
-				writeStatus(w, http.StatusNotFound)
-				return
-			}
-		}
+	case match.route == nil:
 		g.serveService(w, r, prefix, servicePath, preflight, method)
 		return
 	}
+	route := *match.route
 	if preflight {
 		g.servePreflight(w, r, method)
 		return
@@ -394,7 +402,8 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			proxy = route.debugProxy
 		}
 	}
-	proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, caller)))
+	ctx = context.WithValue(context.WithValue(ctx, identityKey{}, caller), routeParamsKey{}, match.params)
+	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func main() {

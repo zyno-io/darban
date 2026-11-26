@@ -388,22 +388,6 @@ func stripForwardedIdentity(headers http.Header, settings authorizationConfig) {
 	}
 }
 
-func matchesPathTemplate(template, path string) bool {
-	templateParts, pathParts := strings.Split(template, "/"), strings.Split(path, "/")
-	if len(templateParts) != len(pathParts) {
-		return false
-	}
-	for i, part := range templateParts {
-		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") && pathParts[i] != "" {
-			continue
-		}
-		if part != pathParts[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // omitRefusedOperations removes the documented operations of a docs-only
 // service that its direct route would refuse, so the document does not promise
 // them, and returns a warning for each. A template is judged against every

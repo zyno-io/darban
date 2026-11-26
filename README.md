@@ -48,9 +48,8 @@ under `contractServices`. It has no traffic effect: it adds no routes and no
 denials, and the service's direct route keeps its own gating. The contract is
 optional, and a rejected one changes only the document. Such a service cannot
 select `operations` or define rewrites, and rewrites into it are denied with a
-warning on their owner. Its paths may be templates, such as `/items/{id}`,
-where each segment is a literal (`[A-Za-z0-9._~@-]+`, not `.` or `..`) or a
-whole `{name}`. Its component references are checked only when it publishes.
+warning on their owner. Its component references are checked only when it
+publishes.
 
 `route: false` with `publish: true` documents the service's public operations
 while its traffic stays on the direct route. It needs an explicit `prefix` that
@@ -94,6 +93,33 @@ in `book-catalog` becomes `bookCatalogItems`. Set `firstOnly` to prefix the
 first tag and leave the rest as written. Set `openapi.populateEmptyTags` to
 `true` to add the service name as the tag when an operation has none. This
 setting defaults to `false`.
+
+## Operation paths
+
+An operation path below the mount is a sequence of segments. Each is a
+literal of `A-Z a-z 0-9 . _ ~ @ -` (but not `.` or `..`) or a whole
+`{name}` parameter, such as `/items/{id}/reviews`. A template within a segment,
+such as `/files/{name}.txt`, a repeated parameter name, an empty segment and a
+trailing `/` are rejected, as are two operations with the same method and path
+shape, such as `GET /items/{id}` and `GET /items/{itemId}`. That includes
+`internal` operations.
+
+A request matches one segment at a time, a literal before a parameter, and
+backtracks when the rest of the path does not match. So `GET /items/new`
+wins over `GET /items/{id}`, and `/items/new/reviews` still matches
+`/items/{id}/reviews`. A parameter matches one non-empty segment. The
+upstream receives the operation's upstream path with each parameter as the
+caller encoded it. `HEAD` matches a `GET` operation unless the contract
+declares `HEAD` for the path.
+
+Only a canonical path matches an operation. A path that encodes `/` or `\`
+(`%2F`, `%5C`), or that `path.Clean` changes in anything but a trailing `/`
+(`//`, `.` or `..` segments), matches none. Such a path is still refused with
+`404` when its cleaned form names an `internal` or denied operation. On a prefix
+with a [direct Service route](#direct-service-routes) it otherwise goes to
+that route, with the route's own path policy, and elsewhere it returns `404`.
+A parameter that decodes to `.`, `..`, or a value with `/` or `\` returns
+`404`.
 
 ## Operation visibility
 

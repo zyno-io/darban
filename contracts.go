@@ -134,35 +134,14 @@ func (l *legacySecurity) validate() error {
 }
 
 // Some backends already mount routes under their module name. Map that
-// upstream mount to the public service prefix. A routed service needs literal
-// paths. A docs-only service (route: false) routes nothing, so its paths may
-// be templates.
+// upstream mount to the public service prefix. The rest of the path must be a
+// valid operation path (see templatePath).
 func (b serviceBinding) publicPath(path string) (string, bool) {
 	suffix, ok := strings.CutPrefix(path, b.Mount)
-	valid := literalPath.MatchString
-	if !b.routed() {
-		valid = templatePath
-	}
-	if !ok || !valid(suffix) {
+	if !ok || !templatePath(suffix) {
 		return "", false
 	}
 	return b.Prefix + suffix, true
-}
-
-var pathSegment = regexp.MustCompile(`^([A-Za-z0-9._~@-]+|\{[A-Za-z_][A-Za-z0-9_.-]*\})$`)
-
-// templatePath reports whether every segment of path is a literal or a whole
-// {name} parameter.
-func templatePath(path string) bool {
-	if !strings.HasPrefix(path, "/") || path == "/" {
-		return false
-	}
-	for _, segment := range strings.Split(path[1:], "/") {
-		if segment == "." || segment == ".." || !pathSegment.MatchString(segment) {
-			return false
-		}
-	}
-	return true
 }
 
 type upstreamBindings struct {
@@ -627,6 +606,8 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 		selected[key] = operation.Legacy
 	}
 	matched := 0
+	// shapes holds the first path of each method and path shape.
+	shapes := make(map[operationKey]string)
 	for _, path := range slices.Sorted(maps.Keys(source.Paths)) {
 		item := source.Paths[path]
 		for _, key := range slices.Sorted(maps.Keys(item)) {
@@ -665,9 +646,14 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 				if visibility == visibilityInternal {
 					continue
 				}
-				return fmt.Errorf("unmapped or non-literal public path %q", path)
+				return fmt.Errorf("invalid or unmapped public path %q: each segment must be a literal or a whole {name}", path)
 			}
 			publicKey := operationKey{strings.ToUpper(key), publicPath}
+			shape := operationKey{publicKey.method, pathShape(path)}
+			if other, exists := shapes[shape]; exists {
+				return fmt.Errorf("%s %s and %s %s have the same path shape", key, other, key, path)
+			}
+			shapes[shape] = path
 			if visibility == visibilityInternal {
 				native[publicKey] = sourceOperation{visibility: visibilityInternal}
 				continue
