@@ -267,6 +267,11 @@ Omit `openapi` to disable publication or configure either path independently.
 Configure `omitOperationExtensionPrefixes` to remove selected source vendor
 extensions from published operations.
 
+The YAML document is written from the JSON one, with the same content.
+Characters YAML cannot hold as they are, such as DEL, C1 controls and U+FFFE,
+are escaped, and U+0085 is written as `\N`. Keys of any length are allowed;
+a long or multi-line one is a YAML complex key (`? key`).
+
 ```json
 {
   "defaultVisibility": "public",
@@ -431,6 +436,10 @@ image from the repository's Dockerfile. Supply the TLS certificate and key in a 
 `<release-name>-backend-tls`. Use Helm values to supply the image and
 bindings. This example configures a catalog API and publishes both
 OpenAPI formats.
+
+The chart requests 64Mi of memory and limits it to 256Mi. Composing the
+contracts needs more than serving them: eight full-size contracts peak near
+120Mi while they compose. Raise `resources.limits.memory` for a larger set.
 
 ```yaml
 image: ghcr.io/zyno-io/darban:<short-sha>

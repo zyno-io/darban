@@ -1210,6 +1210,11 @@ func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string
 	})
 	conflicts := make(map[string]string)
 	rejected := make(map[string]bool)
+	// Trials check without rendering. Rendering accepts whatever passes the
+	// checks, but if it ever fails, the admission runs again with rendering
+	// trials, so the unit that makes it fail is the one rejected.
+	check := validateAssembly
+	rendering := false
 	seed := make(map[string]*serviceUnit)
 	for _, name := range order {
 		if unit := lastGood[name]; unit != nil {
@@ -1217,7 +1222,7 @@ func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string
 		}
 	}
 	for {
-		_, err := assemble(seed, bindings, "")
+		err := validateAssembly(seed, bindings, "")
 		if err == nil {
 			break
 		}
@@ -1241,7 +1246,7 @@ restart:
 				}
 				previous, had := accepted[name]
 				accepted[name] = unit
-				_, err := assemble(accepted, bindings, name)
+				err := check(accepted, bindings, name)
 				if err == nil {
 					continue
 				}
@@ -1260,7 +1265,7 @@ restart:
 					trial := maps.Clone(accepted)
 					trial[name] = unit
 					delete(trial, culprit)
-					if _, alone := assemble(trial, bindings, name); alone != nil {
+					if alone := check(trial, bindings, name); alone != nil {
 						blameCulprit, culprit, err = false, "", alone
 					}
 				}
@@ -1285,8 +1290,15 @@ restart:
 			}
 		}
 		out, err := assemble(accepted, bindings, "")
+		if err != nil && !rendering {
+			check, rendering = func(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) error {
+				_, err := assemble(units, bindings, prefer)
+				return err
+			}, true
+			continue restart
+		}
 		if err != nil {
-			// Unreachable: every admitted step was validated. Fall back to the seed.
+			// Unreachable: every admitted step rendered. Fall back to the seed.
 			out, _ = assemble(seed, bindings, "")
 			return out, seed, conflicts
 		}
@@ -1315,7 +1327,23 @@ func faultService(err error) string {
 // assemble merges validated units into one candidate and runs the checks that
 // span services: rewrites, route and OpenAPI endpoint conflicts, duplicate
 // operationIds and component imports.
+// renderYAML writes the composed document as YAML. Tests replace it to make
+// rendering fail.
+var renderYAML = jsonToYAML
+
 func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) (candidate, error) {
+	return assembleUnits(units, bindings, prefer, true)
+}
+
+// validateAssembly runs every check of assemble without rendering the
+// document, for the trial assemblies that only need to know whether a set of
+// units fits together.
+func validateAssembly(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) error {
+	_, err := assembleUnits(units, bindings, prefer, false)
+	return err
+}
+
+func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, prefer string, render bool) (candidate, error) {
 	var out candidate
 	unroutedDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
@@ -1484,14 +1512,18 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 			return out, &assemblyError{source.service, fmt.Errorf("%s %s: %w", key.method, key.path, err)}
 		}
 		security := make(securityRequirements, 0, len(source.requirements))
+		// Each requirement keeps all its schemes, which must all be met, in a
+		// stable order.
 		for _, alternative := range source.requirements {
-			for profile, scopes := range alternative {
+			requirement := make(map[string][]string, len(alternative))
+			for _, profile := range slices.Sorted(maps.Keys(alternative)) {
 				name, err := importComponent(source.service, "securitySchemes", profile, *source.source, components)
 				if err != nil {
 					return out, &assemblyError{source.service, err}
 				}
-				security = append(security, map[string][]string{name: scopes})
+				requirement[name] = alternative[profile]
 			}
+			security = append(security, requirement)
 		}
 		operation["security"] = security
 		if id := source.operationID; id != "" {
@@ -1510,7 +1542,9 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 			operationIDs[id] = key
 			operation["operationId"] = id
 		}
-		paths[key.path][strings.ToLower(key.method)] = operation
+		if render {
+			paths[key.path][strings.ToLower(key.method)] = operation
+		}
 		count(keyOwners[key], func(c *serviceCounts) { c.documented++ })
 	}
 	for _, service := range slices.Sorted(maps.Keys(documentedSources)) {
@@ -1519,6 +1553,9 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		}
 	}
 
+	if !render {
+		return out, nil
+	}
 	document := map[string]any{
 		"openapi":    "3.1.0",
 		"info":       map[string]string{"title": "Darban", "version": "1"},
@@ -1530,7 +1567,10 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	if err != nil {
 		return out, err
 	}
-	out.specYAML, err = yaml.JSONToYAML(rawJSON)
+	// Write the YAML from the JSON without parsing it back into a tree. It
+	// accepts any JSON document, so rendering cannot reject what passed the
+	// checks above.
+	out.specYAML, err = renderYAML(rawJSON)
 	if err != nil {
 		return out, err
 	}
@@ -1541,7 +1581,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		return strings.Compare(a.key.method+" "+a.key.path, b.key.method+" "+b.key.path)
 	})
 	hash := sha256.New()
-	hash.Write(out.specYAML)
+	hash.Write(rawJSON)
 	fmt.Fprintf(hash, "services %v\n", out.contractServices)
 	for _, name := range out.contractServices {
 		binding := units[name].binding

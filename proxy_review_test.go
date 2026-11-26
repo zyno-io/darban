@@ -189,10 +189,18 @@ func TestBackendAuthForwardsIdentityHeadersOnlyWhenListed(t *testing.T) {
 		"forwarded":       {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"X-Forwarded-For"}},
 		"invalid":         {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"bad header"}},
 		"duplicate":       {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"X-Id", "X-Id"}},
+		"duplicate spelling": {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true,
+			ForwardRequestHeaders: []string{"X-ZS-TID", "X-ZS-TID"}},
 	} {
 		bindings := upstreamBindings{Hostname: api, Authz: "http://authz.fixtures.svc.cluster.local:80", ServiceRoutes: map[string]serviceRoute{"/shop": route}}
-		if err := bindings.validateServiceRoutes(true); err == nil {
+		err := bindings.validateServiceRoutes(true)
+		if err == nil {
 			t.Errorf("%s: accepted", name)
+			continue
+		}
+		// The message names the actual problem.
+		if needsBackendAuth := strings.Contains(err.Error(), "needs backendAuth"); needsBackendAuth != (name == "not backendAuth") {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }
@@ -271,5 +279,54 @@ func TestExtraRoutesRejectSameShapesAndIgnoredAuth(t *testing.T) {
 		if err := writeBindings(t, body); err == nil || !strings.Contains(err.Error(), "extra route") {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+func TestBackendAuthForwardsUpstreamRequestHeadersThatLookLikeIdentity(t *testing.T) {
+	// Alpha forwards X-ZS-Date upstream although X-ZS- is a stripped prefix.
+	// On a backendAuth route the backend gets it, and the authorizer request
+	// headers, which it is not, exclude it.
+	var upstream, authorizer http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		upstream = q.Header.Clone()
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer backend.Close()
+	authz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		authorizer = q.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer authz.Close()
+	bindings := upstreamBindings{
+		Hostname: api, Authz: authz.URL, UpstreamRequestHeaders: []string{"X-Zs-Date"},
+		Authorization: authorizationConfig{Path: "/authz", RequestHeaders: []string{"X-Zs-Tid"}, ResponseHeaders: []string{"X-Zs-Tid"},
+			StripHeaderPrefixes: []string{"X-Zs-"}},
+		ServiceRoutes: map[string]serviceRoute{
+			"/auth":  {Origin: backend.URL, BackendAuth: true},
+			"/suite": {Origin: backend.URL},
+		},
+	}
+	if err := bindings.validateServiceRoutes(true); err != nil {
+		t.Fatal(err)
+	}
+	gw := newGateway(bindings)
+	for _, path := range []string{"/auth/login", "/suite/x"} {
+		upstream, authorizer = nil, nil
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = api
+		req.Header.Set("Authorization", "Bearer x")
+		req.Header.Set("X-ZS-Date", "2026-11-26")
+		req.Header.Set("X-ZS-TID", "forged")
+		res := httptest.NewRecorder()
+		gw.serve(&snapshot{}, res, req)
+		if res.Code != http.StatusTeapot || upstream.Get("X-Zs-Date") != "2026-11-26" || upstream.Get("X-Zs-Tid") != "" {
+			t.Errorf("%s: %d upstream %v", path, res.Code, upstream)
+		}
+		if authorizer != nil && authorizer.Get("X-Zs-Date") != "" {
+			t.Errorf("%s: authorizer got X-ZS-Date", path)
+		}
+	}
+	if authorizer == nil {
+		t.Fatal("the protected route did not call the authorizer")
 	}
 }

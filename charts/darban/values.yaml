@@ -17,9 +17,12 @@ ingress:
   namespace: ''
   gatewayName: ''
 
+# Composing large contracts peaks well above the steady state: eight
+# full-size contracts peak near 120Mi. Size the limit for the largest
+# contract set.
 resources:
   requests:
     cpu: 100m
-    memory: 32Mi
+    memory: 64Mi
   limits:
-    memory: 128Mi
+    memory: 256Mi
