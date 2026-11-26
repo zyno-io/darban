@@ -14,6 +14,41 @@ go run . -manifest testdata/local.yaml -bindings testdata/bindings.json -print-s
 ```
 
 Set `-namespace` for Kubernetes discovery or `-manifest` for local files.
+
+### Pre-flight checks
+
+`-contracts FILE` reads a `GatewayContract` list, as
+`kubectl get gatewaycontracts -o json` prints it, and decodes each item
+exactly as cluster mode does. It is one-shot only, with `-print-spec` or
+`-report`:
+
+```bash
+kubectl get gatewaycontracts -n zyno-alpha -o json > contracts.json
+darban -contracts contracts.json -bindings bindings.json -print-spec
+darban -contracts contracts.json -bindings bindings.json -report
+```
+
+`-report` prints a stable, diffable table of what the gateway does, and exits
+`1` when a contract is rejected or missing:
+
+- a line per service with `route`, `publish`, its state and its counts, and
+  any rejection or warning;
+- a line per contract operation:
+  `METHOD path service visibility documented=yes|no -> outcome`;
+- a line per rewrite and per extra route;
+- a summary of the outcomes.
+
+The outcome is `404 internal`, `404 unmatched`, `404 route-rule` (refused by
+the direct route's path rules), `503 closed` (a routed service on a direct
+route without an accepted contract) or
+`proxy auth=authz|none|backend via=contract|service-route`. `authz` is the
+gateway's authorizer, `none` an anonymous operation, and `backend` a route
+that leaves authorization to the backend. A `route: false` service's
+operations are judged by its direct route's rules, as its traffic is today, so
+a diff of the reports for the same contracts with `route: false` and with
+`route: true` shows what a cutover changes. A template is judged against
+every path it stands for, as for [publish-only](#route-and-publish)
+omissions.
 The gateway reads bindings JSON from `/config/bindings.json` and its TLS
 certificate and key from `/tls/` by default. The local manifest points to
 OpenAPI YAML and rewrite YAML. Kubernetes registers the same information in
@@ -576,7 +611,19 @@ contract: its traffic stays on the direct route either way.
 prefix, including the rewrites it owns, that the active snapshot routes,
 documents and denies. `warnings` lists the service's rewrites that are denied
 although their target is served, and the operations a publish-only service
-leaves out of the document. The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+leaves out of the document. For a `route: false` service on a direct route, `shadow` compares its real
+traffic with its contract. Each request the route serves is also matched
+against the contract's operations, of any visibility: `matched`,
+`wouldDeny` (an `internal` operation), `unmatched`, and of the matched ones
+`wouldSkipAuth` (anonymous, or a `backendAuth` route) and `wouldAuthorize`.
+Up to 20 distinct `samples` per kind read `kind METHOD template`: the
+operation's template, or for an unmatched request its path with every
+segment that is not a plain lowercase word replaced by `{}`, cut after six
+segments. They never hold a query, an identifier or a raw path. The counts
+survive contract updates and reset when the pod restarts. An unmatched sample
+is a path the service needs to declare, or to list in `extraRoutes`, before
+it moves to `route: true`.
+The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
 

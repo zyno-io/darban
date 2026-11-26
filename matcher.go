@@ -234,6 +234,8 @@ func (t routeTable) lookup(method string, segments []string) *routeEntry {
 
 // routeMatch is the outcome of matching a request against the snapshot.
 type routeMatch struct {
+	// key is the template of the operation the request matched.
+	key    operationKey
 	denied bool
 	// passthrough marks an operation the bindings leave unselected.
 	passthrough bool
@@ -269,11 +271,11 @@ func (t routeTable) matchRequest(method, raw, decoded, legacyPrefix string) rout
 	case entry == nil:
 		return routeMatch{}
 	case entry.kind == entryPassthrough:
-		return routeMatch{passthrough: true}
+		return routeMatch{key: entry.key, passthrough: true}
 	case entry.kind == entryDenied:
-		return routeMatch{denied: true}
+		return routeMatch{key: entry.key, denied: true}
 	}
-	match := routeMatch{route: entry.route}
+	match := routeMatch{key: entry.key, route: entry.route}
 	for i, name := range entry.params {
 		if name == "*" {
 			// The rest of the path, already canonical.
@@ -291,7 +293,7 @@ func (t routeTable) matchRequest(method, raw, decoded, legacyPrefix string) rout
 		}
 		value := segments[i]
 		if value == "." || value == ".." || strings.ContainsAny(value, `/\`) {
-			return routeMatch{route: entry.route, invalid: true}
+			return routeMatch{key: entry.key, route: entry.route, invalid: true}
 		}
 		if match.params == nil {
 			match.params = make(map[string]string)
