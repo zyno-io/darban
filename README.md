@@ -21,6 +21,9 @@ namespaced `GatewayContract` resources under `contractAPIGroup`. A contract
 names its own upstream (see [Contract upstreams](#contract-upstreams)), so a
 backend can join the gateway without a bindings entry.
 
+The bindings file is parsed strictly. An unknown key at any depth, or any
+data after the JSON object, fails startup.
+
 `bindings.services` entries are optional overrides. A contract that sets
 `spec.upstream` needs none. Use an entry for what only bindings carry:
 `operations` (with `legacy`), `debugOrigin` and `registrationOnly`. Its
