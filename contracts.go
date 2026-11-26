@@ -441,7 +441,7 @@ func parseBindings(raw []byte, path string, local bool) (upstreamBindings, error
 	}
 	if bindings.UpstreamTLS.CAFile != "" {
 		if _, err := loadCAPool(bindings.UpstreamTLS.CAFile); err != nil {
-			return bindings, fmt.Errorf("upstreamTLS.caFile: %w", err)
+			return bindings, retryableError{fmt.Errorf("upstreamTLS.caFile: %w", err)}
 		}
 	}
 	if bindings.Authz != "" {
@@ -1003,9 +1003,12 @@ type serviceUnit struct {
 	openAPIDigest [sha256.Size]byte
 	native        map[operationKey]sourceOperation
 	aliases       map[operationKey]aliasTarget
-	denied        []operationKey
-	passthrough   []operationKey
-	extras        []compiledOperation
+	// targets are the services the rewrites name, which must stay in the
+	// effective bindings for the unit to be reused.
+	targets     []string
+	denied      []operationKey
+	passthrough []operationKey
+	extras      []compiledOperation
 }
 
 const (
@@ -1123,6 +1126,9 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 			return nil, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
 		}
 		unit.aliases[from] = aliasTarget{operationKey{from.method, rule.To.Path}, rule.To.ServiceName}
+		if !slices.Contains(unit.targets, rule.To.ServiceName) {
+			unit.targets = append(unit.targets, rule.To.ServiceName)
+		}
 	}
 	return unit, nil
 }
@@ -1198,7 +1204,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		if !ok {
 			continue
 		}
-		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding, effectiveBindings) {
+		if prev := lastGood[name]; prev != nil && prev.reusable(reg, binding, effectiveBindings) {
 			current[name] = prev
 			continue
 		}
@@ -1264,6 +1270,18 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	return out, report
 }
 
+// reusable reports whether the unit is what compiling reg with binding under
+// these bindings would give: the same inputs, and every rewrite target still
+// a service the bindings know.
+func (u *serviceUnit) reusable(reg registration, binding serviceBinding, bindings upstreamBindings) bool {
+	for _, target := range u.targets {
+		if _, known := bindings.Services[target]; !known {
+			return false
+		}
+	}
+	return u.digest == registrationDigest(reg, binding, bindings)
+}
+
 // refreshUnits compiles each last-good unit again from its contract when the
 // bindings it depends on changed, so that a service kept on its last good
 // contract follows new bindings too. A unit that no longer compiles is
@@ -1272,7 +1290,7 @@ func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBin
 	var out map[string]*serviceUnit
 	for name, unit := range units {
 		binding, _, err := resolveBinding(unit.reg, bindings)
-		if err == nil && unit.digest == registrationDigest(unit.reg, binding, effective) {
+		if err == nil && unit.reusable(unit.reg, binding, effective) {
 			continue
 		}
 		if out == nil {

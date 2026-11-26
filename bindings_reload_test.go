@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -60,8 +61,10 @@ type reloadRig struct {
 	rec    *reconciler
 	active atomic.Pointer[snapshot]
 	regs   atomic.Pointer[[]registration]
-	stop   context.CancelFunc
-	done   chan struct{}
+	// unreadable makes the contracts fail to load.
+	unreadable atomic.Bool
+	stop       context.CancelFunc
+	done       chan struct{}
 }
 
 func reloadBindingsJSON(origin, extra string) string {
@@ -75,7 +78,7 @@ func newReloadRig(t *testing.T, body string) *reloadRig {
 		t.Fatal(err)
 	}
 	g := newGateway(bindings)
-	g.bindingsStatus.loaded(revision, time.Now())
+	g.bindingsRevision, g.bindingsLoadedAt = revision, time.Now()
 	r.first = g
 	r.rec = &reconciler{gateway: g, active: &r.active}
 	r.setContracts(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"))
@@ -94,7 +97,12 @@ func newReloadRig(t *testing.T, body string) *reloadRig {
 
 func (r *reloadRig) setContracts(regs ...registration) {
 	r.regs.Store(&regs)
-	r.rec.apply(func() ([]registration, error) { return *r.regs.Load(), nil })
+	r.rec.apply(func() ([]registration, error) {
+		if r.unreadable.Load() {
+			return nil, errors.New("contracts unreadable")
+		}
+		return *r.regs.Load(), nil
+	})
 }
 
 func (r *reloadRig) get(path string) int {
@@ -209,9 +217,9 @@ func TestBindingsReloadKeepsTheActiveBindingsOnError(t *testing.T) {
 		if (name == "API group" || name == "upstream TLS") && !strings.Contains(report.LastBindingsError.Message, "restart") {
 			t.Errorf("%s: %q", name, report.LastBindingsError.Message)
 		}
-		r.rec.mu.Lock()
-		r.rec.gateway.bindingsStatus.lastError = nil
-		r.rec.mu.Unlock()
+		r.first.bindingsStatus.mu.Lock()
+		r.first.bindingsStatus.err = nil
+		r.first.bindingsStatus.mu.Unlock()
 	}
 	// The next valid file applies, and the error stays as the last one seen.
 	r.files.write(reloadBindingsJSON(origin, `, "enabled": false`))
@@ -277,4 +285,37 @@ func TestBindingsReloadRacesWithContractUpdates(t *testing.T) {
 	if active := r.active.Load(); active.gateway != r.rec.gateway {
 		t.Error("the active snapshot is from an older gateway")
 	}
+}
+
+func TestBindingsReloadRecompilesWhenARewriteTargetGoes(t *testing.T) {
+	origin := teapotUpstream(t)
+	withLegacy := fmt.Sprintf(`{"hostname": "api.example.net", "services": {"alpha": {"origin": %q}, "beta": {"origin": %q}, "legacy": {"origin": %q}}}`, origin, origin, origin)
+	r := newReloadRig(t, withLegacy)
+	alpha := contractFor("alpha", "/items", "listAlpha")
+	alpha.rewrites = `[{from: {method: GET, path: /alpha/old}, to: {serviceName: legacy, path: /items}}]`
+	r.setContracts(alpha, contractFor("beta", "/items", "listBeta"))
+	if r.get("/alpha/items") != http.StatusTeapot {
+		t.Fatal("alpha not served")
+	}
+	// Without legacy in the bindings, alpha's rewrite is outside them, as a
+	// fresh pod would find: the unit is compiled again, and rejected.
+	r.files.write(reloadBindingsJSON(origin, ""))
+	r.waitFor("alpha rejected", func() bool { return r.get("/alpha/items") == http.StatusServiceUnavailable })
+	if r.get("/beta/items") != http.StatusTeapot {
+		t.Error("beta stopped serving")
+	}
+}
+
+func TestBindingsReloadRetriesWhenTheContractsCannotBeRead(t *testing.T) {
+	origin := teapotUpstream(t)
+	r := newReloadRig(t, reloadBindingsJSON(origin, ""))
+	r.unreadable.Store(true)
+	r.files.write(reloadBindingsJSON(origin, `, "enabled": false`))
+	r.waitFor("reload error", func() bool { return r.status().LastBindingsError != nil })
+	if r.get("/alpha/items") != http.StatusTeapot {
+		t.Fatal("the old bindings stopped serving")
+	}
+	// The same file applies once the contracts can be read again.
+	r.unreadable.Store(false)
+	r.waitFor("retried reload", func() bool { return r.get("/alpha/items") == http.StatusServiceUnavailable })
 }

@@ -93,13 +93,21 @@ type statusResponse struct {
 func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		snapshot := active.Load()
+		// Report the bindings that serve: the active snapshot's, or before the
+		// first snapshot the latest accepted ones.
 		g := g
 		if snapshot != nil && snapshot.gateway != nil {
 			g = snapshot.gateway
+		} else if current := g.bindingsStatus.current.Load(); current != nil {
+			g = current
 		}
 		stopping := draining.Load()
 		report := statusResponse{Status: "ready", Ready: snapshot != nil && !stopping}
-		report.BindingsRevision, report.BindingsLoadedAt, report.LastBindingsError = g.bindingsStatus.read()
+		report.BindingsRevision = g.bindingsRevision
+		if !g.bindingsLoadedAt.IsZero() {
+			report.BindingsLoadedAt = g.bindingsLoadedAt.UTC().Format(time.RFC3339)
+		}
+		report.LastBindingsError = g.bindingsStatus.lastError()
 		report.Upstreams = append(report.Upstreams, upstreamStatus{"authz", "authorization", g.endpoints.state(g.bindings.Authz)})
 		// Contracts can add upstreams at runtime, so merge the served ones.
 		services := maps.Clone(g.bindings.Services)

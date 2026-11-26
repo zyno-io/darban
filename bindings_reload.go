@@ -7,6 +7,7 @@ import (
 	"log"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,35 +16,33 @@ import (
 // content hash of the file, whatever its modification time.
 const bindingsPollInterval = 2 * time.Second
 
-// bindingsStatusStore holds the active bindings revision and the latest
-// reload failure for /status.
+// bindingsStatusStore is shared by every gateway. It holds the latest reload
+// failure, and the gateway of the latest accepted bindings, which /status
+// reports before the first snapshot exists.
 type bindingsStatusStore struct {
-	mu        sync.RWMutex
-	revision  string
-	loadedAt  time.Time
-	lastError *contractRejection
-}
-
-func (s *bindingsStatusStore) loaded(revision string, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.revision, s.loadedAt = revision, now
+	mu      sync.RWMutex
+	err     *contractRejection
+	current atomic.Pointer[gateway]
 }
 
 func (s *bindingsStatusStore) failed(err error, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastError = &contractRejection{Message: err.Error(), Time: now.UTC().Format(time.RFC3339)}
+	s.err = &contractRejection{Message: err.Error(), Time: now.UTC().Format(time.RFC3339)}
 }
 
-func (s *bindingsStatusStore) read() (revision, loadedAt string, lastError *contractRejection) {
+func (s *bindingsStatusStore) lastError() *contractRejection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if !s.loadedAt.IsZero() {
-		loadedAt = s.loadedAt.UTC().Format(time.RFC3339)
-	}
-	return s.revision, loadedAt, s.lastError
+	return s.err
 }
+
+// retryableError is a reload failure that does not depend on the bindings
+// content, such as contracts or a CA file that cannot be read, so the same
+// content is tried again.
+type retryableError struct{ error }
+
+func (e retryableError) Unwrap() error { return e.error }
 
 // hotSwappable reports why new bindings cannot replace the active ones
 // without a restart: the contract API group selects the informer, the
@@ -72,17 +71,18 @@ func (r *reconciler) reloadBindings(next upstreamBindings, revision string, now 
 	if err := hotSwappable(previous.bindings, next, r.watched); err != nil {
 		return err
 	}
-	r.gateway = previous.withBindings(next)
+	next.requireAuthz = previous.bindings.requireAuthz
+	r.gateway = previous.withBindings(next, revision, now)
 	if r.load != nil {
 		r.applyLocked()
 		if active := r.active.Load(); active == nil || active.gateway != r.gateway {
 			// The contracts could not be read, so nothing was compiled with the
 			// new bindings.
 			r.gateway = previous
-			return errors.New("the contracts could not be read to compile the new bindings")
+			return retryableError{errors.New("the contracts could not be read to compile the new bindings")}
 		}
 	}
-	r.gateway.bindingsStatus.loaded(revision, now)
+	r.gateway.bindingsStatus.current.Store(r.gateway)
 	return nil
 }
 
@@ -92,7 +92,12 @@ func (r *reconciler) reloadBindings(next upstreamBindings, revision string, now 
 func (r *reconciler) watchBindings(ctx context.Context, path string, local bool, revision string, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	current, failed := revision, ""
+	r.mu.Lock()
+	status := r.gateway.bindingsStatus
+	r.mu.Unlock()
+	// current is the active revision. failed is a revision whose content was
+	// rejected, which is not tried again; reported is the last error logged.
+	current, failed, reported := revision, "", ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,23 +113,22 @@ func (r *reconciler) watchBindings(ctx context.Context, path string, local bool,
 			err = r.reloadBindings(bindings, next, now)
 		}
 		if err != nil {
-			// A file that cannot be read has no revision; report it once per
-			// message instead.
-			key := next
-			if key == "" {
-				key = "unreadable: " + err.Error()
+			// A file that cannot be read has no revision, and a failure that
+			// does not depend on the content is tried again; both are logged
+			// once per message.
+			var retry retryableError
+			if next != "" && !errors.As(err, &retry) {
+				failed = next
 			}
-			if key != failed {
+			if message := next + " " + err.Error(); message != reported {
 				log.Printf("bindings reload rejected, keeping revision %s: %v", short(current), err)
-				r.mu.Lock()
-				r.gateway.bindingsStatus.failed(err, now)
-				r.mu.Unlock()
+				status.failed(err, now)
+				reported = message
 			}
-			failed = key
 			continue
 		}
 		log.Printf("bindings reloaded revision=%s", short(next))
-		current, failed = next, ""
+		current, failed, reported = next, "", ""
 	}
 }
 

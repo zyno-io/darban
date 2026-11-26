@@ -195,10 +195,14 @@ type gateway struct {
 	contractStatus *contractStatusStore
 	bindingsStatus *bindingsStatusStore
 	bindings       upstreamBindings
-	transports     *transports
-	authClient     *http.Client
-	upstreamTLS    *upstreamVerifier
-	endpoints      endpointCatalog
+	// bindingsRevision is the SHA-256 of the bindings file, loaded at
+	// bindingsLoadedAt.
+	bindingsRevision string
+	bindingsLoadedAt time.Time
+	transports       *transports
+	authClient       *http.Client
+	upstreamTLS      *upstreamVerifier
+	endpoints        endpointCatalog
 }
 
 func newGateway(bindings upstreamBindings) *gateway {
@@ -223,9 +227,9 @@ func newGateway(bindings upstreamBindings) *gateway {
 
 // withBindings returns a gateway for new bindings that shares everything
 // else with g.
-func (g *gateway) withBindings(bindings upstreamBindings) *gateway {
+func (g *gateway) withBindings(bindings upstreamBindings, revision string, loadedAt time.Time) *gateway {
 	next := *g
-	next.bindings = bindings
+	next.bindings, next.bindingsRevision, next.bindingsLoadedAt = bindings, revision, loadedAt
 	return &next
 }
 
@@ -455,7 +459,8 @@ func main() {
 	}
 	bindings.requireAuthz = true
 	gateway := newGateway(bindings)
-	gateway.bindingsStatus.loaded(bindingsRevision, time.Now())
+	gateway.bindingsRevision, gateway.bindingsLoadedAt = bindingsRevision, time.Now()
+	gateway.bindingsStatus.current.Store(gateway)
 	var active atomic.Pointer[snapshot]
 	reload := &reconciler{gateway: gateway, active: &active, watched: *namespace}
 	var current cache.SharedIndexInformer

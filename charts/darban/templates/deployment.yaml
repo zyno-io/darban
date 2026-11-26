@@ -19,8 +19,23 @@ spec:
       labels:
         {{- include "app.labels" . | nindent 8 }}
       annotations:
-        {{- /* Bindings reload in place; only the settings that cannot restart the pods. */}}
-        checksum/restart: {{ dict "contractAPIGroup" .Values.bindings.contractAPIGroup "upstreamTLS" .Values.bindings.upstreamTLS "chartTLS" .Values.upstreamTLS | toJson | sha256sum }}
+        {{- /* Bindings reload in place. Roll the pods only for the settings that
+             cannot: contractAPIGroup, upstreamTLS, and the Services named
+             outside the release namespace, whose EndpointSlices are watched
+             by name. */}}
+        {{- $origins := list (.Values.bindings.authz | default "") }}
+        {{- range $name, $service := (.Values.bindings.services | default dict) }}
+        {{- $origins = append $origins ($service.origin | default "") }}
+        {{- $origins = append $origins ($service.debugOrigin | default "") }}
+        {{- end }}
+        {{- $external := list }}
+        {{- range $origins }}
+        {{- $parts := splitList "." (regexReplaceAll ":[0-9]+$" (urlParse .).host "") }}
+        {{- if and (gt (len $parts) 1) (ne (index $parts 1) $.Release.Namespace) }}
+        {{- $external = append $external (printf "%s.%s" (index $parts 0) (index $parts 1)) }}
+        {{- end }}
+        {{- end }}
+        checksum/restart: {{ dict "contractAPIGroup" .Values.bindings.contractAPIGroup "upstreamTLS" .Values.bindings.upstreamTLS "chartTLS" .Values.upstreamTLS "external" ($external | uniq | sortAlpha) | toJson | sha256sum }}
         {{- if .Values.rolloutOnBindingsChange }}
         checksum/bindings: {{ .Values.bindings | toJson | sha256sum }}
         {{- end }}

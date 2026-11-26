@@ -592,15 +592,18 @@ On a change it:
 
 A request is served entirely by one bindings revision, and readiness never
 changes during a reload. On any error, the active bindings keep serving, and
-the error is logged once per revision and shown in `/status` as
-`lastBindingsError`. `contractAPIGroup`, `upstreamTLS` and, in cluster mode,
+the error is logged once and shown in `/status` as `lastBindingsError`. A
+file that does not parse, validate or hot-swap is not tried again until its
+content changes. A failure that does not depend on the content, such as
+contracts or a CA file that cannot be read, is retried on the next read. `contractAPIGroup`, `upstreamTLS` and, in cluster mode,
 the set of Services named outside the watched namespace (whose
 EndpointSlices are watched by name) cannot change at runtime: such a change
 is rejected with an error that says to restart the gateway. Everything else
 in the bindings applies in place.
 
-The chart rolls the pods only when `contractAPIGroup` or `upstreamTLS`
-changes. Set `rolloutOnBindingsChange: true` to roll them on every bindings
+The chart rolls the pods only when one of those changes: `contractAPIGroup`,
+`upstreamTLS`, or the Services that `authz`, `origin` and `debugOrigin` name
+outside the release namespace. Set `rolloutOnBindingsChange: true` to roll them on every bindings
 change, as before reloads existed.
 
 ### Contract isolation
