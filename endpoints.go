@@ -43,21 +43,7 @@ func newEndpointCatalog(config *rest.Config, bindings upstreamBindings, watched 
 	if err != nil {
 		return nil, err
 	}
-	names := make(map[string]map[string]bool)
-	origins := []string{bindings.Authz}
-	for _, binding := range bindings.Services {
-		origins = append(origins, binding.Origin, binding.DebugOrigin)
-	}
-	for _, origin := range origins {
-		name, namespace := serviceReference(origin)
-		if name == "" {
-			continue
-		}
-		if names[namespace] == nil {
-			names[namespace] = make(map[string]bool)
-		}
-		names[namespace][name] = true
-	}
+	names := externalServices(bindings, watched)
 	out := make(endpointCatalog, len(names)+1)
 	if watched != "" {
 		out[watched] = newEndpointInformer(cache.NewListWatchFromClient(client.RESTClient(), "endpointslices", watched, fields.Everything()))
@@ -81,6 +67,27 @@ func newEndpointCatalog(config *rest.Config, bindings upstreamBindings, watched 
 		out[namespace] = newEndpointInformer(api)
 	}
 	return out, nil
+}
+
+// externalServices lists the Services the bindings name outside the watched
+// namespace, by namespace. The catalog watches each of them by name.
+func externalServices(bindings upstreamBindings, watched string) map[string]map[string]bool {
+	names := make(map[string]map[string]bool)
+	origins := []string{bindings.Authz}
+	for _, binding := range bindings.Services {
+		origins = append(origins, binding.Origin, binding.DebugOrigin)
+	}
+	for _, origin := range origins {
+		name, namespace := serviceReference(origin)
+		if name == "" || namespace == watched {
+			continue
+		}
+		if names[namespace] == nil {
+			names[namespace] = make(map[string]bool)
+		}
+		names[namespace][name] = true
+	}
+	return names
 }
 
 func newEndpointInformer(api cache.ListerWatcher) cache.SharedIndexInformer {

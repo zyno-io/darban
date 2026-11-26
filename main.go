@@ -54,6 +54,12 @@ func readJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	return decodeJSON(raw, path, value)
+}
+
+// decodeJSON decodes one JSON value strictly: no unknown fields and nothing
+// after the value.
+func decodeJSON(raw []byte, path string, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
@@ -167,6 +173,8 @@ type snapshot struct {
 	revision    string
 	specYAML    []byte
 	specJSON    []byte
+	// gateway serves the snapshot with the bindings it was built from.
+	gateway *gateway
 }
 
 func (s *snapshot) routeTable() routeTable {
@@ -180,8 +188,12 @@ func (s *snapshot) match(method, raw, decoded, legacyPrefix string) routeMatch {
 
 type routeParamsKey struct{}
 
+// gateway serves one bindings revision. A bindings reload makes a new
+// gateway that shares the transports, the authorizer client, the upstream
+// verifier, the EndpointSlice catalog and the status stores.
 type gateway struct {
-	contractStatus contractStatusStore
+	contractStatus *contractStatusStore
+	bindingsStatus *bindingsStatusStore
 	bindings       upstreamBindings
 	transports     *transports
 	authClient     *http.Client
@@ -197,9 +209,11 @@ func newGateway(bindings upstreamBindings) *gateway {
 	}
 	tlsConfig := verifier.tlsConfig()
 	return &gateway{
-		upstreamTLS: verifier,
-		bindings:    bindings,
-		transports:  &transports{base: newTransport(tlsConfig)},
+		contractStatus: new(contractStatusStore),
+		bindingsStatus: new(bindingsStatusStore),
+		upstreamTLS:    verifier,
+		bindings:       bindings,
+		transports:     &transports{base: newTransport(tlsConfig)},
 		authClient: &http.Client{
 			Transport:     newTransport(tlsConfig),
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -207,8 +221,17 @@ func newGateway(bindings upstreamBindings) *gateway {
 	}
 }
 
+// withBindings returns a gateway for new bindings that shares everything
+// else with g.
+func (g *gateway) withBindings(bindings upstreamBindings) *gateway {
+	next := *g
+	next.bindings = bindings
+	return &next
+}
+
 func (g *gateway) build(compiled candidate) *snapshot {
 	active := &snapshot{
+		gateway:          g,
 		contractServices: compiled.contractServices,
 		services:         compiled.services,
 		proxies:          make(map[string]*serviceProxy, len(compiled.services)),
@@ -397,7 +420,7 @@ func main() {
 	case *contracts != "" && !oneShot:
 		log.Fatal("-contracts needs -print-spec or -report")
 	}
-	bindings, err := loadBindings(*bindingsPath, *manifest != "")
+	bindings, bindingsRevision, err := readBindings(*bindingsPath, *manifest != "")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -432,8 +455,9 @@ func main() {
 	}
 	bindings.requireAuthz = true
 	gateway := newGateway(bindings)
+	gateway.bindingsStatus.loaded(bindingsRevision, time.Now())
 	var active atomic.Pointer[snapshot]
-	reload := &reconciler{gateway: gateway, active: &active}
+	reload := &reconciler{gateway: gateway, active: &active, watched: *namespace}
 	var current cache.SharedIndexInformer
 	if *namespace != "" {
 		config, err := rest.InClusterConfig()
@@ -499,8 +523,13 @@ func main() {
 	apiServer := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests.Add(1)
+			// Each snapshot carries the gateway for its bindings.
 			snapshot := active.Load()
-			gateway.serve(snapshot, w, r)
+			if snapshot == nil {
+				gateway.serve(nil, w, r)
+				return
+			}
+			snapshot.gateway.serve(snapshot, w, r)
 		}),
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -520,6 +549,7 @@ func main() {
 	failures := make(chan error, 3)
 	go func() { failures <- apiServer.ServeTLS(traffic, "", "") }()
 	go func() { failures <- adminServer.Serve(admin) }()
+	go reload.watchBindings(stopping, *bindingsPath, *manifest != "", bindingsRevision, bindingsPollInterval)
 	if current == nil {
 		go reload.watchLocal(stopping, *manifest)
 	} else {

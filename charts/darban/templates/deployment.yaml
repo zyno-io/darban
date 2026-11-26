@@ -19,7 +19,11 @@ spec:
       labels:
         {{- include "app.labels" . | nindent 8 }}
       annotations:
+        {{- /* Bindings reload in place; only the settings that cannot restart the pods. */}}
+        checksum/restart: {{ dict "contractAPIGroup" .Values.bindings.contractAPIGroup "upstreamTLS" .Values.bindings.upstreamTLS "chartTLS" .Values.upstreamTLS | toJson | sha256sum }}
+        {{- if .Values.rolloutOnBindingsChange }}
         checksum/bindings: {{ .Values.bindings | toJson | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}
       terminationGracePeriodSeconds: 18

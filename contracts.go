@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	pathpkg "path"
 	"regexp"
 	"slices"
@@ -411,8 +412,25 @@ var (
 )
 
 func loadBindings(path string, local bool) (upstreamBindings, error) {
+	bindings, _, err := readBindings(path, local)
+	return bindings, err
+}
+
+// readBindings loads and validates a bindings file, and returns the SHA-256
+// of its content as its revision.
+func readBindings(path string, local bool) (upstreamBindings, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return upstreamBindings{}, "", err
+	}
+	sum := sha256.Sum256(raw)
+	bindings, err := parseBindings(raw, path, local)
+	return bindings, hex.EncodeToString(sum[:]), err
+}
+
+func parseBindings(raw []byte, path string, local bool) (upstreamBindings, error) {
 	var bindings upstreamBindings
-	if err := readJSON(path, &bindings); err != nil {
+	if err := decodeJSON(raw, path, &bindings); err != nil {
 		return bindings, err
 	}
 	if !dnsName.MatchString(bindings.Hostname) {
@@ -976,7 +994,10 @@ type aliasTarget struct {
 // serviceUnit is one service's contract after per-service validation. It is
 // the unit of isolation: the compiler keeps, replaces or drops whole units.
 type serviceUnit struct {
-	// binding is the effective binding the unit was compiled with.
+	// reg is the contract the unit was compiled from, so that new bindings
+	// can compile it again. binding is the effective binding it was compiled
+	// with.
+	reg           registration
 	binding       serviceBinding
 	digest        [sha256.Size]byte
 	openAPIDigest [sha256.Size]byte
@@ -1027,9 +1048,10 @@ type compileReport struct {
 }
 
 // registrationDigest identifies everything a compiled unit depends on: the
-// contract and its effective binding. Rewrite destinations are resolved against
-// the served target binding in assemble, so they are not part of it.
-func registrationDigest(reg registration, binding serviceBinding) [sha256.Size]byte {
+// contract, its effective binding and the global bindings. Rewrite
+// destinations are resolved against the served target binding in assemble,
+// so they are not part of it.
+func registrationDigest(reg registration, binding serviceBinding, bindings upstreamBindings) [sha256.Size]byte {
 	hash := sha256.New()
 	visibility := "-"
 	if reg.defaultVisibility != nil {
@@ -1037,6 +1059,10 @@ func registrationDigest(reg registration, binding serviceBinding) [sha256.Size]b
 	}
 	fmt.Fprintf(hash, "%q %q %q %q", reg.serviceName, reg.openAPI, reg.rewrites, visibility)
 	encoded, _ := json.Marshal(binding)
+	fmt.Fprintf(hash, " %s", encoded)
+	global := bindings
+	global.Services = nil
+	encoded, _ = json.Marshal(global)
 	fmt.Fprintf(hash, " %s", encoded)
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
@@ -1060,8 +1086,9 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		return nil, errors.New("requires a rewrites list")
 	}
 	unit := &serviceUnit{
+		reg:           reg,
 		binding:       binding,
-		digest:        registrationDigest(reg, binding),
+		digest:        registrationDigest(reg, binding, bindings),
 		openAPIDigest: sha256.Sum256([]byte(reg.openAPI)),
 		native:        make(map[operationKey]sourceOperation),
 		aliases:       make(map[operationKey]aliasTarget),
@@ -1164,13 +1191,14 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	}
 	effectiveBindings := bindings
 	effectiveBindings.Services = effective
+	lastGood = refreshUnits(lastGood, bindings, effectiveBindings, defaultVisibility)
 	for _, reg := range sorted {
 		name := reg.serviceName
 		binding, ok := resolved[name]
 		if !ok {
 			continue
 		}
-		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding) {
+		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding, effectiveBindings) {
 			current[name] = prev
 			continue
 		}
@@ -1234,6 +1262,34 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		}
 	}
 	return out, report
+}
+
+// refreshUnits compiles each last-good unit again from its contract when the
+// bindings it depends on changed, so that a service kept on its last good
+// contract follows new bindings too. A unit that no longer compiles is
+// dropped, as if it had never been accepted.
+func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBindings, defaultVisibility operationVisibility) map[string]*serviceUnit {
+	var out map[string]*serviceUnit
+	for name, unit := range units {
+		binding, _, err := resolveBinding(unit.reg, bindings)
+		if err == nil && unit.digest == registrationDigest(unit.reg, binding, effective) {
+			continue
+		}
+		if out == nil {
+			out = maps.Clone(units)
+		}
+		delete(out, name)
+		if err != nil {
+			continue
+		}
+		if fresh, err := compileService(unit.reg, binding, effective, defaultVisibility); err == nil {
+			out[name] = fresh
+		}
+	}
+	if out == nil {
+		return units
+	}
+	return out
 }
 
 // compileStrict treats any rejected contract, and any rewrite into a service

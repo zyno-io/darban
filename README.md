@@ -88,7 +88,8 @@ Every service is described by its contract, and optionally by an entry under
   merges with bindings the same way.
 
 The bindings file is parsed strictly. An unknown key at any depth, or any
-data after the JSON object, fails startup. A minimal file for a gateway
+data after the JSON object, fails startup. A changed file is reloaded in place (see
+[Bindings reload](#bindings-reload)). A minimal file for a gateway
 whose contracts all set `spec.upstream` is:
 
 ```json
@@ -576,6 +577,32 @@ In the chart, set `upstreamTLS.caSecretName` or `upstreamTLS.caConfigMapName`
 mounts it at `/etc/darban/upstream-ca` and sets `bindings.upstreamTLS.caFile`
 to match. Leaving them unset changes nothing.
 
+### Bindings reload
+
+Darban reloads the `-bindings` file while it runs. It reads the file every
+two seconds and compares the SHA-256 of its content, so the atomic `..data`
+symlink swap of a ConfigMap volume is picked up whatever the file times say.
+On a change it:
+
+1. parses and validates the file as strictly as at startup;
+2. checks that nothing changed that cannot change at runtime;
+3. compiles the current contracts with it, including the last good contract
+   of a service whose current one is rejected; and
+4. swaps the snapshot, which carries the new bindings, in one atomic store.
+
+A request is served entirely by one bindings revision, and readiness never
+changes during a reload. On any error, the active bindings keep serving, and
+the error is logged once per revision and shown in `/status` as
+`lastBindingsError`. `contractAPIGroup`, `upstreamTLS` and, in cluster mode,
+the set of Services named outside the watched namespace (whose
+EndpointSlices are watched by name) cannot change at runtime: such a change
+is rejected with an error that says to restart the gateway. Everything else
+in the bindings applies in place.
+
+The chart rolls the pods only when `contractAPIGroup` or `upstreamTLS`
+changes. Set `rolloutOnBindingsChange: true` to roll them on every bindings
+change, as before reloads existed.
+
 ### Contract isolation
 
 Darban compiles each service's contract on its own, so one service cannot
@@ -636,7 +663,10 @@ Darban has no Prometheus registry, so the rejections appear in `/status` only.
 ### Status
 
 `GET /status` on the private admin port (8081) reports the active revision,
-route count, and EndpointSlice state for the authorizer and each backend,
+the bindings (`bindingsRevision`, the SHA-256 of the active file,
+`bindingsLoadedAt`, and `lastBindingsError` with its message and time, which
+stays after a later reload succeeds), route count, and EndpointSlice state
+for the authorizer and each backend,
 including the upstreams that contracts add at runtime. Darban watches every
 EndpointSlice in its own namespace, and the Services named in `bindings` in
 other namespaces.
