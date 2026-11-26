@@ -7,52 +7,33 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestMountOnDirectRouteServiceIsRejected(t *testing.T) {
-	bindings := directRouteBindings("http://catalog.zyno-alpha.svc.cluster.local:80")
-	bindings.Services["catalog"] = serviceBinding{Prefix: "/catalog", Origin: "http://catalog.zyno-alpha.svc.cluster.local:80"}
+func TestMountMapsUpstreamPathsToThePrefix(t *testing.T) {
+	bindings := contractOnlyBindings()
+	bindings.Services["catalog"] = serviceBinding{Prefix: "/catalog"}
 	const upstream = "http://catalog." + testNamespace + ".svc.cluster.local/api"
-	reg := clusterContract("catalog", "/api/items", "listItems", upstream, "/catalog")
+	reg := clusterContract("catalog", "/api/items", "listItems", upstream, "")
 	reg.openAPI += "  /api/private:\n    post:\n      x-darban-visibility: internal\n"
-	_, report := compile([]registration{reg}, bindings, nil)
-	if outcome := report.services["catalog"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "direct route") {
-		t.Fatalf("catalog outcome = %+v", outcome)
-	}
-	// Without a mount the same contract is accepted and denies the operation.
-	reg = clusterContract("catalog", "/items", "listItems", "http://catalog."+testNamespace+".svc.cluster.local", "/catalog")
-	reg.openAPI += "  /private:\n    post:\n      x-darban-visibility: internal\n"
 	got, report := compile([]registration{reg}, bindings, nil)
 	if report.services["catalog"].rejection != "" {
-		t.Fatalf("unmounted contract rejected: %+v", report.services["catalog"])
+		t.Fatalf("catalog outcome = %+v", report.services["catalog"])
 	}
+	wantPaths(t, got, "/catalog/items")
 	if len(got.denied) != 1 || got.denied[0] != (operationKey{"POST", "/catalog/private"}) {
 		t.Fatalf("denied = %v", got.denied)
 	}
-	// A static mount on a direct route is a startup error.
-	raw, _ := json.Marshal(map[string]any{
-		"hostname":      "api.example.net",
-		"services":      map[string]any{"catalog": map[string]any{"origin": "http://127.0.0.1:8443", "prefix": "/catalog", "mount": "/api"}},
-		"serviceRoutes": map[string]any{"/catalog": map[string]any{"origin": "http://127.0.0.1:8443", "backendAuth": true}},
-	})
-	path := filepath.Join(t.TempDir(), "bindings.json")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadBindings(path, true); err == nil || !strings.Contains(err.Error(), "mount") {
-		t.Fatalf("loadBindings = %v, want a mount error", err)
+	if binding := got.services["catalog"]; binding.Mount != "/api" || binding.Origin != "http://catalog."+testNamespace+".svc.cluster.local:80" {
+		t.Fatalf("binding = %+v", binding)
 	}
 }
 
@@ -94,17 +75,16 @@ func TestRewriteOwnerIsCheckedAgainstServedTargetBinding(t *testing.T) {
 
 func TestRewriteOwnerSurvivesTargetPrefixCollision(t *testing.T) {
 	bindings := contractOnlyBindings()
-	bindings.Services["t"] = serviceBinding{Prefix: "/t", Origin: "http://t.zyno-alpha.svc.cluster.local:80"}
+	// t has no bindings entry, so its contract chooses its prefix.
 	bindings.Services["x"] = serviceBinding{Prefix: "/x", Origin: "http://x.zyno-alpha.svc.cluster.local:80"}
 	other := clusterContract("u", "/things", "listU", "http://u", "/u")
-	regs := []registration{contractFor("t", "/items", "listT"), rewriteOwner("aliasX"), other}
+	regs := []registration{clusterContract("t", "/items", "listT", "http://t", ""), rewriteOwner("aliasX"), other}
 	_, r1 := compile(regs, bindings, nil)
 	if len(r1.accepted) != 3 {
 		t.Fatalf("setup: %+v", r1.services)
 	}
 	// t moves onto u's prefix and loses the collision.
-	moved := contractFor("t", "/items", "listT")
-	moved.prefix = "/u"
+	moved := clusterContract("t", "/items", "listT", "http://t", "/u")
 	got, r2 := compile([]registration{moved, rewriteOwner("aliasX2"), other}, bindings, r1.accepted)
 	if r2.services["t"].serving != servingLastGood || !strings.Contains(r2.services["t"].rejection, "already used") {
 		t.Fatalf("t: %+v", r2.services["t"])
@@ -260,9 +240,9 @@ func TestRewriteApprovalDoesNotDependOnHowTargetFails(t *testing.T) {
 }
 
 func TestBindingsEntryWithoutPrefixReservesItsDefaultPrefix(t *testing.T) {
-	for _, route := range []bool{true, false} {
+	for _, publish := range []bool{true, false} {
 		bindings := contractOnlyBindings()
-		bindings.Services["foo"] = serviceBinding{Origin: "http://foo.zyno-alpha.svc.cluster.local:80", Route: &route, Publish: &route}
+		bindings.Services["foo"] = serviceBinding{Origin: "http://foo.zyno-alpha.svc.cluster.local:80", Publish: &publish}
 		evil := clusterContract("evil", "/items", "listEvil", "http://evil", "/foo")
 		foo := contractFor("foo", "/items", "listFoo")
 		for name, regs := range map[string][]registration{
@@ -272,10 +252,10 @@ func TestBindingsEntryWithoutPrefixReservesItsDefaultPrefix(t *testing.T) {
 		} {
 			_, report := compile(regs, bindings, nil)
 			if outcome := report.services["evil"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "reserved") {
-				t.Errorf("route=%v %s: evil = %+v", route, name, outcome)
+				t.Errorf("publish=%v %s: evil = %+v", publish, name, outcome)
 			}
 			if _, has := report.services["foo"]; has && report.services["foo"].rejection != "" {
-				t.Errorf("route=%v %s: foo = %+v", route, name, report.services["foo"])
+				t.Errorf("publish=%v %s: foo = %+v", publish, name, report.services["foo"])
 			}
 		}
 	}

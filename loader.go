@@ -91,25 +91,23 @@ type reconciler struct {
 	logged   map[string]string
 	// warned holds the last logged warnings per service.
 	warned map[string]string
-	// overrides remembers the contract-over-binding messages already logged.
+	// overrides remembers the binding-over-contract messages already logged.
 	overrides map[string]string
 	now       func() time.Time
 }
 
-// classify sets each service's explicit state and reason. Services whose
-// prefix has a direct service route fail closed (503) until a good contract
-// arrives, including after the contract was deleted; every other unaccepted
-// service is simply not installed.
+// classify sets each service's explicit state and reason. A bound service
+// without an accepted contract fails closed (503) until a good contract
+// arrives, including after the contract was deleted; a discovered contract
+// that is not accepted is simply not installed.
 func (r *reconciler) classify(report *compileReport) {
 	bindings := r.gateway.bindings
 	names := make(map[string]bool, len(report.services)+len(bindings.Services))
 	for name := range report.services {
 		names[name] = true
 	}
-	for name, binding := range bindings.Services {
-		if binding.routed() && binding.Prefix != "" {
-			names[name] = true
-		}
+	for name := range bindings.Services {
+		names[name] = true
 	}
 	for name := range names {
 		outcome := report.services[name]
@@ -118,16 +116,23 @@ func (r *reconciler) classify(report *compileReport) {
 			reason = "no GatewayContract"
 		}
 		switch {
+		case !outcome.enabled:
+			outcome.state = stateDisabled
+			if outcome.rejection == "" {
+				reason = ""
+			} else {
+				reason += "; "
+			}
+			reason += "disabled in bindings; its prefix returns 503"
 		case outcome.serving == servingCurrent:
 			outcome.state, reason = stateServing, ""
 		case outcome.serving == servingLastGood:
 			outcome.state = stateServingLastGood
 		default:
 			outcome.state = stateNotInstalled
-			binding := bindings.Services[name]
-			if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.routed() && binding.Prefix != "" {
-				outcome.state = stateDirectRouteClosed
-				reason += "; direct service route returns 503 until a good contract is seen"
+			if _, bound := bindings.Services[name]; bound {
+				outcome.state = stateClosed
+				reason += "; its prefix returns 503 until a good contract is seen"
 			}
 		}
 		outcome.reason = reason

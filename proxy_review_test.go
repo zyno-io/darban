@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// reviewRig serves the shop service on a direct route with a custom contract
+// reviewRig serves the shop service with a custom contract
 // and rewrites, and records what the upstream and the authorizer receive.
 type reviewRig struct {
 	h          *skipHarness
@@ -17,7 +17,20 @@ type reviewRig struct {
 	authorizer *http.Request
 }
 
-func newReviewRig(t *testing.T, route serviceRoute, browserOrigins []string, binding serviceBinding, openAPI, rewrites string) *reviewRig {
+// validateServices validates every service binding as loadBindings does.
+func validateServices(t *testing.T, bindings upstreamBindings) {
+	t.Helper()
+	if err := bindings.validateRequestHeaders(true); err != nil {
+		t.Fatal(err)
+	}
+	for name, binding := range bindings.Services {
+		if err := binding.validate(name, bindings, true, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func newReviewRig(t *testing.T, binding serviceBinding, browserOrigins []string, openAPI, rewrites string) *reviewRig {
 	r := &reviewRig{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		r.upstream = q.Clone(q.Context())
@@ -34,18 +47,15 @@ func newReviewRig(t *testing.T, route serviceRoute, browserOrigins []string, bin
 	}))
 	t.Cleanup(upstream.Close)
 	t.Cleanup(authz.Close)
-	route.Origin = upstream.URL
+	binding.Origin = upstream.URL
 	binding.Prefix = "/shop"
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authz: authz.URL, BrowserOrigins: browserOrigins,
 		Authorization: authorizationConfig{Path: "/authz", RequestHeaders: []string{"X-Tenant", "X-Id"},
 			ResponseHeaders: []string{"X-Id"}, StripHeaderPrefixes: []string{"X-Id-"}},
-		Services:      map[string]serviceBinding{"shop": binding},
-		ServiceRoutes: map[string]serviceRoute{"/shop": route},
+		Services: map[string]serviceBinding{"shop": binding},
 	}
-	if err := bindings.validateServiceRoutes(true); err != nil {
-		t.Fatal(err)
-	}
+	validateServices(t, bindings)
 	r.h = newSkipHarness(t, bindings)
 	if openAPI != "" {
 		r.h.apply(registration{serviceName: "shop", rewrites: rewrites, openAPI: openAPI})
@@ -108,16 +118,16 @@ components:
 
 const api = "api.example.net"
 
-func TestRewriteWithinADirectPrefixForwardsItsTarget(t *testing.T) {
+func TestRewriteWithinThePrefixForwardsItsTarget(t *testing.T) {
 	// A rewrite of the protected /private to the anonymous /open must serve
 	// /open, not /private without authorization.
-	r := newReviewRig(t, serviceRoute{}, nil, serviceBinding{}, reviewContract,
+	r := newReviewRig(t, serviceBinding{}, nil, reviewContract,
 		`[{from: {method: GET, path: /shop/private}, to: {serviceName: shop, path: /open}}]`)
 	res := r.do("GET", api, "/shop/private", nil)
 	if res.Code != http.StatusTeapot || r.upstream == nil || r.upstream.URL.Path != "/open" || r.authorizer != nil {
 		t.Fatalf("rewrite = %d %v", res.Code, r.upstream)
 	}
-	// The service's own operations still use the route's transport.
+	// The service's own operations use the same transport.
 	if res := r.do("GET", api, "/shop/open", nil); res.Code != http.StatusTeapot || r.upstream.URL.Path != "/open" {
 		t.Fatalf("own operation = %d", res.Code)
 	}
@@ -128,7 +138,7 @@ func TestBackendCORSExemptsOnlyRealPreflights(t *testing.T) {
 		return http.Header{"Origin": {"https://unknown.example"}, "Access-Control-Request-Method": {requested}}
 	}
 	for name, origins := range map[string][]string{"browser origins": {"https://app.example.net"}, "no browser origins": nil} {
-		r := newReviewRig(t, serviceRoute{BackendCORS: true}, origins, serviceBinding{}, reviewContract, "[]")
+		r := newReviewRig(t, serviceBinding{BackendCORS: true}, origins, reviewContract, "[]")
 		// A preflight for GET on a path the contract serves goes to the backend.
 		if res := r.do("OPTIONS", api, "/shop/private", preflight("GET")); res.Code != http.StatusTeapot || r.authorizer != nil ||
 			r.upstream.Method != http.MethodOptions {
@@ -147,53 +157,41 @@ func TestBackendCORSExemptsOnlyRealPreflights(t *testing.T) {
 			t.Errorf("%s: preflight for an unknown path = %d", name, res.Code)
 		}
 	}
-
-	// A route: false backendCORS route exempts the same preflights.
-	r := newReviewRig(t, serviceRoute{BackendCORS: true}, nil, serviceBinding{Route: new(false), Publish: new(false)}, "", "")
-	if res := r.do("OPTIONS", api, "/shop/private", preflight("GET")); res.Code != http.StatusTeapot || r.authorizer != nil {
-		t.Errorf("route false: preflight = %d", res.Code)
-	}
-	if res := r.do("OPTIONS", api, "/shop/private", preflight("OPTIONS")); res.Code != http.StatusUnauthorized || r.upstream != nil {
-		t.Errorf("route false: OPTIONS about OPTIONS = %d", res.Code)
-	}
-	if res := r.do("OPTIONS", api, "/shop/private", nil); res.Code != http.StatusUnauthorized || r.upstream != nil {
-		t.Errorf("route false: plain OPTIONS = %d", res.Code)
-	}
 }
 
 func TestBackendAuthForwardsIdentityHeadersOnlyWhenListed(t *testing.T) {
 	caller := http.Header{"X-Tenant": {"t1"}, "X-Id": {"forged"}, "X-Id-Extra": {"forged"}, "Authorization": {"Bearer x"}}
 	for name, forward := range map[string][]string{"default": nil, "listed": {"x-id"}} {
-		for _, routed := range []bool{false, true} {
-			contract, binding := "", serviceBinding{Route: new(false), Publish: new(false)}
-			if routed {
-				contract, binding = reviewContract, serviceBinding{}
-			}
-			r := newReviewRig(t, serviceRoute{BackendAuth: true, ForwardRequestHeaders: slices.Clone(forward)}, nil, binding, contract, "[]")
-			if res := r.do("GET", api, "/shop/open", caller); res.Code != http.StatusTeapot {
-				t.Fatalf("%s routed=%v: %d", name, routed, res.Code)
-			}
-			wantID := ""
-			if forward != nil {
-				wantID = "forged"
-			}
-			if r.upstream.Header.Get("X-Tenant") != "t1" || r.upstream.Header.Get("X-Id") != wantID ||
-				r.upstream.Header.Get("X-Id-Extra") != "" || r.upstream.Header.Get("Authorization") != "Bearer x" {
-				t.Errorf("%s routed=%v: upstream got %v", name, routed, r.upstream.Header)
-			}
+		r := newReviewRig(t, serviceBinding{BackendAuth: true, ForwardRequestHeaders: slices.Clone(forward)}, nil, reviewContract, "[]")
+		if res := r.do("GET", api, "/shop/open", caller); res.Code != http.StatusTeapot {
+			t.Fatalf("%s: %d", name, res.Code)
+		}
+		wantID := ""
+		if forward != nil {
+			wantID = "forged"
+		}
+		if r.upstream.Header.Get("X-Tenant") != "t1" || r.upstream.Header.Get("X-Id") != wantID ||
+			r.upstream.Header.Get("X-Id-Extra") != "" || r.upstream.Header.Get("Authorization") != "Bearer x" {
+			t.Errorf("%s: upstream got %v", name, r.upstream.Header)
 		}
 	}
-	for name, route := range map[string]serviceRoute{
-		"not backendAuth": {Origin: "http://shop.fixtures.svc.cluster.local:80", ForwardRequestHeaders: []string{"X-Id"}},
-		"authorization":   {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"Authorization"}},
-		"forwarded":       {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"X-Forwarded-For"}},
-		"invalid":         {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"bad header"}},
-		"duplicate":       {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true, ForwardRequestHeaders: []string{"X-Id", "X-Id"}},
-		"duplicate spelling": {Origin: "http://shop.fixtures.svc.cluster.local:80", BackendAuth: true,
-			ForwardRequestHeaders: []string{"X-ZS-TID", "X-ZS-TID"}},
+	for name, binding := range map[string]serviceBinding{
+		"not backendAuth":    {ForwardRequestHeaders: []string{"X-Id"}},
+		"authorization":      {BackendAuth: true, ForwardRequestHeaders: []string{"Authorization"}},
+		"forwarded":          {BackendAuth: true, ForwardRequestHeaders: []string{"X-Forwarded-For"}},
+		"client IP":          {BackendAuth: true, ForwardRequestHeaders: []string{"X-Real-IP"}},
+		"invalid":            {BackendAuth: true, ForwardRequestHeaders: []string{"bad header"}},
+		"duplicate":          {BackendAuth: true, ForwardRequestHeaders: []string{"X-Id", "X-Id"}},
+		"duplicate spelling": {BackendAuth: true, ForwardRequestHeaders: []string{"X-ZS-TID", "X-ZS-TID"}},
+		"connection":         {BackendAuth: true, ForwardRequestHeaders: []string{"Connection"}},
+		"upgrade":            {BackendAuth: true, ForwardRequestHeaders: []string{"Upgrade"}},
+		"te":                 {BackendAuth: true, ForwardRequestHeaders: []string{"Te"}},
+		"keep-alive":         {BackendAuth: true, ForwardRequestHeaders: []string{"Keep-Alive"}},
+		"proxy auth":         {BackendAuth: true, ForwardRequestHeaders: []string{"Proxy-Authorization"}},
+		"alias":              {BackendAuth: true, ForwardRequestHeaders: []string{"CF-Connecting-IP"}},
 	} {
-		bindings := upstreamBindings{Hostname: api, Authz: "http://authz.fixtures.svc.cluster.local:80", ServiceRoutes: map[string]serviceRoute{"/shop": route}}
-		err := bindings.validateServiceRoutes(true)
+		bindings := upstreamBindings{Hostname: api, Authz: "http://authz.fixtures.svc.cluster.local:80"}
+		err := binding.validate("shop", bindings, true, true)
 		if err == nil {
 			t.Errorf("%s: accepted", name)
 			continue
@@ -205,8 +203,8 @@ func TestBackendAuthForwardsIdentityHeadersOnlyWhenListed(t *testing.T) {
 	}
 }
 
-func TestRoutedAuthorizationEdgeCases(t *testing.T) {
-	r := newReviewRig(t, serviceRoute{LegacyHosts: []string{"shop.example.net"}}, nil, serviceBinding{}, reviewContract, "[]")
+func TestAuthorizationEdgeCases(t *testing.T) {
+	r := newReviewRig(t, serviceBinding{LegacyHosts: []string{"shop.example.net"}}, nil, reviewContract, "[]")
 	// Two Authorization headers are ambiguous.
 	if res := r.do("GET", api, "/shop/private", http.Header{"Authorization": {"Bearer a", "Bearer b"}}); res.Code != http.StatusUnauthorized || r.authorizer != nil {
 		t.Errorf("duplicate Authorization = %d", res.Code)
@@ -226,19 +224,14 @@ func TestRoutedAuthorizationEdgeCases(t *testing.T) {
 	}
 }
 
-func TestRoutedOperationsKeepTheRouteClientIPAndTimeouts(t *testing.T) {
-	r := newReviewRig(t, serviceRoute{ForwardTrustedClientIP: true, LongResponsePaths: []string{"/slow"}, LongResponseHeaderTimeout: "50ms"},
-		nil, serviceBinding{}, reviewContract, "[]")
-	if res := r.do("GET", api, "/shop/open", http.Header{"X-Real-Ip": {"::ffff:192.0.2.7"}}); res.Code != http.StatusTeapot ||
-		r.upstream.Header.Get("X-Real-Ip") != "192.0.2.7" {
-		t.Errorf("client IP: %d %v", res.Code, r.upstream)
-	}
-	if res := r.do("GET", api, "/shop/open", nil); res.Code != http.StatusServiceUnavailable || r.upstream != nil {
-		t.Errorf("missing client IP = %d", res.Code)
+func TestLongResponsePathsUseTheirTimeout(t *testing.T) {
+	r := newReviewRig(t, serviceBinding{LongResponsePaths: []string{"/slow"}, LongResponseHeaderTimeout: "50ms"}, nil, reviewContract, "[]")
+	if res := r.do("GET", api, "/shop/open", nil); res.Code != http.StatusTeapot {
+		t.Errorf("regular path = %d", res.Code)
 	}
 	// /slow is a long-response path, here with a timeout shorter than its
-	// 200ms handler.
-	if res := r.do("GET", api, "/shop/slow", http.Header{"X-Real-Ip": {"192.0.2.7"}}); res.Code != http.StatusBadGateway {
+	// 200ms handler. It goes last: its handler outlives the request.
+	if res := r.do("GET", api, "/shop/slow", nil); res.Code != http.StatusBadGateway {
 		t.Errorf("long-response timeout = %d", res.Code)
 	}
 }
@@ -249,7 +242,7 @@ func TestExtraRoutesForOptionsHeadAndHealth(t *testing.T) {
 		{Method: "OPTIONS", Path: "/cors", Auth: extraAuthNone},
 		{Method: "HEAD", Path: "/ping", Auth: extraAuthNone},
 	}}
-	r := newReviewRig(t, serviceRoute{}, nil, binding, reviewContract, "[]")
+	r := newReviewRig(t, binding, nil, reviewContract, "[]")
 	for _, test := range []struct{ method, path, upstream string }{
 		{"GET", "/shop/healthz", "GET /healthz"},
 		{"HEAD", "/shop/healthz", "GET /healthz"},
@@ -273,8 +266,7 @@ func TestExtraRoutesRejectSameShapesAndIgnoredAuth(t *testing.T) {
 		"same shape": `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80", "authorization": {"path": "/authz"},
 			"services": {"shop": {"prefix": "/shop", "extraRoutes": [{"method": "GET", "path": "/a/{x}", "auth": "gateway"}, {"method": "GET", "path": "/a/{y}", "auth": "none"}]}}}`,
 		"gateway on backendAuth": `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80", "authorization": {"path": "/authz"},
-			"serviceRoutes": {"/shop": {"origin": "http://shop.fixtures.svc.cluster.local:80", "backendAuth": true}},
-			"services": {"shop": {"prefix": "/shop", "extraRoutes": [{"method": "GET", "path": "/a", "auth": "gateway"}]}}}`,
+			"services": {"shop": {"prefix": "/shop", "backendAuth": true, "extraRoutes": [{"method": "GET", "path": "/a", "auth": "gateway"}]}}}`,
 	} {
 		if err := writeBindings(t, body); err == nil || !strings.Contains(err.Error(), "extra route") {
 			t.Errorf("%s: %v", name, err)
@@ -284,7 +276,7 @@ func TestExtraRoutesRejectSameShapesAndIgnoredAuth(t *testing.T) {
 
 func TestBackendAuthForwardsUpstreamRequestHeadersThatLookLikeIdentity(t *testing.T) {
 	// Alpha forwards X-ZS-Date upstream although X-ZS- is a stripped prefix.
-	// On a backendAuth route the backend gets it, and the authorizer request
+	// On a backendAuth service the backend gets it, and the authorizer request
 	// headers, which it is not, exclude it.
 	var upstream, authorizer http.Header
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -301,16 +293,17 @@ func TestBackendAuthForwardsUpstreamRequestHeadersThatLookLikeIdentity(t *testin
 		Hostname: api, Authz: authz.URL, UpstreamRequestHeaders: []string{"X-Zs-Date"},
 		Authorization: authorizationConfig{Path: "/authz", RequestHeaders: []string{"X-Zs-Tid"}, ResponseHeaders: []string{"X-Zs-Tid"},
 			StripHeaderPrefixes: []string{"X-Zs-"}},
-		ServiceRoutes: map[string]serviceRoute{
-			"/auth":  {Origin: backend.URL, BackendAuth: true},
-			"/suite": {Origin: backend.URL},
+		Services: map[string]serviceBinding{
+			"auth":  {Origin: backend.URL, BackendAuth: true},
+			"suite": {Origin: backend.URL},
 		},
 	}
-	if err := bindings.validateServiceRoutes(true); err != nil {
-		t.Fatal(err)
-	}
-	gw := newGateway(bindings)
-	for _, path := range []string{"/auth/login", "/suite/x"} {
+	validateServices(t, bindings)
+	h := newSkipHarness(t, bindings)
+	protected := "openapi: 3.1.0\npaths:\n  /x:\n    get:\n      security: [{account: []}]\n      responses: {'200': {description: OK}}\n" +
+		"components:\n  securitySchemes:\n    account: {type: http, scheme: bearer}\n"
+	h.apply(registration{serviceName: "auth", rewrites: "[]", openAPI: protected}, registration{serviceName: "suite", rewrites: "[]", openAPI: protected})
+	for _, path := range []string{"/auth/x", "/suite/x"} {
 		upstream, authorizer = nil, nil
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.Host = api
@@ -318,7 +311,7 @@ func TestBackendAuthForwardsUpstreamRequestHeadersThatLookLikeIdentity(t *testin
 		req.Header.Set("X-ZS-Date", "2026-11-26")
 		req.Header.Set("X-ZS-TID", "forged")
 		res := httptest.NewRecorder()
-		gw.serve(&snapshot{}, res, req)
+		h.g.serve(h.active.Load(), res, req)
 		if res.Code != http.StatusTeapot || upstream.Get("X-Zs-Date") != "2026-11-26" || upstream.Get("X-Zs-Tid") != "" {
 			t.Errorf("%s: %d upstream %v", path, res.Code, upstream)
 		}
@@ -327,6 +320,6 @@ func TestBackendAuthForwardsUpstreamRequestHeadersThatLookLikeIdentity(t *testin
 		}
 	}
 	if authorizer == nil {
-		t.Fatal("the protected route did not call the authorizer")
+		t.Fatal("the protected service did not call the authorizer")
 	}
 }

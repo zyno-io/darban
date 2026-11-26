@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -155,7 +156,7 @@ func TestContractOnlyServiceServesThroughItsUpstream(t *testing.T) {
 	defer backend.Close()
 	bindings := contractOnlyBindings()
 	g := newGateway(bindings)
-	g.transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+	g.transports.base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, backend.Listener.Addr().String())
 	}
 	compiled, _ := compile([]registration{
@@ -221,23 +222,21 @@ func TestBindingFallbackWithoutUpstream(t *testing.T) {
 	wantPaths(t, got, "/alpha/items")
 }
 
-func TestContractOverridesBinding(t *testing.T) {
+func TestBindingOverridesContract(t *testing.T) {
 	bindings := contractOnlyBindings()
 	bindings.Services["alpha"] = serviceBinding{
-		Origin: "http://old.zyno-alpha.svc.cluster.local:8080", Prefix: "/old", Mount: "/old-mount",
+		Origin: "http://old.zyno-alpha.svc.cluster.local:8080", Prefix: "/old", Mount: "/api",
 		DebugOrigin: "http://debug.zyno-alpha.svc.cluster.local:8080",
 	}
 	bindings.Debug = debugConfig{RequestHeader: "X-Debug", RequiredHeader: "X-Ok", RequiredValue: "1"}
-	reg := clusterContract("alpha", "/items", "listAlpha", "https://new."+testNamespace+".svc.cluster.local:9000", "/fresh")
+	reg := clusterContract("alpha", "/api/items", "listAlpha", "https://new."+testNamespace+".svc.cluster.local:9000", "/fresh")
 	got, report := compile([]registration{reg}, bindings, nil)
-	wantPaths(t, got, "/fresh/items")
-	binding := got.services["alpha"]
-	if binding.Origin != "https://new.zyno-alpha.svc.cluster.local:9000" || binding.Prefix != "/fresh" || binding.Mount != "" ||
-		binding.DebugOrigin != bindings.Services["alpha"].DebugOrigin {
+	wantPaths(t, got, "/old/items")
+	if binding := got.services["alpha"]; !reflect.DeepEqual(binding, bindings.Services["alpha"]) {
 		t.Fatalf("effective binding = %+v", binding)
 	}
 	note := report.overrides["alpha"]
-	for _, want := range []string{"upstream https://new", "prefix /fresh", `mount ""`} {
+	for _, want := range []string{"origin http://old", "(spec.upstream https://new", `mount "/api"`, "prefix /old (spec.prefix /fresh)"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("override note %q lacks %q", note, want)
 		}
@@ -252,12 +251,12 @@ func TestContractOverridesBinding(t *testing.T) {
 	load := func() ([]registration, error) { return []registration{reg}, nil }
 	r.apply(load)
 	r.apply(load)
-	if count := strings.Count(output.String(), "contract overrides bindings"); count != 1 {
+	if count := strings.Count(output.String(), "bindings override the contract"); count != 1 {
 		t.Fatalf("override logged %d times:\n%s", count, output.String())
 	}
 	reg.upstream = "https://newer." + testNamespace + ".svc.cluster.local:9000"
 	r.apply(load)
-	if count := strings.Count(output.String(), "contract overrides bindings"); count != 2 {
+	if count := strings.Count(output.String(), "bindings override the contract"); count != 2 {
 		t.Fatalf("a new value was not logged:\n%s", output.String())
 	}
 }
@@ -356,27 +355,21 @@ func TestContractPrefixCollidesWithBindingService(t *testing.T) {
 	}
 }
 
-func TestContractPrefixCollidesWithServiceRoutes(t *testing.T) {
+func TestBindingsEntryOwnsItsPrefix(t *testing.T) {
 	bindings := contractOnlyBindings()
-	bindings.ServiceRoutes = map[string]serviceRoute{"/legacy": {Origin: "http://legacy.zyno-alpha.svc.cluster.local:80"}, "/owned": {Origin: "http://owner.zyno-alpha.svc.cluster.local:80"}}
-	bindings.Services["owner"] = serviceBinding{Origin: "http://owner.zyno-alpha.svc.cluster.local:80", Prefix: "/owned"}
+	bindings.Services["owner"] = serviceBinding{Prefix: "/owned"}
 	regs := []registration{
-		clusterContract("intruder", "/items", "listIntruder", "http://intruder", "/legacy"),
-		clusterContract("owner", "/items", "listOwner", "http://owner", "/owned"),
+		clusterContract("intruder", "/items", "listIntruder", "http://intruder", "/owned"),
+		// The entry's prefix overrides the contract's.
+		clusterContract("owner", "/items", "listOwner", "http://owner", "/elsewhere"),
 	}
 	got, report := compile(regs, bindings, nil)
 	wantPaths(t, got, "/owned/items")
-	if outcome := report.services["intruder"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "serviceRoutes") {
+	if outcome := report.services["intruder"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "reserved") {
 		t.Fatalf("intruder outcome = %+v", outcome)
 	}
-	if report.services["owner"].rejection != "" {
-		t.Fatalf("owner outcome = %+v", report.services["owner"])
-	}
-	// The owner cannot move off the prefix of its direct route, which would
-	// lose that route's deny list.
-	moved := clusterContract("owner", "/items", "listOwner", "http://owner", "")
-	if _, report = compile([]registration{moved}, bindings, nil); !strings.Contains(report.services["owner"].rejection, "owns the serviceRoutes prefix") {
-		t.Fatalf("owner outcome = %+v", report.services["owner"])
+	if report.services["owner"].rejection != "" || report.overrides["owner"] == "" {
+		t.Fatalf("owner outcome = %+v, overrides %v", report.services["owner"], report.overrides)
 	}
 }
 
@@ -560,6 +553,20 @@ func TestLocalManifestContractWithUpstream(t *testing.T) {
 	if _, err := compileStrict(regs, contractOnlyBindings()); err != nil {
 		t.Fatal(err)
 	}
+	// Bindings entries merge with local contracts as they do with cluster
+	// ones, and an entry without a contract fails closed.
+	bindings := contractOnlyBindings()
+	bindings.Services["local-only"] = serviceBinding{Prefix: "/renamed", BackendAuth: true}
+	bindings.Services["absent"] = serviceBinding{Origin: "http://127.0.0.1:9200"}
+	got, report = compile(regs, bindings, nil)
+	wantPaths(t, got, "/renamed/items")
+	want := serviceBinding{Origin: "http://127.0.0.1:9100", Mount: "/api", Prefix: "/renamed", BackendAuth: true}
+	if binding := got.services["local-only"]; !reflect.DeepEqual(binding, want) || !strings.Contains(report.overrides["local-only"], "prefix /renamed") {
+		t.Fatalf("binding %+v overrides %v", binding, report.overrides)
+	}
+	if !report.services["absent"].missing || !slices.Contains(got.unserved, "/absent") {
+		t.Fatalf("absent %+v unserved %v", report.services["absent"], got.unserved)
+	}
 }
 
 func TestLoadBindingsAllowsPartialServiceEntries(t *testing.T) {
@@ -574,7 +581,7 @@ func TestLoadBindingsAllowsPartialServiceEntries(t *testing.T) {
 	if err := write(`{"hostname": "api.example.net"}`); err != nil {
 		t.Fatalf("no services: %v", err)
 	}
-	if err := write(`{"hostname": "api.example.net", "services": {"a": {"route": false, "publish": false}, "b": {"mount": "/b"}}}`); err != nil {
+	if err := write(`{"hostname": "api.example.net", "services": {"a": {"publish": false}, "b": {"mount": "/b"}}}`); err != nil {
 		t.Fatalf("partial entries: %v", err)
 	}
 	for name, body := range map[string]string{
@@ -582,7 +589,12 @@ func TestLoadBindingsAllowsPartialServiceEntries(t *testing.T) {
 		"bad origin":    `{"hostname": "api.example.net", "services": {"a": {"origin": "http://example.com:80"}}}`,
 		"bad mount":     `{"hostname": "api.example.net", "services": {"a": {"mount": "/A/"}}}`,
 		"debug no pol.": `{"hostname": "api.example.net", "services": {"a": {"debugOrigin": "http://d.ns.svc.cluster.local:80"}}}`,
-		"unrouted ops":  `{"hostname": "api.example.net", "services": {"a": {"route": false, "publish": false, "operations": [{"method": "GET", "path": "/x"}]}}}`,
+		"legacy twice":  `{"hostname": "api.example.net", "services": {"a": {"legacyHosts": ["a.example.net"]}, "b": {"legacyHosts": ["a.example.net"]}}}`,
+		"default clash": `{"hostname": "api.example.net", "services": {"a": {}, "b": {"prefix": "/a"}}}`,
+		"forward":       `{"hostname": "api.example.net", "services": {"a": {"forwardRequestHeaders": ["X-Tenant"]}}}`,
+		"long response": `{"hostname": "api.example.net", "services": {"a": {"longResponsePaths": ["/x"]}}}`,
+		"upstream host": `{"hostname": "api.example.net", "services": {"a": {"upstreamHost": "not a host"}}}`,
+		"gateway extra": `{"hostname": "api.example.net", "services": {"a": {"extraRoutes": [{"method": "GET", "path": "/x", "auth": "gateway"}]}}}`,
 		"collision":     `{"hostname": "api.example.net", "services": {"a": {"prefix": "/x"}, "b": {"prefix": "/x"}}}`,
 	} {
 		if err := write(body); err == nil {

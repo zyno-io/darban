@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	pathpkg "path"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/net/http/httpguts"
 
 	"sigs.k8s.io/yaml"
 )
@@ -46,27 +50,50 @@ type rewriteRule struct {
 	} `json:"to"`
 }
 
+// serviceBinding is a service's settings. A discovered contract supplies the
+// origin, mount and prefix; an entry in bindings.services overrides any of
+// them and adds the rest. Every field is optional.
 type serviceBinding struct {
+	// Origin, Mount and Prefix override the contract's spec.upstream and
+	// spec.prefix. Prefix defaults to /<name>.
 	Origin      string
 	Prefix      string
 	Mount       string
 	DebugOrigin string
-	Operations  []operationSelection
-	// ExtraRoutes are paths a routed service serves that its contract cannot
+	// Operations narrows the contract to the listed operations.
+	Operations []operationSelection
+	// ExtraRoutes are paths the service serves that its contract cannot
 	// declare, such as probes, static assets and event streams.
 	ExtraRoutes []extraRoute `json:",omitempty"`
-	// Route and Publish default to true. Route false keeps the service's
-	// traffic on its serviceRoutes entry and makes the contract docs-only.
-	// Publish false keeps its operations out of the combined OpenAPI.
-	Route   *bool `json:",omitempty"`
+	// Enabled defaults to true. False serves nothing: the prefix and legacy
+	// hosts return 503 and the operations leave the document, while the
+	// contract is still validated and keeps its prefix.
+	Enabled *bool `json:",omitempty"`
+	// Publish defaults to true. False keeps the service's operations out of
+	// the combined OpenAPI.
 	Publish *bool `json:",omitempty"`
+	// UpstreamHost replaces the Host header sent upstream. LegacyHosts are
+	// hostnames the service used to serve, which reach it without the prefix.
+	UpstreamHost string   `json:",omitempty"`
+	LegacyHosts  []string `json:",omitempty"`
+	// BackendAuth leaves every operation's authorization to the backend.
+	// ForwardRequestHeaders are caller headers such a backend gets although
+	// they name an identity, such as tenant selectors.
+	BackendAuth           bool     `json:",omitempty"`
+	ForwardRequestHeaders []string `json:",omitempty"`
+	// BackendCORS lets the backend answer its own CORS, preflights included.
+	BackendCORS bool `json:",omitempty"`
+	// LongResponsePaths wait LongResponseHeaderTimeout for response headers
+	// instead of the regular timeout.
+	LongResponsePaths         []string `json:",omitempty"`
+	LongResponseHeaderTimeout string   `json:",omitempty"`
 }
-
-// routed reports whether the contract routes the service's traffic.
-func (b serviceBinding) routed() bool { return b.Route == nil || *b.Route }
 
 // published reports whether the service's operations are documented.
 func (b serviceBinding) published() bool { return b.Publish == nil || *b.Publish }
+
+// enabled reports whether the service serves traffic.
+func (b serviceBinding) enabled() bool { return b.Enabled == nil || *b.Enabled }
 
 // validate checks the fields of a service binding. Origins are optional
 // because a contract can supply them, so only present ones are checked. A
@@ -79,9 +106,6 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 	extras := make(map[operationKey]bool, len(b.ExtraRoutes))
 	for _, extra := range b.ExtraRoutes {
 		key := operationKey{extra.Method, pathShape(extra.Path)}
-		if !b.routed() {
-			return fmt.Errorf("service %q has route: false, so it cannot have extraRoutes", name)
-		}
 		if extras[key] {
 			return fmt.Errorf("service %q: duplicate or same-shape extra route %s %s", name, extra.Method, extra.Path)
 		}
@@ -90,21 +114,9 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 			return fmt.Errorf("service %q: %w", name, err)
 		}
 	}
-	if _, direct := bindings.ServiceRoutes[b.Prefix]; direct && b.Prefix != "" && b.routed() && b.DebugOrigin != "" {
-		return fmt.Errorf("service %q uses the serviceRoutes transport of %s, which has no debug origin", name, b.Prefix)
-	}
-	if !b.routed() && len(b.Operations) != 0 {
-		return fmt.Errorf("service %q has route: false, so it cannot select operations", name)
-	}
-	if !b.routed() && b.published() {
-		// The document describes the direct route, which proxies <prefix>/X to X.
-		if _, direct := bindings.ServiceRoutes[b.Prefix]; b.Prefix == "" || !direct || b.Mount != "" {
-			return fmt.Errorf("service %q has route: false and publish: true, which requires a prefix with a serviceRoutes entry and no mount", name)
-		}
-	}
 	if checkOrigins && b.Origin != "" {
 		if _, err := upstreamOrigin(b.Origin, local); err != nil {
-			return err
+			return fmt.Errorf("service %q: %w", name, err)
 		}
 	}
 	if b.DebugOrigin != "" {
@@ -113,11 +125,68 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 		}
 		if checkOrigins {
 			if _, err := upstreamOrigin(b.DebugOrigin, local); err != nil {
-				return err
+				return fmt.Errorf("service %q: %w", name, err)
 			}
 		}
 	}
+	if !b.BackendAuth && bindings.Authz == "" && b.protectedRoutes() {
+		return fmt.Errorf("service %q authorizes at the gateway, which needs authz (or set backendAuth)", name)
+	}
+	if b.UpstreamHost != "" && !dnsName.MatchString(b.UpstreamHost) {
+		return fmt.Errorf("service %q: invalid upstreamHost %q", name, b.UpstreamHost)
+	}
+	for _, host := range b.LegacyHosts {
+		if !dnsName.MatchString(host) || host == bindings.Hostname {
+			return fmt.Errorf("service %q: invalid legacy host %q", name, host)
+		}
+	}
+	if b.LongResponseHeaderTimeout != "" || len(b.LongResponsePaths) > 0 {
+		timeout, err := time.ParseDuration(b.LongResponseHeaderTimeout)
+		if err != nil || timeout <= 0 || len(b.LongResponsePaths) == 0 {
+			return fmt.Errorf("service %q needs both longResponsePaths and a positive longResponseHeaderTimeout", name)
+		}
+	}
+	for _, pattern := range b.LongResponsePaths {
+		value := strings.TrimSuffix(pattern, "/*")
+		if !strings.HasPrefix(value, "/") || pathpkg.Clean(value) != value || strings.ContainsAny(value, "*%?#\\") {
+			return fmt.Errorf("service %q: invalid longResponsePaths entry %q", name, pattern)
+		}
+	}
+	if len(b.ForwardRequestHeaders) > 0 && !b.BackendAuth {
+		return fmt.Errorf("service %q sets forwardRequestHeaders, which needs backendAuth", name)
+	}
+	for i, header := range b.ForwardRequestHeaders {
+		canonical := http.CanonicalHeaderKey(header)
+		switch {
+		case !httpguts.ValidHeaderFieldName(header):
+			return fmt.Errorf("service %q: invalid forwardRequestHeaders entry %q", name, header)
+		case !httpguts.ValidTrailerHeader(canonical) || canonical == "Upgrade":
+			// Hop-by-hop and framing headers belong to the connection.
+			return fmt.Errorf("service %q cannot forward request header %q", name, header)
+		case managedHeader(canonical, bindings):
+			return fmt.Errorf("service %q cannot forward request header %q, which Darban manages", name, header)
+		case slices.Contains(b.ForwardRequestHeaders[:i], canonical):
+			return fmt.Errorf("service %q lists forwardRequestHeaders entry %q twice", name, header)
+		}
+		// Earlier entries are already canonical.
+		b.ForwardRequestHeaders[i] = canonical
+	}
 	return nil
+}
+
+// protectedRoutes reports whether an extra route needs the gateway's
+// authorizer. Contract operations are checked when they are compiled, when
+// the gateway serves traffic (requireAuthz).
+func (b serviceBinding) protectedRoutes() bool {
+	return slices.ContainsFunc(b.ExtraRoutes, func(e extraRoute) bool { return e.Auth == extraAuthGateway })
+}
+
+// managedHeader reports whether Darban sets a request header itself, so no
+// caller copy of it may pass.
+func managedHeader(name string, bindings upstreamBindings) bool {
+	return name == "Authorization" || name == "Host" || slices.Contains(forwardedMetadata, name) ||
+		strings.HasPrefix(name, "X-Forwarded-") || name == "Forwarded" || slices.Contains(clientAddressHeaders, name) ||
+		name == bindings.ClientIP.header()
 }
 
 type operationSelection struct {
@@ -125,7 +194,7 @@ type operationSelection struct {
 	Path   string
 }
 
-// extraRoute is a path a routed service serves besides its contract
+// extraRoute is a path a service serves besides its contract
 // operations. Path is an upstream path like an operation's, and may end in /*
 // for a subtree. Auth is gateway (the authorizer decides) or none (the
 // backend does).
@@ -153,8 +222,8 @@ func (e extraRoute) validate(binding serviceBinding, bindings upstreamBindings) 
 		return fmt.Errorf("extra route %s %s: auth must be gateway or none", e.Method, e.Path)
 	case e.Auth == extraAuthGateway && bindings.Authz == "":
 		return fmt.Errorf("extra route %s %s: auth gateway needs authz", e.Method, e.Path)
-	case e.Auth == extraAuthGateway && bindings.ServiceRoutes[binding.Prefix].BackendAuth:
-		return fmt.Errorf("extra route %s %s: auth gateway on a backendAuth route would be ignored", e.Method, e.Path)
+	case e.Auth == extraAuthGateway && binding.BackendAuth:
+		return fmt.Errorf("extra route %s %s: auth gateway on a backendAuth service would be ignored", e.Method, e.Path)
 	}
 	if _, ok := binding.publicPath(base); !ok {
 		return fmt.Errorf("extra route %s %s is outside the mount %q", e.Method, e.Path, binding.Mount)
@@ -174,7 +243,6 @@ func (b serviceBinding) publicPath(path string) (string, bool) {
 }
 
 type upstreamBindings struct {
-	ServiceRoutes          map[string]serviceRoute
 	BrowserOrigins         []string
 	UpstreamRequestHeaders []string
 	Hostname               string
@@ -186,6 +254,11 @@ type upstreamBindings struct {
 	DefaultVisibility      *operationVisibility
 	OpenAPI                openAPIConfig
 	UpstreamTLS            upstreamTLSConfig
+	ClientIP               clientIPConfig
+	// requireAuthz rejects a contract with operations the gateway must
+	// authorize when authz is unset. It is set when the gateway serves
+	// traffic, and not for -print-spec or -report, which need no authorizer.
+	requireAuthz bool
 }
 
 type openAPIConfig struct {
@@ -291,9 +364,6 @@ type sourceOperation struct {
 	doc          map[string]any
 	requirements securityRequirements
 	source       *sourceDoc
-	// unrouted marks an operation of a docs-only service (route: false). It
-	// can be documented but is never routed.
-	unrouted bool
 }
 
 type compiledOperation struct {
@@ -303,14 +373,6 @@ type compiledOperation struct {
 	path string
 	// protected reports that the gateway authorizes the operation.
 	protected bool
-}
-
-// shadowOperation is an operation of a docs-only service, which shadow mode
-// matches real requests against.
-type shadowOperation struct {
-	key       operationKey
-	protected bool
-	internal  bool
 }
 
 // serviceCounts is what the assembled snapshot does with one service's
@@ -334,9 +396,7 @@ type candidate struct {
 	// denied although its target is served. It never rejects a contract.
 	aliasWarnings map[string][]string
 	// counts holds, by service, its routed, documented and denied keys.
-	counts map[string]serviceCounts
-	// shadow holds the operations of each docs-only service, by service.
-	shadow   map[string]shadowContract
+	counts   map[string]serviceCounts
 	specYAML []byte
 	specJSON []byte
 	revision string
@@ -377,8 +437,18 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	if err := bindings.Debug.validate(bindings.Authorization); err != nil {
 		return bindings, err
 	}
-	if err := bindings.validateServiceRoutes(local); err != nil {
+	if err := bindings.validateRequestHeaders(local); err != nil {
 		return bindings, err
+	}
+	if err := bindings.ClientIP.validate(); err != nil {
+		return bindings, err
+	}
+	for _, header := range bindings.Authorization.ResponseHeaders {
+		// Darban removes these before the request leaves, so a projected copy
+		// would never arrive. X-Real-IP is set after the identity regardless.
+		if canonical := http.CanonicalHeaderKey(header); canonical != "X-Real-Ip" && managedHeader(canonical, bindings) {
+			return bindings, fmt.Errorf("authorization.responseHeaders cannot name %q, which Darban manages", header)
+		}
 	}
 	if (!local || bindings.ContractAPIGroup != "") && !dnsName.MatchString(bindings.ContractAPIGroup) {
 		return bindings, errors.New("contractAPIGroup must be a DNS name in Kubernetes mode")
@@ -405,20 +475,32 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 		}
 	}
 	prefixes := make(map[string]string)
-	for name, binding := range bindings.Services {
+	hosts := make(map[string]string)
+	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
+		binding := bindings.Services[name]
 		if err := binding.validate(name, bindings, local, true); err != nil {
 			return bindings, err
 		}
-		if binding.Prefix == "" {
-			continue
+		prefix := binding.Prefix
+		if prefix == "" {
+			prefix = "/" + name
 		}
-		if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.Mount != "" {
-			return bindings, fmt.Errorf("service %q has a mount, which a serviceRoutes prefix %s does not support", name, binding.Prefix)
+		if other, exists := prefixes[prefix]; exists {
+			return bindings, fmt.Errorf("prefix collision between %q and %q", other, name)
 		}
-		if other, exists := prefixes[binding.Prefix]; exists {
-			return bindings, fmt.Errorf("prefix collision between %q and %q", name, other)
+		if reason, reserved := reservedPrefixes(bindings)[prefix]; reserved {
+			return bindings, fmt.Errorf("service %q: prefix %s collides with %s", name, prefix, reason)
 		}
-		prefixes[binding.Prefix] = name
+		if binding.Mount != "" && len(binding.LegacyHosts) > 0 {
+			return bindings, fmt.Errorf("service %q: legacyHosts need an upstream without a mount", name)
+		}
+		prefixes[prefix] = name
+		for _, host := range binding.LegacyHosts {
+			if other, exists := hosts[host]; exists {
+				return bindings, fmt.Errorf("legacy host %q belongs to both %q and %q", host, other, name)
+			}
+			hosts[host] = name
+		}
 	}
 	return bindings, nil
 }
@@ -827,6 +909,9 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
+			if protected && !binding.BackendAuth && bindings.requireAuthz && bindings.Authz == "" {
+				return fmt.Errorf("%s %s: authorizes at the gateway, which needs authz (or set backendAuth)", key, path)
+			}
 			if _, exists := op["callbacks"]; exists {
 				return errors.New("callbacks require explicit public URL handling")
 			}
@@ -900,11 +985,6 @@ type serviceUnit struct {
 	denied        []operationKey
 	passthrough   []operationKey
 	extras        []compiledOperation
-	// shadow lists a docs-only unit's operations for shadow mode.
-	shadow []shadowOperation
-	// warnings lists operations a docs-only unit leaves out of the document
-	// because its direct route would refuse them.
-	warnings []string
 }
 
 const (
@@ -915,10 +995,11 @@ const (
 
 // Service states reported in /status.
 const (
-	stateServing           = "serving"
-	stateServingLastGood   = "serving_last_good"
-	stateNotInstalled      = "not_installed"
-	stateDirectRouteClosed = "direct_route_closed"
+	stateServing         = "serving"
+	stateServingLastGood = "serving_last_good"
+	stateNotInstalled    = "not_installed"
+	stateClosed          = "closed"
+	stateDisabled        = "disabled"
 )
 
 type serviceOutcome struct {
@@ -928,12 +1009,12 @@ type serviceOutcome struct {
 	// state and reason are set by the reconciler.
 	state  string
 	reason string
-	// warnings describe rewrites denied although their target is served, and
-	// operations a docs-only service leaves out of the document.
+	// warnings describe rewrites denied although their target is served.
 	warnings []string
-	// route and publish are the service's effective binding settings.
-	route, publish bool
-	counts         serviceCounts
+	// publish and enabled are the service's effective binding settings.
+	publish bool
+	enabled bool
+	counts  serviceCounts
 }
 
 // compileReport describes what compile did with each service. accepted holds
@@ -985,40 +1066,8 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		native:        make(map[operationKey]sourceOperation),
 		aliases:       make(map[operationKey]aliasTarget),
 	}
-	if !binding.routed() && len(rules) != 0 {
-		return nil, errors.New("a service with route: false cannot define rewrites")
-	}
 	if err := readOperations(reg.serviceName, source, binding, fallback, bindings, unit.native, &unit.denied, &unit.passthrough); err != nil {
 		return nil, err
-	}
-	if !binding.routed() {
-		// Shadow mode compares real traffic with every operation of the
-		// contract, whatever its visibility.
-		for key, op := range unit.native {
-			if op.visibility != visibilityInternal {
-				unit.shadow = append(unit.shadow, shadowOperation{key, op.protected, false})
-			}
-		}
-		for _, key := range unit.denied {
-			unit.shadow = append(unit.shadow, shadowOperation{key, false, true})
-		}
-		slices.SortFunc(unit.shadow, func(a, b shadowOperation) int { return compareOperationKeys(a.key, b.key) })
-		// A docs-only contract has no traffic effect: no routes and no denials.
-		// Its service keeps its serviceRoutes entry. Only the operations it
-		// documents are kept, so its component references are imported, and
-		// checked, only when it publishes.
-		unit.denied = nil
-		for key, op := range unit.native {
-			if op.visibility != visibilityPublic || !binding.published() {
-				delete(unit.native, key)
-				continue
-			}
-			op.unrouted = true
-			unit.native[key] = op
-		}
-		if binding.published() {
-			unit.warnings = omitRefusedOperations(unit.native, bindings.ServiceRoutes[binding.Prefix])
-		}
 	}
 	if !binding.published() {
 		for key, op := range unit.native {
@@ -1157,41 +1206,45 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 			}
 			binding = unit.binding
 			outcome.counts = out.counts[name]
-			outcome.warnings = slices.Concat(slices.Sorted(slices.Values(out.aliasWarnings[name])), unit.warnings)
+			outcome.warnings = slices.Sorted(slices.Values(out.aliasWarnings[name]))
 		}
-		outcome.route, outcome.publish = binding.routed(), binding.published()
+		outcome.publish, outcome.enabled = binding.published(), binding.enabled()
 		report.services[name] = outcome
 	}
-	// Only bindings entries declare that a service must have a contract and
-	// own a direct service route, so only they are reported missing or unserved.
-	// A service with route: false keeps its traffic on serviceRoutes, so its
-	// contract is optional.
+	// A disabled service's prefix, and so its legacy hosts, return 503.
+	for _, name := range slices.Sorted(maps.Keys(accepted)) {
+		if binding := accepted[name].binding; !binding.enabled() {
+			out.unserved = append(out.unserved, binding.Prefix)
+		}
+	}
+	// Only bindings entries declare that a service must have a contract, so
+	// only they are reported missing, and their prefixes fail closed (503)
+	// while no contract is accepted.
 	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
 		binding := bindings.Services[name]
-		if !binding.routed() {
-			continue
-		}
 		if count[name] == 0 {
-			report.services[name] = serviceOutcome{serving: servingNone, missing: true, route: true, publish: binding.published()}
+			report.services[name] = serviceOutcome{serving: servingNone, missing: true, publish: binding.published(), enabled: binding.enabled()}
 		}
-		if binding.Prefix != "" && accepted[name] == nil {
-			out.unserved = append(out.unserved, binding.Prefix)
+		if accepted[name] == nil {
+			prefix := binding.Prefix
+			if prefix == "" {
+				prefix = "/" + name
+			}
+			out.unserved = append(out.unserved, prefix)
 		}
 	}
 	return out, report
 }
 
-// compileStrict treats any rejected, unbound or missing contract as an error.
-// It is for one-shot use such as -print-spec.
+// compileStrict treats any rejected contract, and any rewrite into a service
+// without a contract, as an error. It is for one-shot use such as
+// -print-spec. A bound service without a contract is not an error: it fails
+// closed, and the document leaves it out.
 func compileStrict(regs []registration, bindings upstreamBindings) (candidate, error) {
 	out, report := compile(regs, bindings, nil)
 	for _, name := range slices.Sorted(maps.Keys(report.services)) {
-		outcome := report.services[name]
-		if outcome.rejection != "" {
+		if outcome := report.services[name]; outcome.rejection != "" {
 			return out, errors.New(outcome.rejection)
-		}
-		if outcome.missing {
-			return out, fmt.Errorf("missing contract for service %q", name)
 		}
 	}
 	if problems := rewritesWithoutContract(report); len(problems) > 0 {
@@ -1225,10 +1278,7 @@ func rewritesWithoutContract(report compileReport) []string {
 // is the one being admitted, unless the failure lies in another unit that was
 // itself admitted in this pass (for example a rewrite owner), which is
 // rejected instead. A service with a last-good unit therefore ends up current
-// or last-good, never omitted. The exception is a docs-only service (route:
-// false): assemble blames it for any conflict with a routed service, and it
-// is then rejected even with its last-good unit, so it can never cost a routed
-// service its place. Among new contracts the older one wins. A pod
+// or last-good, never omitted. Among new contracts the older one wins. A pod
 // that already serves last-good units may differ from a fresh pod when an old
 // and a changed contract conflict.
 func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string]time.Time, bindings upstreamBindings) (candidate, map[string]*serviceUnit, map[string]string) {
@@ -1291,27 +1341,10 @@ restart:
 				culprit := faultService(err)
 				other, present := accepted[culprit]
 				blameCulprit := culprit != "" && culprit != name && present
-				if blameCulprit && !other.binding.routed() && unit.binding.routed() {
-					// A docs-only culprit is blamed for any conflict with a routed
-					// unit, so first check that the routed unit fits without it.
-					// Otherwise the routed unit is at fault on its own.
-					trial := maps.Clone(accepted)
-					trial[name] = unit
-					delete(trial, culprit)
-					if alone := check(trial, bindings, name); alone != nil {
-						blameCulprit, culprit, err = false, "", alone
-					}
-				}
 				switch {
 				case blameCulprit && other != lastGood[culprit]:
 					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
 					rejected[culprit] = true
-				case blameCulprit && !other.binding.routed() && unit.binding.routed():
-					// A docs-only service never holds its place against a routed
-					// one, not even with its last good contract.
-					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
-					rejected[culprit] = true
-					delete(seed, culprit)
 				case culprit != "" && culprit != name:
 					conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
 					rejected[name] = true
@@ -1378,7 +1411,6 @@ func validateAssembly(units map[string]*serviceUnit, bindings upstreamBindings, 
 
 func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, prefer string, render bool) (candidate, error) {
 	var out candidate
-	unroutedDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
 	aliases := make(map[operationKey]aliasTarget)
 	// owners maps each rewrite to the service that defines it, and keyOwners
@@ -1399,26 +1431,18 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		out.services[name] = unit.binding
 		if unit.binding.Prefix != "" {
 			if other, taken := prefixOwners[unit.binding.Prefix]; taken {
-				// A docs-only service never displaces a routed one. Otherwise blame
-				// the service being admitted, else the later one.
+				// Blame the service being admitted, else the later one.
 				blamed, holder := name, other
-				if routed := unit.binding.routed(); routed != units[other].binding.routed() {
-					if routed {
-						blamed, holder = other, name
-					}
-				} else if prefer == other {
+				if prefer == other {
 					blamed, holder = other, name
 				}
 				return out, &assemblyError{blamed, fmt.Errorf("prefix %s is already used by service %s", unit.binding.Prefix, holder)}
 			}
 			prefixOwners[unit.binding.Prefix] = name
 		}
-		if !unit.binding.routed() {
-			unroutedDigests[name] = unit.openAPIDigest
-			if out.shadow == nil {
-				out.shadow = make(map[string]shadowContract)
-			}
-			out.shadow[name] = shadowContract{unit.openAPIDigest, unit.shadow}
+		// A disabled service keeps its prefix, and contributes nothing else.
+		if !unit.binding.enabled() {
+			continue
 		}
 		maps.Copy(native, unit.native)
 		for key := range unit.native {
@@ -1466,18 +1490,14 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 			out.aliasWarnings[owner] = append(out.aliasWarnings[owner], fmt.Sprintf(format, args...))
 		}
 		if !serving {
-			// The target service has no serving contract. Deny the alias path so
-			// it cannot reach a direct service route.
-			if target, bound := bindings.Services[alias.service]; bound && !target.routed() {
-				warn("rewrite %s %s targets service %s, which has route: false", from.method, from.path, alias.service)
-				continue
-			}
+			// The target service has no serving contract, so the alias path is
+			// denied.
 			delete(published, from)
 			deny(from, owner)
 			continue
 		}
-		if !targetUnit.binding.routed() {
-			warn("rewrite %s %s targets service %s, which has route: false", from.method, from.path, alias.service)
+		if !targetUnit.binding.enabled() {
+			warn("rewrite %s %s targets service %s, which is disabled", from.method, from.path, alias.service)
 			continue
 		}
 		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
@@ -1525,10 +1545,8 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		if key.path == bindings.OpenAPI.YAMLPath || key.path == bindings.OpenAPI.JSONPath {
 			return out, &assemblyError{source.service, fmt.Errorf("OpenAPI endpoint conflicts with route %s %s", key.method, key.path)}
 		}
-		if !source.unrouted {
-			out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.protected})
-			count(keyOwners[key], func(c *serviceCounts) { c.routes++ })
-		}
+		out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.protected})
+		count(keyOwners[key], func(c *serviceCounts) { c.routes++ })
 		operationComponents := components
 		if source.visibility == visibilityUnlisted {
 			operationComponents = unlistedComponents
@@ -1565,16 +1583,8 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		operation["security"] = security
 		if id := source.operationID; id != "" {
 			if other, exists := operationIDs[id]; exists {
-				// A docs-only service is at fault against a routed one. Otherwise
-				// both are, so name neither.
-				blamed := ""
-				if first := published[other]; first.unrouted != source.unrouted {
-					blamed = source.service
-					if first.unrouted {
-						blamed = first.service
-					}
-				}
-				return out, &assemblyError{blamed, fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)}
+				// Both services are at fault, so name neither.
+				return out, &assemblyError{"", fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)}
 			}
 			operationIDs[id] = key
 			operation["operationId"] = id
@@ -1622,10 +1632,7 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 	fmt.Fprintf(hash, "services %v\n", out.contractServices)
 	for _, name := range out.contractServices {
 		binding := units[name].binding
-		fmt.Fprintf(hash, "upstream %s %s %s %s %s\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin)
-	}
-	for _, name := range slices.Sorted(maps.Keys(unroutedDigests)) {
-		fmt.Fprintf(hash, "unrouted %s %x\n", name, unroutedDigests[name])
+		fmt.Fprintf(hash, "upstream %s %s %s %s %s enabled=%v\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin, binding.enabled())
 	}
 	for _, route := range out.routes {
 		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.protected)

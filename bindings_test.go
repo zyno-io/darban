@@ -22,8 +22,9 @@ func TestBindingsRejectUnknownKeysAndTrailingData(t *testing.T) {
 		"authz": "http://authz.fixtures.svc.cluster.local:3000",
 		"authorization": {"path": "/authz", "responseHeaders": ["X-Id"]},
 		"openapi": {"yamlPath": "/openapi.yaml"},
-		"serviceRoutes": {"/x": {"origin": "http://x.fixtures.svc.cluster.local:80", "backendAuth": true}},
-		"services": {"a": {"prefix": "/a", "operations": [{"method": "get", "path": "/a"}]}}}`
+		"clientIP": {"header": "X-Real-IP", "trustedProxies": ["10.0.0.0/8"]},
+		"services": {"a": {"prefix": "/a", "operations": [{"method": "get", "path": "/a"}]},
+			"x": {"origin": "http://x.fixtures.svc.cluster.local:80", "backendAuth": true}}}`
 	if err := writeBindings(t, valid+"\n"); err != nil {
 		t.Fatalf("valid bindings: %v", err)
 	}
@@ -31,7 +32,8 @@ func TestBindingsRejectUnknownKeysAndTrailingData(t *testing.T) {
 		"top level":      strings.Replace(valid, `"hostname"`, `"bogus": 1, "hostname"`, 1),
 		"service":        strings.Replace(valid, `"prefix": "/a"`, `"prefix": "/a", "bogus": true`, 1),
 		"operation":      strings.Replace(valid, `"path": "/a"}`, `"path": "/a", "bogus": 1}`, 1),
-		"service route":  strings.Replace(valid, `"backendAuth": true`, `"backendAuth": true, "bogus": []`, 1),
+		"second service": strings.Replace(valid, `"backendAuth": true`, `"backendAuth": true, "bogus": []`, 1),
+		"client IP":      strings.Replace(valid, `"header": "X-Real-IP"`, `"header": "X-Real-IP", "bogus": 1`, 1),
 		"authorization":  strings.Replace(valid, `"path": "/authz"`, `"path": "/authz", "bogus": ""`, 1),
 		"openapi":        strings.Replace(valid, `"yamlPath"`, `"bogus": "", "yamlPath"`, 1),
 		"trailing value": valid + ` {}`,

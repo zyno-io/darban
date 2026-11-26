@@ -24,27 +24,24 @@ type contractRejection struct {
 
 // contractStatus reports one service's contract. Serving is current,
 // last-good, or none. State is the explicit outcome: serving, serving_last_good,
-// not_installed or direct_route_closed, with the Reason. Rejected is true while the service's latest contract is
-// being rejected; LastRejection stays after the contract is fixed. Route and
-// Publish are the service's binding settings. Routes, Documented and Denied
+// not_installed or closed, with the Reason. Rejected is true while the service's latest contract is
+// being rejected; LastRejection stays after the contract is fixed. Publish is
+// the service's binding setting. Routes, Documented and Denied
 // count the public operation keys under the service's prefix that the active
 // snapshot routes, documents and denies.
 type contractStatus struct {
-	Service    string   `json:"service"`
-	Serving    string   `json:"serving"`
-	Rejected   bool     `json:"rejected"`
-	Missing    bool     `json:"missing,omitempty"`
-	State      string   `json:"state"`
-	Reason     string   `json:"reason,omitempty"`
-	Route      bool     `json:"route"`
-	Publish    bool     `json:"publish"`
-	Routes     int      `json:"routes"`
-	Documented int      `json:"documented"`
-	Denied     int      `json:"denied"`
-	Warnings   []string `json:"warnings,omitempty"`
-	// Shadow compares a route: false service's direct-route traffic with its
-	// contract.
-	Shadow        *shadowStatus      `json:"shadow,omitempty"`
+	Service       string             `json:"service"`
+	Serving       string             `json:"serving"`
+	Rejected      bool               `json:"rejected"`
+	Missing       bool               `json:"missing,omitempty"`
+	State         string             `json:"state"`
+	Reason        string             `json:"reason,omitempty"`
+	Enabled       bool               `json:"enabled"`
+	Publish       bool               `json:"publish"`
+	Routes        int                `json:"routes"`
+	Documented    int                `json:"documented"`
+	Denied        int                `json:"denied"`
+	Warnings      []string           `json:"warnings,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -59,7 +56,7 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
 		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
-			State: outcome.state, Reason: outcome.reason, Route: outcome.route, Publish: outcome.publish,
+			State: outcome.state, Reason: outcome.reason, Enabled: outcome.enabled, Publish: outcome.publish,
 			Routes: outcome.counts.routes, Documented: outcome.counts.documented, Denied: outcome.counts.denied,
 			Warnings: outcome.warnings}
 		previous := s.services[name]
@@ -111,16 +108,7 @@ func (g *gateway) statusHandler(active *atomic.Pointer[snapshot], draining *atom
 				upstreamStatus{name, "debug", g.endpoints.state(binding.DebugOrigin)},
 			)
 		}
-		for _, prefix := range slices.Sorted(maps.Keys(g.bindings.ServiceRoutes)) {
-			route := g.bindings.ServiceRoutes[prefix]
-			report.Upstreams = append(report.Upstreams, upstreamStatus{prefix, "service", g.endpoints.state(route.Origin)})
-		}
 		report.Contracts = g.contractStatus.list()
-		for i := range report.Contracts {
-			if !report.Contracts[i].Route {
-				report.Contracts[i].Shadow = g.shadow.status(report.Contracts[i].Service)
-			}
-		}
 		if snapshot != nil {
 			report.ContractRevision = snapshot.revision
 			report.ContractServices = snapshot.contractServices

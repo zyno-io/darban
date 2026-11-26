@@ -59,15 +59,15 @@ func TestDebugServiceSelection(t *testing.T) {
 		Services: map[string]serviceBinding{"observatory": {Origin: primary.URL, DebugOrigin: debugOrigin}},
 	}
 	g := newGateway(bindings)
-	g.debugTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address != debugHost {
-			t.Errorf("debug request dialed %s", address)
-		}
+	g.transports.base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, debug.Listener.Addr().String())
+		if address == debugHost {
+			address = debug.Listener.Addr().String()
+		}
+		return dialer.DialContext(ctx, network, address)
 	}
 	const path = "/observatory/objects"
-	active := g.build(candidate{routes: []compiledOperation{{
+	active := g.build(candidate{services: bindings.Services, routes: []compiledOperation{{
 		key: operationKey{"POST", path}, service: "observatory", path: "/observatory/objects", protected: true,
 	}}})
 	send := func(account, wantBody string, wantStatus int) {

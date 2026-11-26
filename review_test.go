@@ -24,13 +24,12 @@ paths:
       x-darban-visibility: internal
 `
 
-func directRouteBindings(origin string) upstreamBindings {
+func catalogBindings(origin string) upstreamBindings {
 	return upstreamBindings{
 		Hostname: "api.example.net",
 		Services: map[string]serviceBinding{
-			"catalog": {Prefix: "/catalog", Origin: origin, Operations: []operationSelection{{Method: "get", Path: "/prices"}}},
+			"catalog": {Prefix: "/catalog", Origin: origin, BackendAuth: true, Operations: []operationSelection{{Method: "get", Path: "/prices"}}},
 		},
-		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: origin, BackendAuth: true}},
 	}
 }
 
@@ -41,7 +40,7 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	}))
 	defer upstream.Close()
-	bindings := directRouteBindings(upstream.URL)
+	bindings := catalogBindings(upstream.URL)
 	g := newGateway(bindings)
 	var active atomic.Pointer[snapshot]
 	rec := &reconciler{gateway: g, active: &active}
@@ -55,7 +54,7 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	good := registration{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}
 	bad := registration{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-darban-policy: anonymous", "x-darban-policy: bogus", 1)}
 
-	// A fresh pod with only a bad contract becomes ready, but the direct route
+	// A fresh pod with only a bad contract becomes ready, but the service
 	// fails closed because the internal operations are unknown.
 	freshGateway := newGateway(bindings)
 	fresh := &reconciler{gateway: freshGateway, active: new(atomic.Pointer[snapshot])}
@@ -68,7 +67,7 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	freshRes := httptest.NewRecorder()
 	freshGateway.serve(fresh.active.Load(), freshRes, freshReq)
 	if freshRes.Code != http.StatusServiceUnavailable {
-		t.Fatalf("fresh pod direct route returned %d, want 503", freshRes.Code)
+		t.Fatalf("fresh pod returned %d, want 503", freshRes.Code)
 	}
 
 	rec.apply(func() ([]registration, error) { return []registration{good}, nil })
@@ -80,14 +79,14 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusNotFound {
 		t.Fatalf("internal operation returned %d while serving last-good", code)
 	}
-	// With the contract deleted the service is gone: the direct route fails
+	// With the contract deleted the service fails
 	// closed for everything, as on a fresh pod.
 	rec.apply(func() ([]registration, error) { return nil, nil })
 	if code := probe(http.MethodPost, "/catalog/private/42"); code != http.StatusServiceUnavailable {
 		t.Errorf("internal operation returned %d after deletion, want 503", code)
 	}
 	if code := probe(http.MethodGet, "/catalog/anything"); code != http.StatusServiceUnavailable {
-		t.Errorf("direct route returned %d after deletion, want 503", code)
+		t.Errorf("undeclared path returned %d after deletion, want 503", code)
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("upstream received %d requests", hits.Load())
@@ -100,7 +99,7 @@ func TestNeverServedServiceFailsClosed(t *testing.T) {
 		hits.Add(1)
 	}))
 	defer upstream.Close()
-	bindings := directRouteBindings(upstream.URL)
+	bindings := catalogBindings(upstream.URL)
 	g := newGateway(bindings)
 	compiled, _ := compile(nil, bindings, nil)
 	for _, path := range []string{"/catalog/private/42", "/catalog/anything"} {
@@ -117,15 +116,13 @@ func TestNeverServedServiceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
+func TestDeletedContractFailsLegacyHostsClosed(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer upstream.Close()
-	bindings := directRouteBindings(upstream.URL)
-	route := bindings.ServiceRoutes["/catalog"]
-	route.PublicPaths = []string{"/public/*"}
-	route.DeniedPaths = []string{"/zrpc/*"}
-	route.LegacyHosts = []string{"catalog.example.net"}
-	bindings.ServiceRoutes["/catalog"] = route
+	bindings := catalogBindings(upstream.URL)
+	catalog := bindings.Services["catalog"]
+	catalog.LegacyHosts = []string{"catalog.example.net"}
+	bindings.Services["catalog"] = catalog
 	g := newGateway(bindings)
 	var active atomic.Pointer[snapshot]
 	rec := &reconciler{gateway: g, active: &active}
@@ -141,6 +138,9 @@ func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
 	})
 	if got := probe("api.example.net", "/catalog/prices"); got != http.StatusNoContent {
 		t.Fatalf("served: %d", got)
+	}
+	if got := probe("catalog.example.net", "/prices"); got != http.StatusNoContent {
+		t.Fatalf("served on the legacy host: %d", got)
 	}
 	for pass := 0; pass < 2; pass++ {
 		rec.apply(func() ([]registration, error) { return nil, nil })
@@ -208,10 +208,9 @@ func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestUnroutedDeploymentBecomesReadyWithoutContracts(t *testing.T) {
+func TestBoundDeploymentBecomesReadyWithoutContracts(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net",
-		Services:      map[string]serviceBinding{"archive": {Prefix: "/archive", Route: new(false)}},
-		ServiceRoutes: map[string]serviceRoute{"/archive": {Origin: "http://archive.default.svc.cluster.local:80", BackendAuth: true}}}
+		Services: map[string]serviceBinding{"archive": {Prefix: "/archive", Origin: "http://archive.default.svc.cluster.local:80", BackendAuth: true}}}
 	var active atomic.Pointer[snapshot]
 	rec := &reconciler{gateway: newGateway(bindings), active: &active}
 	rec.apply(func() ([]registration, error) { return nil, nil })
@@ -351,7 +350,7 @@ func TestRevisionTracksServingServices(t *testing.T) {
 
 func TestStrictRejectsRewriteToServiceWithoutContract(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", Route: new(false), Publish: new(false)},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", Publish: new(false)},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: archive, path: /thing}}]`}
