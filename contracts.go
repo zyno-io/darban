@@ -160,6 +160,9 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 		switch {
 		case !httpguts.ValidHeaderFieldName(header):
 			return fmt.Errorf("service %q: invalid forwardRequestHeaders entry %q", name, header)
+		case !httpguts.ValidTrailerHeader(canonical) || canonical == "Upgrade":
+			// Hop-by-hop and framing headers belong to the connection.
+			return fmt.Errorf("service %q cannot forward request header %q", name, header)
 		case managedHeader(canonical, bindings):
 			return fmt.Errorf("service %q cannot forward request header %q, which Darban manages", name, header)
 		case slices.Contains(b.ForwardRequestHeaders[:i], canonical):
@@ -172,7 +175,8 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 }
 
 // protectedRoutes reports whether an extra route needs the gateway's
-// authorizer. Contract operations are checked when they are compiled.
+// authorizer. Contract operations are checked when they are compiled, when
+// the gateway serves traffic (requireAuthz).
 func (b serviceBinding) protectedRoutes() bool {
 	return slices.ContainsFunc(b.ExtraRoutes, func(e extraRoute) bool { return e.Auth == extraAuthGateway })
 }
@@ -251,6 +255,10 @@ type upstreamBindings struct {
 	OpenAPI                openAPIConfig
 	UpstreamTLS            upstreamTLSConfig
 	ClientIP               clientIPConfig
+	// requireAuthz rejects a contract with operations the gateway must
+	// authorize when authz is unset. It is set when the gateway serves
+	// traffic, and not for -print-spec or -report, which need no authorizer.
+	requireAuthz bool
 }
 
 type openAPIConfig struct {
@@ -900,6 +908,9 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 			requirements, protected, err := operationPolicy(op, source)
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
+			}
+			if protected && !binding.BackendAuth && bindings.requireAuthz && bindings.Authz == "" {
+				return fmt.Errorf("%s %s: authorizes at the gateway, which needs authz (or set backendAuth)", key, path)
 			}
 			if _, exists := op["callbacks"]; exists {
 				return errors.New("callbacks require explicit public URL handling")

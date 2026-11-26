@@ -35,12 +35,14 @@ func (c clientIPConfig) header() string {
 	return http.CanonicalHeaderKey(c.Header)
 }
 
+// clientIPHeaders are the headers clientIP.header may name: those ingresses
+// and CDNs use for the client address. Darban removes all of them upstream.
+var clientIPHeaders = []string{"X-Real-Ip", "Cf-Connecting-Ip", "True-Client-Ip", "X-Client-Ip",
+	"X-Cluster-Client-Ip", "Fastly-Client-Ip", "X-Envoy-External-Address"}
+
 func (c *clientIPConfig) validate() error {
-	if c.Header != "" {
-		header := http.CanonicalHeaderKey(c.Header)
-		if !httpguts.ValidHeaderFieldName(c.Header) || header == "Authorization" || header == "Host" || header == "Forwarded" {
-			return fmt.Errorf("invalid clientIP.header %q", c.Header)
-		}
+	if c.Header != "" && !slices.Contains(clientIPHeaders, http.CanonicalHeaderKey(c.Header)) {
+		return fmt.Errorf("clientIP.header %q is not a client-address header; use one of %s", c.Header, strings.Join(clientIPHeaders, ", "))
 	}
 	c.proxies = nil
 	for _, value := range c.TrustedProxies {
@@ -440,7 +442,8 @@ func (g *gateway) servePreflight(w http.ResponseWriter, r *http.Request, method 
 
 // clientAddressHeaders are the headers proxies commonly use for the client
 // address, besides X-Forwarded-* and Forwarded.
-var clientAddressHeaders = []string{"X-Real-Ip", "Client-Ip", "True-Client-Ip", "X-Client-Ip", "X-Cluster-Client-Ip", "X-Original-Forwarded-For"}
+var clientAddressHeaders = []string{"X-Real-Ip", "Client-Ip", "True-Client-Ip", "X-Client-Ip", "X-Cluster-Client-Ip",
+	"X-Original-Forwarded-For", "Cf-Connecting-Ip", "Fastly-Client-Ip", "X-Envoy-External-Address"}
 
 // stripClientAddress removes every header that could carry a client address
 // or a proxy's view of the request: X-Forwarded-*, Forwarded, the common

@@ -430,6 +430,7 @@ func main() {
 		}
 		return
 	}
+	bindings.requireAuthz = true
 	gateway := newGateway(bindings)
 	var active atomic.Pointer[snapshot]
 	reload := &reconciler{gateway: gateway, active: &active}

@@ -183,6 +183,12 @@ func TestBackendAuthForwardsIdentityHeadersOnlyWhenListed(t *testing.T) {
 		"invalid":            {BackendAuth: true, ForwardRequestHeaders: []string{"bad header"}},
 		"duplicate":          {BackendAuth: true, ForwardRequestHeaders: []string{"X-Id", "X-Id"}},
 		"duplicate spelling": {BackendAuth: true, ForwardRequestHeaders: []string{"X-ZS-TID", "X-ZS-TID"}},
+		"connection":         {BackendAuth: true, ForwardRequestHeaders: []string{"Connection"}},
+		"upgrade":            {BackendAuth: true, ForwardRequestHeaders: []string{"Upgrade"}},
+		"te":                 {BackendAuth: true, ForwardRequestHeaders: []string{"Te"}},
+		"keep-alive":         {BackendAuth: true, ForwardRequestHeaders: []string{"Keep-Alive"}},
+		"proxy auth":         {BackendAuth: true, ForwardRequestHeaders: []string{"Proxy-Authorization"}},
+		"alias":              {BackendAuth: true, ForwardRequestHeaders: []string{"CF-Connecting-IP"}},
 	} {
 		bindings := upstreamBindings{Hostname: api, Authz: "http://authz.fixtures.svc.cluster.local:80"}
 		err := binding.validate("shop", bindings, true, true)
