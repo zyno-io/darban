@@ -373,7 +373,8 @@ Darban talks to it:
   non-empty `Authorization` header returns `401` without a call.
 - `responseHeaders` are the identity the authorizer returns. Darban sends
   each single, non-empty one upstream, and removes caller copies of them
-  from every request.
+  from every request. They cannot name a header Darban manages, such as
+  `Authorization`, `X-Forwarded-*` or a client-address header.
 - `stripHeaderPrefixes` removes every request header with one of these
   prefixes.
 

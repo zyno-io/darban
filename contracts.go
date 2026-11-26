@@ -174,7 +174,7 @@ func (b serviceBinding) protectedRoutes() bool {
 // caller copy of it may pass.
 func managedHeader(name string, bindings upstreamBindings) bool {
 	return name == "Authorization" || name == "Host" || slices.Contains(forwardedMetadata, name) ||
-		strings.HasPrefix(name, "X-Forwarded-") || name == "Forwarded" || name == "X-Real-Ip" ||
+		strings.HasPrefix(name, "X-Forwarded-") || name == "Forwarded" || slices.Contains(clientAddressHeaders, name) ||
 		name == bindings.ClientIP.header()
 }
 
@@ -427,6 +427,13 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 	}
 	if err := bindings.ClientIP.validate(); err != nil {
 		return bindings, err
+	}
+	for _, header := range bindings.Authorization.ResponseHeaders {
+		// Darban removes these before the request leaves, so a projected copy
+		// would never arrive. X-Real-IP is set after the identity regardless.
+		if canonical := http.CanonicalHeaderKey(header); canonical != "X-Real-Ip" && managedHeader(canonical, bindings) {
+			return bindings, fmt.Errorf("authorization.responseHeaders cannot name %q, which Darban manages", header)
+		}
 	}
 	if (!local || bindings.ContractAPIGroup != "") && !dnsName.MatchString(bindings.ContractAPIGroup) {
 		return bindings, errors.New("contractAPIGroup must be a DNS name in Kubernetes mode")

@@ -397,7 +397,7 @@ func TestBackendPreflightFollowsTheServiceThatServesThePath(t *testing.T) {
 	}
 }
 
-func TestLegacyHostsNeedNoMount(t *testing.T) {
+func TestLoadRejectsSettingsDarbanWouldOverride(t *testing.T) {
 	bindings := contractOnlyBindings()
 	bindings.Services["shop"] = serviceBinding{LegacyHosts: []string{"shop.example.net"}}
 	_, report := compile([]registration{clusterContract("shop", "/api/items", "listShop", "http://shop/api", "")}, bindings, nil)
@@ -407,6 +407,9 @@ func TestLegacyHostsNeedNoMount(t *testing.T) {
 	for name, body := range map[string]string{
 		"mount":    `{"hostname": "api.example.net", "services": {"a": {"mount": "/api", "legacyHosts": ["a.example.net"]}}}`,
 		"reserved": `{"hostname": "api.example.net", "openapi": {"yamlPath": "/docs/openapi.yaml"}, "services": {"docs": {}}}`,
+		"projected": `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80",
+			"authorization": {"path": "/authz", "responseHeaders": ["X-Forwarded-User"]}}`,
+		"alias": `{"hostname": "api.example.net", "upstreamRequestHeaders": ["True-Client-IP"]}`,
 	} {
 		if err := writeBindings(t, body); err == nil {
 			t.Errorf("%s: accepted", name)

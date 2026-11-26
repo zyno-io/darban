@@ -336,10 +336,8 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		// path it serves, when the service that serves the path, which a
 		// rewrite can make another one, is backendCORS too.
 		options := active.match(http.MethodOptions, path, r.URL.Path, legacyPrefix)
-		if options.route != nil || options.denied || options.invalid || options.passthrough {
-			if owner.BackendCORS {
-				match, method = options, http.MethodOptions
-			}
+		if owner.BackendCORS && (options.route != nil || options.denied || options.invalid || options.passthrough) {
+			match, method = options, http.MethodOptions
 		} else if target := active.match(requested, path, r.URL.Path, legacyPrefix); target.route != nil &&
 			!target.denied && !target.invalid && active.services[target.route.service].BackendCORS {
 			match, method, backendPreflight = target, requested, true
