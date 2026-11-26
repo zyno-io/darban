@@ -113,7 +113,11 @@ Startup fails on:
 - an invalid value;
 - two services with the same effective prefix (a `prefix`, or `/<name>`
   without one);
-- a legacy host used twice, or equal to `hostname`;
+- a prefix that is the first segment of `openapi.yamlPath`,
+  `openapi.jsonPath` or `authorization.path`;
+- a legacy host used twice, or equal to `hostname`, or on a service with a
+  `mount` (a legacy host serves the backend's own paths; a contract whose
+  upstream has a path is rejected the same way);
 - `forwardRequestHeaders` without `backendAuth`, or naming `Authorization`,
   `Host`, `Forwarded`, `X-Real-IP`, the `clientIP.header`, `X-Forwarded-*`
   or `X-Original-*`;
@@ -185,8 +189,8 @@ settings, whichever service owns it.
 - The path sent is the operation's upstream path with the decoded
   parameters, re-encoded by Go's `url.URL` path escaping: the path that was
   matched, not the caller's spelling of it. So `/sdk/m%65` reaches the
-  backend as `/sdk/me`, and `/a(1)` as `/a%281%29`. The query is sent as
-  received.
+  backend as `/sdk/me`, and `/a(1)` as `/a%281%29`. A trailing `/` on the
+  request is kept. The query is sent as received.
 - `Host` is `upstreamHost` when set, the legacy hostname on a legacy host,
   and otherwise the origin's host.
 - The response-header timeout is 60 seconds, or `longResponseHeaderTimeout`
@@ -200,8 +204,10 @@ settings, whichever service owns it.
   the cookie's `Domain` is removed. A legacy host keeps the upstream's paths.
 - `X-Original-Method`, `X-Original-URI` and `X-Original-URL` describe the
   public request on a `backendAuth` service.
-- `Forwarded` and `X-Forwarded-*` are never sent. The client address travels
-  in `X-Real-IP` only (see [Client IP](#client-ip)).
+- `Forwarded`, every `X-Forwarded-*` header, and `Client-IP`,
+  `True-Client-IP`, `X-Client-IP`, `X-Cluster-Client-IP` and
+  `X-Original-Forwarded-For` are removed, whoever sent them. The client
+  address travels in `X-Real-IP` only (see [Client IP](#client-ip)).
 
 `browserOrigins` lists the exact origins for gateway CORS, and
 `upstreamRequestHeaders` allows safe request metadata to every upstream.
@@ -221,7 +227,9 @@ preflight, an `OPTIONS` request whose `Access-Control-Request-Method` names
 another method, then reaches the backend without authorization, since it
 carries no credentials, whether or not `browserOrigins` is set. It must be for
 a path and method the service serves, and a contract `OPTIONS` operation on
-the path is served as itself, with its own policy.
+the path is served as itself, with its own policy. For a rewrite, the service
+that serves the path decides: a preflight reaches the backend only when the
+rewrite's target is `backendCORS`.
 
 During a hostname migration, set a service's `legacyHosts` to the exact DNS
 names it previously served. A request on a legacy host is matched as the
@@ -249,7 +257,9 @@ removes every caller copy first, so a caller cannot choose the value:
 3. Otherwise, the peer's own address is sent.
 
 The ingress must overwrite `header` with the address it saw. `header` cannot be `Authorization`, `Host` or
-`Forwarded`, and is never forwarded under its own name.
+`Forwarded`, and is never forwarded under its own name. `X-Real-IP` is set
+after every other header, so neither a copied request header nor an identity
+header the authorizer returns can change it.
 
 ## Public paths and SDK names
 

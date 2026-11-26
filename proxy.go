@@ -235,8 +235,8 @@ func (g *gateway) reverseProxy(binding serviceBinding, target *url.URL, transpor
 	clientIPHeader := bindings.ClientIP.header()
 	return &httputil.ReverseProxy{
 		Transport: transport,
-		// ReverseProxy removes Forwarded and X-Forwarded-* before Rewrite, and
-		// nothing adds them back.
+		// ReverseProxy removes Forwarded and some X-Forwarded-* before Rewrite;
+		// Rewrite removes the rest and every other client-address header.
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			state := r.In.Context().Value(serviceRequestKey{}).(serviceRequest)
@@ -259,11 +259,6 @@ func (g *gateway) reverseProxy(binding serviceBinding, target *url.URL, transpor
 					r.Out.Header[header] = values
 				}
 			}
-			r.Out.Header.Del(clientIPHeader)
-			r.Out.Header.Del("X-Real-Ip")
-			if state.clientIP != "" {
-				r.Out.Header.Set("X-Real-Ip", state.clientIP)
-			}
 			r.Out.Header.Del(bindings.Debug.RequestHeader)
 			if !state.backendAuthorization {
 				r.Out.Header.Del("Authorization")
@@ -273,6 +268,11 @@ func (g *gateway) reverseProxy(binding serviceBinding, target *url.URL, transpor
 			}
 			if binding.BackendAuth {
 				setOriginalRequestHeaders(r.Out.Header, r.In)
+			}
+			// Last, so that no copied or projected header can set it.
+			stripClientAddress(r.Out.Header, clientIPHeader)
+			if state.clientIP != "" {
+				r.Out.Header.Set("X-Real-Ip", state.clientIP)
 			}
 		},
 		ModifyResponse: func(response *http.Response) error {
@@ -436,6 +436,26 @@ func (g *gateway) servePreflight(w http.ResponseWriter, r *http.Request, method 
 		w.Header().Set("Access-Control-Allow-Headers", headers)
 	}
 	writeStatus(w, http.StatusNoContent)
+}
+
+// clientAddressHeaders are the headers proxies commonly use for the client
+// address, besides X-Forwarded-* and Forwarded.
+var clientAddressHeaders = []string{"X-Real-Ip", "Client-Ip", "True-Client-Ip", "X-Client-Ip", "X-Cluster-Client-Ip", "X-Original-Forwarded-For"}
+
+// stripClientAddress removes every header that could carry a client address
+// or a proxy's view of the request: X-Forwarded-*, Forwarded, the common
+// client-address headers and the configured clientIP header.
+func stripClientAddress(headers http.Header, clientIPHeader string) {
+	for header := range headers {
+		if strings.HasPrefix(http.CanonicalHeaderKey(header), "X-Forwarded-") {
+			headers.Del(header)
+		}
+	}
+	headers.Del("Forwarded")
+	headers.Del(clientIPHeader)
+	for _, header := range clientAddressHeaders {
+		headers.Del(header)
+	}
 }
 
 func stripForwardedIdentity(headers http.Header, settings authorizationConfig) {

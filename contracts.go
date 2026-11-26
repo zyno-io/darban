@@ -466,6 +466,12 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 		if other, exists := prefixes[prefix]; exists {
 			return bindings, fmt.Errorf("prefix collision between %q and %q", other, name)
 		}
+		if reason, reserved := reservedPrefixes(bindings)[prefix]; reserved {
+			return bindings, fmt.Errorf("service %q: prefix %s collides with %s", name, prefix, reason)
+		}
+		if binding.Mount != "" && len(binding.LegacyHosts) > 0 {
+			return bindings, fmt.Errorf("service %q: legacyHosts need an upstream without a mount", name)
+		}
 		prefixes[prefix] = name
 		for _, host := range binding.LegacyHosts {
 			if other, exists := hosts[host]; exists {

@@ -138,6 +138,11 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 	if binding.Origin == "" {
 		return binding, "", fmt.Errorf("no upstream: set spec.upstream or bindings.services.%s.origin", name)
 	}
+	if len(binding.LegacyHosts) > 0 && binding.Mount != "" {
+		// A legacy host serves the backend's own paths, so it cannot strip a
+		// mount.
+		return binding, "", fmt.Errorf("legacyHosts need an upstream without a mount, not %q", binding.Mount)
+	}
 	// A bindings entry reserves its prefix for its own service, with or
 	// without a contract.
 	for _, other := range slices.Sorted(maps.Keys(bindings.Services)) {

@@ -330,13 +330,19 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	owner := active.services[active.owners[prefix]]
 	match := active.match(method, path, r.URL.Path, legacyPrefix)
 	backendPreflight := false
-	if owner.BackendCORS && corsPreflight {
-		// An OPTIONS operation is served as itself, with its own policy. Any
-		// other preflight goes to the backend for a path the contract serves.
-		if options := active.match(http.MethodOptions, path, r.URL.Path, legacyPrefix); options.route != nil || options.denied || options.invalid || options.passthrough {
-			match, method = options, http.MethodOptions
-		} else {
-			match, method, backendPreflight = active.match(requested, path, r.URL.Path, legacyPrefix), requested, true
+	if corsPreflight {
+		// On a backendCORS owner an OPTIONS operation is served as itself,
+		// with its own policy. Any other preflight goes to the backend for a
+		// path it serves, when the service that serves the path, which a
+		// rewrite can make another one, is backendCORS too.
+		options := active.match(http.MethodOptions, path, r.URL.Path, legacyPrefix)
+		if options.route != nil || options.denied || options.invalid || options.passthrough {
+			if owner.BackendCORS {
+				match, method = options, http.MethodOptions
+			}
+		} else if target := active.match(requested, path, r.URL.Path, legacyPrefix); target.route != nil &&
+			!target.denied && !target.invalid && active.services[target.route.service].BackendCORS {
+			match, method, backendPreflight = target, requested, true
 		}
 	}
 	// Internal operations, and operations the service's selection leaves out,
@@ -354,6 +360,11 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		upstreamMethod = http.MethodGet
 	}
 	target := upstreamPath(registered.path, match.params)
+	if strings.HasSuffix(r.URL.Path, "/") && !strings.HasSuffix(target, "/") {
+		// The matcher allows one trailing slash, and the backend still sees
+		// it, as it did on the direct routes.
+		target += "/"
+	}
 	// Anonymous operations and backendAuth services leave authorization to
 	// the backend, with the caller's Authorization.
 	backendAuthorization := !registered.protected || proxy.binding.BackendAuth || backendPreflight

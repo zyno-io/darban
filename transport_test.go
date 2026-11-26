@@ -40,6 +40,11 @@ paths:
       security: []
       x-darban-policy: anonymous
       responses: {'200': {description: OK}}
+  /cart:
+    post:
+      operationId: checkout
+      security: [{account: []}]
+      responses: {'200': {description: OK}}
   /zrpc/{method}:
     post:
       x-darban-visibility: internal
@@ -67,6 +72,7 @@ func newTransportRig(t *testing.T, shop serviceBinding, options ...func(*upstrea
 		r.authorized++
 		r.mu.Unlock()
 		w.Header().Set("X-Id", "verified")
+		w.Header().Set("X-Real-Ip", "198.51.100.66")
 		if q.Header.Get("Authorization") == "Bearer admin" {
 			w.Header().Set("X-Debug-Allowed", "true")
 		}
@@ -86,6 +92,13 @@ func newTransportRig(t *testing.T, shop serviceBinding, options ...func(*upstrea
 			"front": {Origin: primary.URL},
 		},
 	}
+	for name, binding := range bindings.Services {
+		binding.Origin = primary.URL
+		if name == "shop" {
+			binding.DebugOrigin = debug.URL
+		}
+		bindings.Services[name] = binding
+	}
 	for _, option := range options {
 		option(&bindings)
 	}
@@ -97,7 +110,8 @@ func newTransportRig(t *testing.T, shop serviceBinding, options ...func(*upstrea
 	r.h.apply(
 		registration{serviceName: "shop", rewrites: "[]", openAPI: shopContract},
 		registration{serviceName: "front", openAPI: anonymousContract("/home", "home"),
-			rewrites: `[{from: {method: GET, path: /front/slow}, to: {serviceName: shop, path: /slow}}]`},
+			rewrites: `[{from: {method: GET, path: /front/slow}, to: {serviceName: shop, path: /slow}},
+				{from: {method: POST, path: /front/checkout}, to: {serviceName: shop, path: /cart}}]`},
 	)
 	for _, name := range []string{"shop", "front"} {
 		if status := r.h.status()[name]; status.Rejected {
@@ -132,7 +146,9 @@ func TestEveryKindOfRequestGetsTheSameTransport(t *testing.T) {
 		Prefix: "/shop", LongResponsePaths: []string{"/slow"}, LongResponseHeaderTimeout: "50ms",
 		ExtraRoutes: []extraRoute{{Method: "GET", Path: "/assets/*", Auth: extraAuthGateway}}})
 	caller := http.Header{"Authorization": {"Bearer x"}, "X-Trace": {"t-1"}, "X-Id": {"forged"}, "X-Id-Extra": {"forged"},
-		"X-Real-Ip": {"203.0.113.9"}, "X-Forwarded-For": {"198.51.100.1"}, "Forwarded": {"for=198.51.100.1"}}
+		"X-Real-Ip": {"203.0.113.9"}, "X-Forwarded-For": {"198.51.100.1"}, "Forwarded": {"for=198.51.100.1"},
+		"X-Forwarded-Prefix": {"/evil"}, "X-Forwarded-Client-Cert": {"evil"}, "True-Client-Ip": {"198.51.100.1"},
+		"Client-Ip": {"198.51.100.1"}}
 	admin := http.Header{}
 	for name, values := range caller {
 		admin[name] = values
@@ -156,6 +172,7 @@ func TestEveryKindOfRequestGetsTheSameTransport(t *testing.T) {
 			"Host": "shop.internal.example", "Path": request.upstreamPath, "Query": "q=1",
 			"X-Real-Ip": "203.0.113.9", "X-Forwarded-For": "", "Forwarded": "", "X-Trace": "t-1",
 			"X-Id": "verified", "X-Id-Extra": "", "Authorization": "", "X-Debug-Backend": "",
+			"X-Forwarded-Prefix": "", "X-Forwarded-Client-Cert": "", "True-Client-Ip": "", "Client-Ip": "",
 		}
 		got := map[string]string{"Host": upstream.Host, "Path": upstream.URL.Path, "Query": upstream.URL.RawQuery}
 		for header := range want {
@@ -306,6 +323,10 @@ func TestEveryRequestIsVerifiedOnEveryHost(t *testing.T) {
 		{"GET", "api.example.net", "/shop/assets/a/b.css", 418, "GET /assets/a/b.css"},
 		{"GET", "shop.example.net", "/items/7", 418, "GET /items/7"},
 		{"HEAD", "shop.example.net", "/items/7", 418, "GET /items/7"},
+		// One trailing slash is allowed, and the backend sees it.
+		{"GET", "api.example.net", "/shop/items/7/", 418, "GET /items/7/"},
+		{"GET", "shop.example.net", "/items/7/", 418, "GET /items/7/"},
+		{"GET", "api.example.net", "/shop/assets/a/", 418, "GET /assets/a/"},
 		{"GET", "shop.example.net", "/assets/a.css", 418, "GET /assets/a.css"},
 		// Undeclared methods and paths, on every service and host.
 		{"POST", "api.example.net", "/shop/items/7", 404, ""},
@@ -337,6 +358,58 @@ func TestEveryRequestIsVerifiedOnEveryHost(t *testing.T) {
 		}
 		if res.Code != test.code || sent != test.upstream {
 			t.Errorf("%s %s%s = %d %q, want %d %q", test.method, test.host, test.target, res.Code, sent, test.code, test.upstream)
+		}
+	}
+}
+
+func TestAProjectedIdentityCannotSetTheClientIP(t *testing.T) {
+	r := newTransportRig(t, serviceBinding{Prefix: "/shop"}, func(b *upstreamBindings) {
+		b.Authorization.ResponseHeaders = append(b.Authorization.ResponseHeaders, "X-Real-Ip")
+	})
+	_, upstream := r.do("GET", "api.example.net", "/shop/items/7", http.Header{"Authorization": {"Bearer x"}, "X-Real-Ip": {"203.0.113.9"}})
+	if upstream == nil || upstream.Header.Get("X-Real-Ip") != "203.0.113.9" {
+		t.Fatalf("upstream %v", upstream)
+	}
+}
+
+func TestBackendPreflightFollowsTheServiceThatServesThePath(t *testing.T) {
+	preflight := http.Header{"Origin": {"https://unknown.example"}, "Access-Control-Request-Method": {"POST"}}
+	// front leaves CORS to its backend, but its rewrite is served by shop,
+	// which does not: the preflight never reaches shop without authorization.
+	r := newTransportRig(t, serviceBinding{Prefix: "/shop"}, func(b *upstreamBindings) {
+		front := b.Services["front"]
+		front.BackendCORS = true
+		b.Services["front"] = front
+	})
+	if res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", preflight); upstream != nil || res.Code != http.StatusNotFound {
+		t.Errorf("backendCORS owner, gateway target: %d %v", res.Code, upstream)
+	}
+	// The reverse: shop leaves CORS to its backend, which answers the
+	// preflight for the rewrite into it.
+	r = newTransportRig(t, serviceBinding{Prefix: "/shop", BackendCORS: true})
+	res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", preflight)
+	if res.Code != http.StatusTeapot || upstream == nil || upstream.Method != "OPTIONS" || upstream.URL.Path != "/cart" || r.authorized != 0 {
+		t.Errorf("gateway owner, backendCORS target: %d %v authorized=%d", res.Code, upstream, r.authorized)
+	}
+	// The operation itself is still authorized.
+	if res, _ := r.do("POST", "api.example.net", "/front/checkout", nil); res.Code != http.StatusUnauthorized {
+		t.Errorf("POST without credentials = %d", res.Code)
+	}
+}
+
+func TestLegacyHostsNeedNoMount(t *testing.T) {
+	bindings := contractOnlyBindings()
+	bindings.Services["shop"] = serviceBinding{LegacyHosts: []string{"shop.example.net"}}
+	_, report := compile([]registration{clusterContract("shop", "/api/items", "listShop", "http://shop/api", "")}, bindings, nil)
+	if !strings.Contains(report.services["shop"].rejection, "legacyHosts") {
+		t.Fatalf("shop %+v", report.services["shop"])
+	}
+	for name, body := range map[string]string{
+		"mount":    `{"hostname": "api.example.net", "services": {"a": {"mount": "/api", "legacyHosts": ["a.example.net"]}}}`,
+		"reserved": `{"hostname": "api.example.net", "openapi": {"yamlPath": "/docs/openapi.yaml"}, "services": {"docs": {}}}`,
+	} {
+		if err := writeBindings(t, body); err == nil {
+			t.Errorf("%s: accepted", name)
 		}
 	}
 }

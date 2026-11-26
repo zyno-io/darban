@@ -78,7 +78,7 @@ func TestTemplatedRoutesMatchLiteralFirstWithBacktracking(t *testing.T) {
 		// special/{part}/view does not continue with reviews, so backtrack to {id}.
 		{"GET", "/shop/items/special/reviews/latest", 418, "GET /api/items/special/reviews/latest"},
 		{"GET", "/shop/items/special/x/view", 418, "GET /api/items/special/x/view"},
-		{"GET", "/shop/items/42/", 418, "GET /api/items/42"},
+		{"GET", "/shop/items/42/", 418, "GET /api/items/42/"},
 		{"PUT", "/shop/Items.v2/7/@tags/red~1", 418, "PUT /api/Items.v2/7/@tags/red~1"},
 		{"GET", "/shop/items/42/secret", 404, ""},
 		{"HEAD", "/shop/items/42/secret", 404, ""},
