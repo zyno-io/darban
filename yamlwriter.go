@@ -14,14 +14,16 @@ import (
 	yaml2 "go.yaml.in/yaml/v2"
 )
 
-// errComplexKey reports a key that YAML can only write as a complex key, such
-// as one with a line break. jsonToYAML leaves those to sigs.k8s.io/yaml.
-var errComplexKey = errors.New("complex YAML key")
-
-// jsonToYAML writes a JSON document as block YAML, exactly as
-// sigs.k8s.io/yaml.JSONToYAML does, without building the document as a tree.
-// It walks the JSON bytes in place and formats each scalar with go-yaml v2,
-// so quoting and block scalars match. Keys are sorted as go-yaml sorts them.
+// jsonToYAML writes a JSON document as block YAML without building the
+// document as a tree. It walks the JSON bytes in place and has go-yaml v2
+// format each scalar and key, so quoting, block scalars, folding and complex
+// keys match what go-yaml writes for the same document, as
+// sigs.k8s.io/yaml.JSONToYAML does. Keys are sorted as go-yaml sorts them.
+//
+// Unlike JSONToYAML it never parses the JSON as YAML, so it accepts every
+// JSON document: a key of any length, and characters go-yaml's reader
+// refuses, such as DEL, C1 controls and U+FFFE, which go-yaml's writer
+// escapes. U+0085 is written as \N, where JSONToYAML read it as a space.
 func jsonToYAML(raw []byte) ([]byte, error) {
 	w := yamlWriter{out: bytes.NewBuffer(make([]byte, 0, len(raw))), values: map[string]string{}, keys: map[string]string{}}
 	value := bytes.TrimSpace(raw)
@@ -80,14 +82,27 @@ func (w *yamlWriter) mapping(object []byte, column int, inline bool) error {
 		if i > 0 || !inline {
 			w.pad(column)
 		}
-		key, err := w.key(entry.key)
+		key, simple, err := w.key(entry.key)
 		if err != nil {
 			return err
 		}
-		w.out.WriteString(key)
-		w.out.WriteByte(':')
-		w.frames = append(w.frames, yamlFrame{key: entry.key})
-		err = w.member(entry.value, column, column+utf8.RuneCountInString(key)+2, false)
+		if !simple {
+			// A complex key: "? key", then ": value" with the value inline,
+			// like a sequence item's.
+			if key, err = w.complexKey(entry.key, column); err != nil {
+				return err
+			}
+			w.out.WriteString("? " + key)
+			w.pad(column)
+			w.out.WriteByte(':')
+			w.frames = append(w.frames, yamlFrame{key: entry.key})
+			err = w.member(entry.value, column, column+2, true)
+		} else {
+			w.out.WriteString(key)
+			w.out.WriteByte(':')
+			w.frames = append(w.frames, yamlFrame{key: entry.key})
+			err = w.member(entry.value, column, column+utf8.RuneCountInString(key)+2, false)
+		}
 		w.frames = w.frames[:len(w.frames)-1]
 		if err != nil {
 			return err
@@ -146,7 +161,12 @@ func (w *yamlWriter) member(value []byte, column, start int, item bool) error {
 		if err != nil {
 			return err
 		}
-		w.out.WriteString(" " + text + "\n")
+		w.out.WriteString(" " + text)
+		// A scalar formatted in context ends its own line, with a line feed
+		// or with a block scalar's last Unicode line break.
+		if last, _ := utf8.DecodeLastRuneInString(text); !strings.ContainsRune(yamlBreaks, last) {
+			w.out.WriteByte('\n')
+		}
 	}
 	return nil
 }
@@ -186,20 +206,23 @@ func (w *yamlWriter) scalar(value []byte, column int) (string, error) {
 // yamlBreaks are the characters YAML reads as line breaks.
 const yamlBreaks = "\n\u0085\u2028\u2029"
 
+// chain wraps a value in a document with only the current path.
+func (w *yamlWriter) chain(leaf any) any {
+	value := leaf
+	for i := len(w.frames) - 1; i >= 0; i-- {
+		if w.frames[i].seq {
+			value = []any{value}
+		} else {
+			value = map[string]any{w.frames[i].key: value}
+		}
+	}
+	return value
+}
+
 // inContext formats a string at the current path by having go-yaml write a
 // document with only that path, then taking what follows the path's header.
 func (w *yamlWriter) inContext(text string) (string, error) {
-	chain := func(leaf any) any {
-		value := leaf
-		for i := len(w.frames) - 1; i >= 0; i-- {
-			if w.frames[i].seq {
-				value = []any{value}
-			} else {
-				value = map[string]any{w.frames[i].key: value}
-			}
-		}
-		return value
-	}
+	chain := w.chain
 	header, err := yaml2.Marshal(chain("x"))
 	if err != nil {
 		return "", err
@@ -212,7 +235,7 @@ func (w *yamlWriter) inContext(text string) (string, error) {
 	if !bytes.Equal(out[:prefix], header[:prefix]) {
 		return "", errors.New("unexpected YAML context")
 	}
-	return strings.TrimSuffix(string(out[prefix:]), "\n"), nil
+	return string(out[prefix:]), nil
 }
 
 // yamlNumber formats a JSON number as go-yaml resolves and writes it: an
@@ -231,20 +254,46 @@ func yamlNumber(text string) (string, error) {
 	return strconv.FormatFloat(f, 'g', -1, 64), nil
 }
 
-func (w *yamlWriter) key(key string) (string, error) {
+// key formats a simple key, which does not depend on where it is. simple is
+// false for a key go-yaml writes as a complex key.
+func (w *yamlWriter) key(key string) (string, bool, error) {
 	if formatted, cached := w.keys[key]; cached {
-		return formatted, nil
+		return formatted, formatted != "", nil
 	}
 	out, err := yaml2.Marshal(map[string]int{key: 0})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	formatted, simple := strings.CutSuffix(string(out), ": 0\n")
 	if !simple || strings.Contains(formatted, "\n") || strings.HasPrefix(formatted, "? ") {
-		return "", errComplexKey
+		formatted = ""
 	}
 	w.keys[key] = formatted
-	return formatted, nil
+	return formatted, formatted != "", nil
+}
+
+// complexKey formats a complex key at the current path, where go-yaml may
+// fold it, by having go-yaml write a document with only that path and key. The
+// text ends with its line break.
+func (w *yamlWriter) complexKey(key string, column int) (string, error) {
+	header, err := yaml2.Marshal(w.chain(map[string]any{"k": "x"}))
+	if err != nil {
+		return "", err
+	}
+	out, err := yaml2.Marshal(w.chain(map[string]any{key: "x"}))
+	if err != nil {
+		return "", err
+	}
+	prefix := len(header) - len("k: x\n")
+	rest, ok := bytes.CutPrefix(out[prefix:], []byte("? "))
+	if !ok || !bytes.Equal(out[:prefix], header[:prefix]) {
+		return "", errors.New("unexpected YAML context")
+	}
+	text, ok := bytes.CutSuffix(rest, []byte(strings.Repeat(" ", column)+": x\n"))
+	if !ok {
+		return "", errors.New("unexpected YAML complex key")
+	}
+	return string(text), nil
 }
 
 type jsonEntry struct {

@@ -267,6 +267,11 @@ Omit `openapi` to disable publication or configure either path independently.
 Configure `omitOperationExtensionPrefixes` to remove selected source vendor
 extensions from published operations.
 
+The YAML document is written from the JSON one, with the same content.
+Characters YAML cannot hold as they are, such as DEL, C1 controls and U+FFFE,
+are escaped, and U+0085 is written as `\N`. Keys of any length are allowed;
+a long or multi-line one is a YAML complex key (`? key`).
+
 ```json
 {
   "defaultVisibility": "public",
