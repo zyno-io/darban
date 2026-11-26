@@ -645,3 +645,19 @@ components:
 		}
 	}
 }
+
+func TestPassthroughPatternNeverShadowsAnAncestorInternalParameter(t *testing.T) {
+	bindings := shopBindings()
+	bindings.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: []operationSelection{{Method: "get", Path: "/sel"}}}
+	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {BackendAuth: true}}
+	h := newTemplateHarness(t, bindings,
+		anonymousOperation("get", "/sel", "sel"),
+		anonymousOperation("get", "/v1/items{batch}", "batch"),
+		"  /{ver}/{id}:\n    get:\n      x-darban-visibility: internal\n",
+	)
+	for path, want := range map[string]int{"/shop/v1/itemsZ": 404, "/shop/v1/items:batch": 404, "/shop/v2/itemsZ": 404, "/shop/v1/other": 404, "/shop/sel": 418} {
+		if code, _ := h.do("GET", path); code != want {
+			t.Errorf("GET %s = %d, want %d", path, code, want)
+		}
+	}
+}

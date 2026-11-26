@@ -140,9 +140,11 @@ route `HEAD`. The caller gets the response headers without the body.
 When a service's bindings select `operations`, the unselected ones still
 take part in matching, as written like `internal` ones, so a selected template
 cannot capture their paths. A template inside an unselected operation's
-segment may claim more than the backend's literal does, so it never wins over
-an `internal` parameter: with an unselected `/v1/items{batch}` and an internal
-`/v1/{id}`, `/v1/itemsZ` and `/v1/items:batch` return `404`.
+segment may claim more than the backend's literal does, so a match through
+one is provisional. If the path, matched again without such templates,
+reaches an `internal` operation at any depth, it returns `404`. With an
+unselected `/v1/items{batch}` and an internal `/{ver}/{id}`, `/v1/itemsZ` and
+`/v1/items:batch` both return `404`.
 On a prefix with a [direct Service route](#direct-service-routes) they go to
 that route with its own policy, and elsewhere they return `404`.
 

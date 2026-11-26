@@ -152,43 +152,56 @@ func (t routeTable) add(entry *routeEntry) {
 	}
 }
 
-func (n *routeNode) match(segments []string) *routeEntry {
+// match finds the entry for the segments. patterned reports that a pattern
+// segment was used on the way. With strict, a passthrough entry reached
+// through a pattern does not count, so the search backtracks past it.
+func (n *routeNode) match(segments []string, strict, patterned bool) (*routeEntry, bool) {
 	if n == nil {
-		return nil
+		return nil, false
 	}
 	if len(segments) == 0 {
-		return n.entry
+		if n.entry == nil || strict && patterned && n.entry.kind == entryPassthrough {
+			return nil, false
+		}
+		return n.entry, patterned
 	}
-	if entry := n.literals[segments[0]].match(segments[1:]); entry != nil {
-		return entry
+	if entry, via := n.literals[segments[0]].match(segments[1:], strict, patterned); entry != nil {
+		return entry, via
 	}
 	for _, pattern := range n.patterns {
 		if pattern.match.MatchString(segments[0]) {
-			if entry := pattern.node.match(segments[1:]); entry != nil {
-				// A pattern is looser than the backend's literal, so it may claim
-				// a path the backend gives to a parameter. It never passes such a
-				// path through when the parameter branch denies it.
-				if entry.kind != entryDenied {
-					if denied := n.param.match(segments[1:]); denied != nil && denied.kind == entryDenied {
-						return denied
-					}
-				}
-				return entry
+			if entry, via := pattern.node.match(segments[1:], strict, true); entry != nil {
+				return entry, via
 			}
 		}
 	}
 	if segments[0] != "" {
-		return n.param.match(segments[1:])
+		return n.param.match(segments[1:], strict, patterned)
 	}
-	return nil
+	return nil, false
 }
 
 // lookup matches decoded path segments. HEAD falls back to GET.
+//
+// A pattern segment such as items{batch} is looser than the backend's
+// literal (items:batch), so a passthrough entry reached through one is
+// provisional: the backend may give the path to a parameter route instead.
+// If the path also reaches a denied entry once such passthroughs are set
+// aside, the denial wins.
 func (t routeTable) lookup(method string, segments []string) *routeEntry {
-	if entry := t[method].match(segments); entry != nil || method != http.MethodHead {
+	find := func(method string) *routeEntry {
+		entry, patterned := t[method].match(segments, false, false)
+		if entry != nil && entry.kind == entryPassthrough && patterned {
+			if strict, _ := t[method].match(segments, true, false); strict != nil && strict.kind == entryDenied {
+				return strict
+			}
+		}
 		return entry
 	}
-	return t[http.MethodGet].match(segments)
+	if entry := find(method); entry != nil || method != http.MethodHead {
+		return entry
+	}
+	return find(http.MethodGet)
 }
 
 // routeMatch is the outcome of matching a request against the snapshot.
