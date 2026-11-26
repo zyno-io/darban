@@ -32,8 +32,10 @@ darban -contracts contracts.json -bindings bindings.json -report
 `1` when a contract is rejected or a rewrite targets a service without a
 contract:
 
-- a line per service with `publish`, its state and its counts, and any
-  rejection or warning. A bindings entry without a contract shows as
+- a line per service with `publish`, its state and its counts, then its
+  transport (origin, mount, `upstreamHost`, `legacyHosts`, long-response
+  settings, `backendAuth`, `backendCORS`, `forwardRequestHeaders`,
+  `debugOrigin` and `enabled`), and any rejection or warning. A bindings entry without a contract shows as
   `state=missing`, and a disabled service as `state=disabled`;
 - a line per contract operation:
   `METHOD path service visibility documented=yes|no -> outcome`;
@@ -62,6 +64,13 @@ Every service is described by its contract, and optionally by an entry under
   replaces `spec.prefix`. Darban logs each disagreement once per distinct
   value. Fields only bindings carry, such as `extraRoutes`, `backendAuth` or
   `legacyHosts`, are added to the contract's.
+- **Origins.** Without an entry `origin`, the contract chooses its own
+  upstream: whoever can edit the `GatewayContract` decides where the
+  service's traffic goes, with its credentials, forwarded headers and legacy
+  hosts. Pin `origin` in bindings for every sensitive service, such as one
+  with `backendAuth`, `forwardRequestHeaders` or `legacyHosts`. A contract
+  whose `spec.upstream` names another origin is then still served at the
+  pinned one, and the disagreement is logged.
 - **No contract.** An entry whose service has no accepted contract serves
   nothing: its prefix and its legacy hosts return `503` for every request,
   extra routes included, until a good contract arrives. A contract with
@@ -130,12 +139,17 @@ Startup fails on:
   `mount` (a legacy host serves the backend's own paths; a contract whose
   upstream has a path is rejected the same way);
 - `forwardRequestHeaders` without `backendAuth`, or naming `Authorization`,
-  `Host`, `Forwarded`, `X-Real-IP`, the `clientIP.header`, `X-Forwarded-*`
-  or `X-Original-*`;
+  `Host`, `Forwarded`, a client-address header, `X-Forwarded-*`,
+  `X-Original-*`, or a hop-by-hop or framing header such as `Connection`,
+  `Upgrade`, `Te`, `Keep-Alive` or `Proxy-Authorization`;
 - `longResponsePaths` without `longResponseHeaderTimeout`, or the reverse;
 - a `debugOrigin` without the `debug` settings;
 - an extra route with `auth: gateway` on a `backendAuth` service, or without
   `authz`.
+
+A contract with operations the gateway must authorize is rejected when
+`authz` is unset and the service is not `backendAuth`. `-print-spec` and
+`-report` skip that check, since they need no authorizer.
 
 ## The verified flow
 
@@ -215,9 +229,11 @@ settings, whichever service owns it.
   the cookie's `Domain` is removed. A legacy host keeps the upstream's paths.
 - `X-Original-Method`, `X-Original-URI` and `X-Original-URL` describe the
   public request on a `backendAuth` service.
-- `Forwarded`, every `X-Forwarded-*` header, and `Client-IP`,
-  `True-Client-IP`, `X-Client-IP`, `X-Cluster-Client-IP` and
-  `X-Original-Forwarded-For` are removed, whoever sent them. The client
+- `Forwarded`, every `X-Forwarded-*` header, and the client-address headers
+  `X-Real-IP`, `Client-IP`, `True-Client-IP`, `X-Client-IP`,
+  `X-Cluster-Client-IP`, `X-Original-Forwarded-For`, `CF-Connecting-IP`,
+  `Fastly-Client-IP` and `X-Envoy-External-Address` are removed, whoever sent
+  them. The client
   address travels in `X-Real-IP` only (see [Client IP](#client-ip)).
 
 `browserOrigins` lists the exact origins for gateway CORS, and
@@ -269,8 +285,10 @@ removes every caller copy first, so a caller cannot choose the value:
    IPv6 address is sent as IPv4.
 3. Otherwise, the peer's own address is sent.
 
-The ingress must overwrite `header` with the address it saw. `header` cannot be `Authorization`, `Host` or
-`Forwarded`, and is never forwarded under its own name. `X-Real-IP` is set
+The ingress must overwrite `header` with the address it saw. `header` is one
+of `X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP`, `X-Client-IP`,
+`X-Cluster-Client-IP`, `Fastly-Client-IP` or `X-Envoy-External-Address`, and
+is never forwarded under its own name. `X-Real-IP` is set
 after every other header, so neither a copied request header nor an identity
 header the authorizer returns can change it.
 

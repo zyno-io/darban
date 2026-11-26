@@ -1,10 +1,16 @@
 service archive publish=false state=missing routes=0 documented=0 denied=0
+  transport: origin=- mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
 service bad publish=true state=rejected routes=0 documented=0 denied=0
+  transport: origin=http://bad.fixtures.svc.cluster.local:80 mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
   rejected: service bad: get /public/{id}: explicit credential policy required
 service hub publish=true state=missing routes=0 documented=0 denied=0
+  transport: origin=http://hub.fixtures.svc.cluster.local:80 mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
 service shop publish=true state=current routes=5 documented=3 denied=3
+  transport: origin=http://shop.fixtures.svc.cluster.local:80 mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
 service suite publish=true state=current routes=2 documented=1 denied=2
+  transport: origin=http://suite.fixtures.svc.cluster.local:80 mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
 service talk publish=false state=current routes=5 documented=0 denied=2
+  transport: origin=http://talk.fixtures.svc.cluster.local:80 mount=- upstreamHost=- legacyHosts=- longResponse=- backendAuth=false backendCORS=false forwardRequestHeaders=- debugOrigin=- enabled=true
 problem: service shop: rewrite GET /shop/archived targets service "archive" without a contract
 GET /bad/admin/stats bad internal documented=no -> 503 closed
 GET /bad/hidden bad unlisted documented=no -> 503 closed

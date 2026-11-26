@@ -217,10 +217,33 @@ func TestEveryKindOfRequestGetsTheSameTransport(t *testing.T) {
 
 func TestRewriteGetsItsTargetsSettings(t *testing.T) {
 	r := newTransportRig(t, serviceBinding{UpstreamHost: "shop.internal.example", Prefix: "/shop"})
-	res, upstream := r.do("GET", "api.example.net", "/front/slow", http.Header{"X-Real-Ip": {"203.0.113.9"}})
+	forged := http.Header{"X-Real-Ip": {"203.0.113.9"}, "X-Id": {"forged"}, "X-Id-Extra": {"forged"}, "Authorization": {"Bearer x"}}
+	// An anonymous target: the caller's credentials pass, forged identity
+	// headers do not.
+	res, upstream := r.do("GET", "api.example.net", "/front/slow", forged)
 	if res.Code != http.StatusTeapot || upstream.Host != "shop.internal.example" || upstream.URL.Path != "/slow" ||
-		upstream.Header.Get("X-Real-Ip") != "203.0.113.9" || res.Header().Get("Location") != "/shop/items/next?step=2" {
+		upstream.Header.Get("X-Real-Ip") != "203.0.113.9" || res.Header().Get("Location") != "/shop/items/next?step=2" ||
+		upstream.Header.Get("X-Id") != "" || upstream.Header.Get("X-Id-Extra") != "" || upstream.Header.Get("Authorization") != "Bearer x" {
 		t.Fatalf("rewrite: %d %v %v", res.Code, upstream, res.Header())
+	}
+	// A protected target: the authorizer's identity replaces the credentials.
+	res, upstream = r.do("POST", "api.example.net", "/front/checkout", forged)
+	if res.Code != http.StatusTeapot || upstream.URL.Path != "/cart" || upstream.Header.Get("X-Id") != "verified" ||
+		upstream.Header.Get("X-Id-Extra") != "" || upstream.Header.Get("Authorization") != "" || r.authorized != 1 {
+		t.Fatalf("protected rewrite: %d %v", res.Code, upstream)
+	}
+	// Cookies are scoped to the target's prefix, without the backend's domain.
+	if cookies := res.Result().Cookies(); len(cookies) != 1 || cookies[0].Path != "/shop/items" || cookies[0].Domain != "" {
+		t.Errorf("rewrite cookies %v", cookies)
+	}
+}
+
+func TestTheRawQueryIsForwardedAsSent(t *testing.T) {
+	r := newTransportRig(t, serviceBinding{Prefix: "/shop"})
+	for _, query := range []string{"a=1;x", "b=%zz&b=2", "c", "d=1&&e="} {
+		if _, upstream := r.do("GET", "api.example.net", "/shop/slow?"+query, nil); upstream == nil || upstream.URL.RawQuery != query {
+			t.Errorf("%q: upstream %v", query, upstream)
+		}
 	}
 }
 
@@ -279,7 +302,13 @@ func TestClientIPIsAlwaysSetAndCannotBeSpoofed(t *testing.T) {
 			t.Errorf("%s: %q, want %q", name, got, test.want)
 		}
 	}
-	for _, bad := range []clientIPConfig{{Header: "Authorization"}, {Header: "bad header"}, {TrustedProxies: []string{"10.0.0.0/33"}}, {TrustedProxies: []string{"proxy"}}} {
+	for _, good := range []string{"X-Real-IP", "cf-connecting-ip", "True-Client-IP", "X-Envoy-External-Address"} {
+		if err := (&clientIPConfig{Header: good}).validate(); err != nil {
+			t.Errorf("%s: %v", good, err)
+		}
+	}
+	for _, bad := range []clientIPConfig{{Header: "Authorization"}, {Header: "bad header"}, {Header: "Cookie"}, {Header: "Content-Type"},
+		{Header: "X-Forwarded-For"}, {Header: "X-Custom"}, {TrustedProxies: []string{"10.0.0.0/33"}}, {TrustedProxies: []string{"proxy"}}} {
 		if err := bad.validate(); err == nil {
 			t.Errorf("%+v accepted", bad)
 		}
@@ -388,8 +417,28 @@ func TestBackendPreflightFollowsTheServiceThatServesThePath(t *testing.T) {
 	if res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", preflight); upstream != nil || res.Code != http.StatusNotFound {
 		t.Errorf("backendCORS owner, gateway target: %d %v", res.Code, upstream)
 	}
+	// With browserOrigins, as in Alpha, the gateway answers it instead, for
+	// any origin, still without reaching shop or the authorizer.
+	for _, origin := range []string{"https://unknown.example", "https://app.example.net"} {
+		r = newTransportRig(t, serviceBinding{Prefix: "/shop"}, func(b *upstreamBindings) {
+			b.BrowserOrigins = []string{"https://app.example.net"}
+			front := b.Services["front"]
+			front.BackendCORS = true
+			b.Services["front"] = front
+		})
+		headers := http.Header{"Origin": {origin}, "Access-Control-Request-Method": {"POST"}}
+		if res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", headers); upstream != nil || r.authorized != 0 || res.Code >= 500 {
+			t.Errorf("browser origins %s: %d %v", origin, res.Code, upstream)
+		}
+	}
 	// The reverse: shop leaves CORS to its backend, which answers the
-	// preflight for the rewrite into it.
+	// preflight for the rewrite into it, with or without browserOrigins.
+	r = newTransportRig(t, serviceBinding{Prefix: "/shop", BackendCORS: true}, func(b *upstreamBindings) {
+		b.BrowserOrigins = []string{"https://app.example.net"}
+	})
+	if res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", preflight); res.Code != http.StatusTeapot || upstream == nil || r.authorized != 0 {
+		t.Errorf("browser origins, backendCORS target: %d %v", res.Code, upstream)
+	}
 	r = newTransportRig(t, serviceBinding{Prefix: "/shop", BackendCORS: true})
 	res, upstream := r.do("OPTIONS", "api.example.net", "/front/checkout", preflight)
 	if res.Code != http.StatusTeapot || upstream == nil || upstream.Method != "OPTIONS" || upstream.URL.Path != "/cart" || r.authorized != 0 {
@@ -418,5 +467,24 @@ func TestLoadRejectsSettingsDarbanWouldOverride(t *testing.T) {
 		if err := writeBindings(t, body); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestProtectedOperationsNeedAnAuthorizer(t *testing.T) {
+	bindings := contractOnlyBindings()
+	bindings.Services["shop"] = serviceBinding{Origin: "http://shop." + testNamespace + ".svc.cluster.local:80"}
+	reg := registration{serviceName: "shop", rewrites: "[]", openAPI: shopContract}
+	// -print-spec and -report need no authorizer.
+	if _, report := compile([]registration{reg}, bindings, nil); report.services["shop"].rejection != "" {
+		t.Fatalf("one-shot: %+v", report.services["shop"])
+	}
+	bindings.requireAuthz = true
+	if _, report := compile([]registration{reg}, bindings, nil); !strings.Contains(report.services["shop"].rejection, "needs authz") {
+		t.Fatalf("serving: %+v", report.services["shop"])
+	}
+	// backendAuth needs none.
+	bindings.Services["shop"] = serviceBinding{Origin: "http://shop." + testNamespace + ".svc.cluster.local:80", BackendAuth: true}
+	if _, report := compile([]registration{reg}, bindings, nil); report.services["shop"].rejection != "" {
+		t.Fatalf("backendAuth: %+v", report.services["shop"])
 	}
 }

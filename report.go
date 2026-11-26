@@ -52,6 +52,11 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		}
 		fmt.Fprintf(w, "service %s publish=%v state=%s routes=%d documented=%d denied=%d\n",
 			name, outcome.publish, state, outcome.counts.routes, outcome.counts.documented, outcome.counts.denied)
+		binding, served := compiled.services[name]
+		if !served {
+			binding = bindings.Services[name]
+		}
+		fmt.Fprintf(w, "  transport: %s\n", transportSummary(binding))
 		if outcome.rejection != "" {
 			fmt.Fprintf(w, "  rejected: %s\n", oneLine(outcome.rejection))
 		}
@@ -188,6 +193,31 @@ func reportOutcome(key operationKey, accepted, bound bool, table routeTable, ser
 	default:
 		return "proxy auth=none"
 	}
+}
+
+// transportSummary describes how a service's requests go upstream, so that a
+// report diff also shows a change of transport: the effective binding of a
+// served service, or the bindings entry of one that is not served.
+func transportSummary(b serviceBinding) string {
+	list := func(values []string) string {
+		if len(values) == 0 {
+			return "-"
+		}
+		return strings.Join(values, ",")
+	}
+	long := "-"
+	if len(b.LongResponsePaths) > 0 {
+		long = list(b.LongResponsePaths) + "@" + b.LongResponseHeaderTimeout
+	}
+	value := func(v string) string {
+		if v == "" {
+			return "-"
+		}
+		return v
+	}
+	return fmt.Sprintf("origin=%s mount=%s upstreamHost=%s legacyHosts=%s longResponse=%s backendAuth=%v backendCORS=%v forwardRequestHeaders=%s debugOrigin=%s enabled=%v",
+		value(b.Origin), value(b.Mount), value(b.UpstreamHost), list(b.LegacyHosts), long, b.BackendAuth, b.BackendCORS,
+		list(b.ForwardRequestHeaders), value(b.DebugOrigin), b.enabled())
 }
 
 // summaryLabel turns an outcome such as "proxy auth=authz" into a summary
