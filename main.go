@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -43,12 +45,22 @@ var (
 	dnsName     = regexp.MustCompile("^[a-z0-9-]+([.][a-z0-9-]+)+$")
 )
 
+// readJSON decodes one JSON value strictly: unknown fields at any depth and
+// trailing data are errors.
 func readJSON(path string, value any) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(raw, value)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("%s: unexpected data after the JSON value", path)
+	}
+	return nil
 }
 
 func upstreamOrigin(address string, local bool) (*url.URL, error) {
@@ -460,7 +472,7 @@ func main() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		cpu := (usage.Utime.Sec+usage.Stime.Sec)*1_000_000 + usage.Utime.Usec + usage.Stime.Usec
+		cpu := int64(usage.Utime.Sec+usage.Stime.Sec)*1_000_000 + int64(usage.Utime.Usec) + int64(usage.Stime.Usec)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, "{\"requests\":%d,\"cpuMicros\":%d}\n", requests.Load(), cpu)
 	})

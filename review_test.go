@@ -177,7 +177,7 @@ func TestCascadingUndoNeverOmitsEstablishedService(t *testing.T) {
 			t.Errorf("service %s: %+v", name, r2.services[name])
 		}
 	}
-	if r2.services["a"].warning == "" || !slices.Contains(got.denied, operationKey{"GET", "/a/old"}) {
+	if len(r2.services["a"].warnings) == 0 || !slices.Contains(got.denied, operationKey{"GET", "/a/old"}) {
 		t.Fatalf("a = %+v denied=%v", r2.services["a"], got.denied)
 	}
 }
@@ -210,9 +210,9 @@ func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestRegistrationOnlyDeploymentBecomesReadyWithoutContracts(t *testing.T) {
+func TestUnroutedDeploymentBecomesReadyWithoutContracts(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net",
-		Services:      map[string]serviceBinding{"archive": {Prefix: "/archive", RegistrationOnly: true}},
+		Services:      map[string]serviceBinding{"archive": {Prefix: "/archive", Route: new(false)}},
 		ServiceRoutes: map[string]serviceRoute{"/archive": {Origin: "http://archive.default.svc.cluster.local:80", BackendAuth: true}}}
 	var active atomic.Pointer[snapshot]
 	rec := &reconciler{gateway: newGateway(bindings), active: &active}
@@ -262,14 +262,14 @@ func TestBrokenRewriteIsDeniedAndWarnedOnItsOwner(t *testing.T) {
 	beta := contractFor("beta", "/items", "listBeta")
 	got, report := compile([]registration{broken, beta}, bindings, nil)
 	wantPaths(t, got, "/alpha/items", "/beta/items")
-	if report.services["alpha"].serving != servingCurrent || report.services["alpha"].warning == "" ||
+	if report.services["alpha"].serving != servingCurrent || len(report.services["alpha"].warnings) == 0 ||
 		report.services["beta"].serving != servingCurrent || !slices.Contains(got.denied, operationKey{"GET", "/alpha/old"}) {
 		t.Fatalf("alpha=%+v beta=%+v", report.services["alpha"], report.services["beta"])
 	}
 	// The same on an established pod.
 	_, r1 := compile([]registration{contractFor("alpha", "/items", "listAlpha"), beta}, bindings, nil)
 	got2, r2 := compile([]registration{broken, beta}, bindings, r1.accepted)
-	if r2.services["alpha"].serving != servingCurrent || r2.services["alpha"].warning == "" || got2.revision != got.revision {
+	if r2.services["alpha"].serving != servingCurrent || len(r2.services["alpha"].warnings) == 0 || got2.revision != got.revision {
 		t.Fatalf("alpha = %+v", r2.services["alpha"])
 	}
 	// A change that removes a target an established rewrite needs only denies
@@ -279,7 +279,7 @@ func TestBrokenRewriteIsDeniedAndWarnedOnItsOwner(t *testing.T) {
 	_, s1 := compile([]registration{rewrite, beta}, bindings, nil)
 	moved := contractFor("beta", "/moved", "listBeta")
 	got, s2 := compile([]registration{rewrite, moved}, bindings, s1.accepted)
-	if s2.services["beta"].serving != servingCurrent || s2.services["alpha"].serving != servingCurrent || s2.services["alpha"].warning == "" {
+	if s2.services["beta"].serving != servingCurrent || s2.services["alpha"].serving != servingCurrent || len(s2.services["alpha"].warnings) == 0 {
 		t.Fatalf("alpha=%+v beta=%+v", s2.services["alpha"], s2.services["beta"])
 	}
 	wantPaths(t, got, "/alpha/items", "/beta/moved")
@@ -387,7 +387,7 @@ func TestRevisionTracksServingServices(t *testing.T) {
 
 func TestStrictRejectsRewriteToServiceWithoutContract(t *testing.T) {
 	bindings := upstreamBindings{Hostname: "api.example.net", Services: map[string]serviceBinding{
-		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", RegistrationOnly: true},
+		"alpha": {Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}, "archive": {Prefix: "/archive", Route: new(false), Publish: new(false)},
 	}}
 	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
 		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: archive, path: /thing}}]`}

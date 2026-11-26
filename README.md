@@ -21,18 +21,52 @@ namespaced `GatewayContract` resources under `contractAPIGroup`. A contract
 names its own upstream (see [Contract upstreams](#contract-upstreams)), so a
 backend can join the gateway without a bindings entry.
 
+The bindings file is parsed strictly. An unknown key at any depth, or any
+data after the JSON object, fails startup.
+
 `bindings.services` entries are optional overrides. A contract that sets
 `spec.upstream` needs none. Use an entry for what only bindings carry:
-`operations` (with `legacy`), `debugOrigin` and `registrationOnly`. Its
+`operations` (with `legacy`), `debugOrigin`, `route` and `publish`. Its
 `origin`, `prefix` and `mount` are the transition fallback for contracts
 that do not yet set `spec.upstream`, and are validated when present.
 
-Set `registrationOnly: true` on a service binding to accept the backend's
-contract ahead of routing migration. The contract is optional at startup, and
-Darban validates its OpenAPI document and reports the loaded service under
-`contractServices` on the status endpoint. Existing service routes continue
-to handle traffic. Operation selections and rewrites require an active
-contract binding.
+### Route and publish
+
+Two service binding booleans, both `true` by default, decide what a contract
+does:
+
+| `route` | `publish` | Traffic | Combined OpenAPI |
+| --- | --- | --- | --- |
+| `true` | `true` | Routed by the contract | Public operations included |
+| `true` | `false` | Routed by the contract | Omitted, as if every operation were `unlisted` |
+| `false` | `true` | Stays on the `serviceRoutes` entry | Public operations the direct route accepts |
+| `false` | `false` | Stays on the `serviceRoutes` entry | Omitted |
+
+With `route: false` the contract is docs-only. Darban validates its operations
+in full, as it would for a routed contract, and reports it in `/status` and
+under `contractServices`. It has no traffic effect: it adds no routes and no
+denials, and the service's direct route keeps its own gating. The contract is
+optional, and a rejected one changes only the document. Such a service cannot
+select `operations` or define rewrites, and rewrites into it are denied with a
+warning on their owner. Its paths may be templates, such as `/items/{id}`,
+where each segment is a literal (`[A-Za-z0-9._~@-]+`, not `.` or `..`) or a
+whole `{name}`. Its component references are checked only when it publishes.
+
+`route: false` with `publish: true` documents the service's public operations
+while its traffic stays on the direct route. It needs an explicit `prefix` that
+has a `serviceRoutes` entry, and no `mount`. Darban leaves out, with a warning
+in `/status`, every operation the direct route would refuse: one that its
+`deniedPaths` may match, one that its `allowedPaths` do not cover, or an
+anonymous operation that its `publicPaths` do not cover on a route without
+`backendAuth`. A template is covered only when every path it stands for is.
+Omissions never reject the contract.
+
+A docs-only contract never costs a routed contract its place. When the two
+conflict, for example on an `operationId` or a prefix, Darban rejects the
+docs-only one, even when it has a last good contract.
+
+With `publish: false` a routed service's operations, and the rewrites into or
+out of it, are callable but left out of the document.
 
 An operation selection can carry a `legacy` block with the `source` security
 requirements and the target credential `profiles`. Darban replaces the source
@@ -209,7 +243,7 @@ version if it had one, when:
   Ownership means a bindings entry for the same service name with that
   prefix, and that service's `spec.prefix` must stay on it;
 - its prefix is reserved by a `bindings.services` entry of another service
-  (its `prefix`, or `/<name>` when it has none, `registrationOnly` included),
+  (its `prefix`, or `/<name>` when it has none, `route: false` included),
   whether or not that service has a contract yet;
 - its prefix has a `serviceRoutes` direct route and its upstream (or bindings
   `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`, so
@@ -303,15 +337,17 @@ block the others once the gateway is running.
   With no good contract, including after the contract was deleted, only that
   direct route fails closed with `503` until a good contract arrives, exactly
   as on a fresh pod. Rewrites into a service that is not installed are denied.
-  Registration-only services keep proxying through `serviceRoutes`.
+  Services with `route: false` keep proxying through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and prefix collisions. Darban first keeps every service's last good contract, then tries
   each changed contract and keeps the last good one when the change conflicts.
   After each rejection the selection restarts from the last good contracts, so a
-  service with a last good contract is only ever current or last-good.
+  service with a last good contract is only ever current or last-good, unless
+  it is docs-only and conflicts with a routed service (see
+  [Route and publish](#route-and-publish)).
   A rewrite whose served target lacks the destination (missing or rewritten
   operation, or a path outside the target's mount) is denied and reported as a
-  `warning` on the owner in `/status`. It never rejects either service, so the
+  warning on the owner in `/status`. It never rejects either service, so the
   outcome does not depend on arrival order. A service
   that was never good is admitted after the established ones. Two contracts
   that claim one prefix conflict the same way. Among new or
@@ -356,7 +392,14 @@ contract. `state` is the explicit outcome per service, with a `reason`:
 `not_installed` (no accepted contract: never accepted, or deleted; the
 prefix returns `404`), or `direct_route_closed` (no accepted contract and the
 service has a direct route, which returns `503` until a good contract
-arrives). The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
+arrives). For a service with `route: false` the state describes only its
+contract: its traffic stays on the direct route either way.
+`route` and `publish` are the service's binding settings. `routes`,
+`documented` and `denied` count the public operation keys under the service's
+prefix, including the rewrites it owns, that the active snapshot routes,
+documents and denies. `warnings` lists the service's rewrites that are denied
+although their target is served, and the operations a publish-only service
+leaves out of the document. The endpoint returns `503` during startup or drain. The chart's Role covers its own namespace. Allow the gateway's
 ServiceAccount to list and watch EndpointSlices in every other namespace named
 in its bindings.
 

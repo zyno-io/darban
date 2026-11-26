@@ -124,8 +124,8 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 			binding.Prefix = "/" + name
 		}
 	} else {
-		// A registration-only service routes nothing through its contract.
-		if !hasStatic || (static.Origin == "" && !static.RegistrationOnly) {
+		// A service with route: false routes nothing through its contract.
+		if !hasStatic || (static.Origin == "" && static.routed()) {
 			return binding, "", fmt.Errorf("no upstream: set spec.upstream or bindings.services.%s.origin", name)
 		}
 		if reg.prefix != "" {
