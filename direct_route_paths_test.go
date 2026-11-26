@@ -41,7 +41,11 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 		// Normal paths, with and without a trailing slash, still work.
 		{"", "POST", "/denied/svc/method", 418, "POST /svc/method"},
 		{"", "GET", "/denied/svc/method/", 418, "GET /svc/method/"},
-		{"", "GET", "/denied/svc/%6Dethod", 418, "GET /svc/%6Dethod"},
+		// The backend gets the path that was gated, escaped only where needed.
+		{"", "GET", "/denied/svc/%6Dethod", 418, "GET /svc/method"},
+		{"", "GET", "/public/tabs/a%20b%3Ac", 418, "GET /tabs/a%20b:c"},
+		{"", "GET", "/public/tabs/a#b", 418, "GET /tabs/a%23b"},
+		{legacyHost, "GET", "/svc/m%65", 418, "GET /svc/me"},
 		{"", "GET", "/allowed/open/x/", 418, "GET /open/x/"},
 		{"", "GET", "/public/tabs/x/", 418, "GET /tabs/x/"},
 		{"", "GET", "/public/private/x", 401, ""},
@@ -56,6 +60,11 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 		{"", "GET", "/public/private/a//../../tabs/x", 404, ""},
 		{legacyHost, "POST", "/zrpc//../svc/m", 404, ""},
 		{legacyHost, "GET", "/authz//..", 404, ""},
+		{legacyHost, "GET", "//authz", 404, ""},
+		{legacyHost, "POST", "//zrpc/svc/m", 404, ""},
+		// Go keeps a raw # in the path and drops RawPath, so the check must
+		// use the path as sent.
+		{"", "POST", "/denied/x#/../zrpc/m", 404, ""},
 		// Clean decodes %2F, the backend does not.
 		{"", "POST", "/denied/zrpc/a/b%2F..%2F..%2Fx", 404, ""},
 		{"", "GET", "/allowed/x%2F..%2Fopen/y", 404, ""},
@@ -90,6 +99,58 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 		}
 		if res.Code != test.want || upstreamHit != test.upstream || len(hits) > 1 {
 			t.Errorf("%s %s%s = %d %v, want %d %q", test.method, test.host, test.path, res.Code, hits, test.want, test.upstream)
+		}
+	}
+}
+
+// TestDirectRouteForwardsTheGatedPath checks that an encoded spelling of a
+// public or allowed path cannot reach a backend route that matches the
+// encoded path, such as a sibling /sdk/:x for /sdk/m%65.
+func TestDirectRouteForwardsTheGatedPath(t *testing.T) {
+	var hits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	bindings := upstreamBindings{
+		Hostname:      "api.example.net",
+		Authorization: authorizationConfig{Profiles: map[string]credentialProfile{"account": {Scheme: "bearer"}}},
+		ServiceRoutes: map[string]serviceRoute{
+			"/suite": {Origin: upstream.URL, AuthProfiles: []string{"account"}, PublicPaths: []string{"/sdk/me"}},
+			"/shop":  {Origin: upstream.URL, BackendAuth: true, AllowedPaths: []string{"/sdk/me"}},
+		},
+	}
+	gw := newGateway(bindings)
+	for path, want := range map[string]string{"/suite/sdk/m%65": "/sdk/me", "/shop/sdk/m%65": "/sdk/me"} {
+		hits = nil
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = bindings.Hostname
+		res := httptest.NewRecorder()
+		gw.serve(&snapshot{}, res, req)
+		if res.Code != http.StatusTeapot || len(hits) != 1 || hits[0] != want {
+			t.Errorf("GET %s = %d %v, want %s", path, res.Code, hits, want)
+		}
+	}
+}
+
+func TestDirectRoutePreflightOnNonCanonicalPathIs404(t *testing.T) {
+	bindings := upstreamBindings{
+		Hostname: "api.example.net", BrowserOrigins: []string{"https://app.example.net"},
+		Authorization: authorizationConfig{Profiles: map[string]credentialProfile{"account": {Scheme: "bearer"}}},
+		ServiceRoutes: map[string]serviceRoute{"/suite": {Origin: "http://suite.fixtures.svc.cluster.local:80",
+			AuthProfiles: []string{"account"}, DeniedPaths: []string{"/zrpc/*"}}},
+	}
+	gw := newGateway(bindings)
+	for path, want := range map[string]int{"/suite/x": 204, "/suite/zrpc//../x": 404, "/suite/x/%2e%2e/zrpc/y": 404, "/suite/x%2Fy": 404} {
+		req := httptest.NewRequest(http.MethodOptions, path, nil)
+		req.Host = bindings.Hostname
+		req.Header.Set("Origin", "https://app.example.net")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		res := httptest.NewRecorder()
+		gw.serve(&snapshot{}, res, req)
+		if res.Code != want {
+			t.Errorf("OPTIONS %s = %d, want %d", path, res.Code, want)
 		}
 	}
 }

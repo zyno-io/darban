@@ -41,7 +41,7 @@ func TestServiceRoutePreservesMethodQueryAndCredentials(t *testing.T) {
 	request.Header.Set("X-Original-Uri", "/spoofed")
 	response := httptest.NewRecorder()
 	gw.serve(&snapshot{}, response, request)
-	if receivedURI != "/login/%6eext?one=a%2Bb&one=c" || receivedMethod != "POST" {
+	if receivedURI != "/login/next?one=a%2Bb&one=c" || receivedMethod != "POST" {
 		t.Fatalf("forwarded %s %s", receivedMethod, receivedURI)
 	}
 	for key, want := range map[string]string{
@@ -118,7 +118,8 @@ func TestLegacyHostPreservesRequestAndEnforcesRoutePolicy(t *testing.T) {
 	const host = "catalog.example.net"
 	const uri = "/items/%31?ref=a%2Bb"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host != host || r.RequestURI != uri || r.Header.Get("X-Identity") != "verified" {
+		// The upstream gets the gated path, /items/1, with the query as sent.
+		if r.Host != host || r.RequestURI != "/items/1?ref=a%2Bb" || r.Header.Get("X-Identity") != "verified" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
