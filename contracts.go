@@ -65,6 +65,10 @@ type serviceBinding struct {
 	// ExtraRoutes are paths the service serves that its contract cannot
 	// declare, such as probes, static assets and event streams.
 	ExtraRoutes []extraRoute `json:",omitempty"`
+	// Enabled defaults to true. False serves nothing: the prefix and legacy
+	// hosts return 503 and the operations leave the document, while the
+	// contract is still validated and keeps its prefix.
+	Enabled *bool `json:",omitempty"`
 	// Publish defaults to true. False keeps the service's operations out of
 	// the combined OpenAPI.
 	Publish *bool `json:",omitempty"`
@@ -87,6 +91,9 @@ type serviceBinding struct {
 
 // published reports whether the service's operations are documented.
 func (b serviceBinding) published() bool { return b.Publish == nil || *b.Publish }
+
+// enabled reports whether the service serves traffic.
+func (b serviceBinding) enabled() bool { return b.Enabled == nil || *b.Enabled }
 
 // validate checks the fields of a service binding. Origins are optional
 // because a contract can supply them, so only present ones are checked. A
@@ -981,6 +988,7 @@ const (
 	stateServingLastGood = "serving_last_good"
 	stateNotInstalled    = "not_installed"
 	stateClosed          = "closed"
+	stateDisabled        = "disabled"
 )
 
 type serviceOutcome struct {
@@ -992,8 +1000,9 @@ type serviceOutcome struct {
 	reason string
 	// warnings describe rewrites denied although their target is served.
 	warnings []string
-	// publish is the service's effective binding setting.
+	// publish and enabled are the service's effective binding settings.
 	publish bool
+	enabled bool
 	counts  serviceCounts
 }
 
@@ -1188,8 +1197,14 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 			outcome.counts = out.counts[name]
 			outcome.warnings = slices.Sorted(slices.Values(out.aliasWarnings[name]))
 		}
-		outcome.publish = binding.published()
+		outcome.publish, outcome.enabled = binding.published(), binding.enabled()
 		report.services[name] = outcome
+	}
+	// A disabled service's prefix, and so its legacy hosts, return 503.
+	for _, name := range slices.Sorted(maps.Keys(accepted)) {
+		if binding := accepted[name].binding; !binding.enabled() {
+			out.unserved = append(out.unserved, binding.Prefix)
+		}
 	}
 	// Only bindings entries declare that a service must have a contract, so
 	// only they are reported missing, and their prefixes fail closed (503)
@@ -1197,7 +1212,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
 		binding := bindings.Services[name]
 		if count[name] == 0 {
-			report.services[name] = serviceOutcome{serving: servingNone, missing: true, publish: binding.published()}
+			report.services[name] = serviceOutcome{serving: servingNone, missing: true, publish: binding.published(), enabled: binding.enabled()}
 		}
 		if accepted[name] == nil {
 			prefix := binding.Prefix
@@ -1414,6 +1429,10 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 			}
 			prefixOwners[unit.binding.Prefix] = name
 		}
+		// A disabled service keeps its prefix, and contributes nothing else.
+		if !unit.binding.enabled() {
+			continue
+		}
 		maps.Copy(native, unit.native)
 		for key := range unit.native {
 			keyOwners[key] = name
@@ -1464,6 +1483,10 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 			// denied.
 			delete(published, from)
 			deny(from, owner)
+			continue
+		}
+		if !targetUnit.binding.enabled() {
+			warn("rewrite %s %s targets service %s, which is disabled", from.method, from.path, alias.service)
 			continue
 		}
 		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
@@ -1598,7 +1621,7 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 	fmt.Fprintf(hash, "services %v\n", out.contractServices)
 	for _, name := range out.contractServices {
 		binding := units[name].binding
-		fmt.Fprintf(hash, "upstream %s %s %s %s %s\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin)
+		fmt.Fprintf(hash, "upstream %s %s %s %s %s enabled=%v\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin, binding.enabled())
 	}
 	for _, route := range out.routes {
 		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.protected)

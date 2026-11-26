@@ -36,6 +36,7 @@ type contractStatus struct {
 	Missing       bool               `json:"missing,omitempty"`
 	State         string             `json:"state"`
 	Reason        string             `json:"reason,omitempty"`
+	Enabled       bool               `json:"enabled"`
 	Publish       bool               `json:"publish"`
 	Routes        int                `json:"routes"`
 	Documented    int                `json:"documented"`
@@ -55,7 +56,7 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
 		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
-			State: outcome.state, Reason: outcome.reason, Publish: outcome.publish,
+			State: outcome.state, Reason: outcome.reason, Enabled: outcome.enabled, Publish: outcome.publish,
 			Routes: outcome.counts.routes, Documented: outcome.counts.documented, Denied: outcome.counts.denied,
 			Warnings: outcome.warnings}
 		previous := s.services[name]

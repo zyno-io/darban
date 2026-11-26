@@ -116,6 +116,14 @@ func (r *reconciler) classify(report *compileReport) {
 			reason = "no GatewayContract"
 		}
 		switch {
+		case !outcome.enabled:
+			outcome.state = stateDisabled
+			if outcome.rejection == "" {
+				reason = ""
+			} else {
+				reason += "; "
+			}
+			reason += "disabled in bindings; its prefix returns 503"
 		case outcome.serving == servingCurrent:
 			outcome.state, reason = stateServing, ""
 		case outcome.serving == servingLastGood:

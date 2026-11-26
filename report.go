@@ -43,10 +43,12 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 		outcome := report.services[name]
 		state := outcome.serving
 		switch {
-		case outcome.missing:
-			state = "missing"
 		case outcome.rejection != "":
 			state, ok = "rejected", false
+		case !outcome.enabled:
+			state = "disabled"
+		case outcome.missing:
+			state = "missing"
 		}
 		fmt.Fprintf(w, "service %s publish=%v state=%s routes=%d documented=%d denied=%d\n",
 			name, outcome.publish, state, outcome.counts.routes, outcome.counts.documented, outcome.counts.denied)
@@ -67,6 +69,7 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 	for _, name := range slices.Sorted(maps.Keys(byName)) {
 		reg := byName[name]
 		binding, accepted := compiled.services[name]
+		disabled := !bindings.Services[name].enabled() || accepted && !binding.enabled()
 		if !accepted {
 			binding, _, _ = resolveBinding(reg, bindings)
 			if binding.Prefix == "" {
@@ -103,6 +106,9 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 				_, documented := document.Paths[public][method]
 				_, bound := bindings.Services[name]
 				result := reportOutcome(key, accepted, bound, table, compiled.services)
+				if disabled {
+					result = "503 disabled"
+				}
 				summary[result]++
 				summary["operations"]++
 				lines = append(lines, fmt.Sprintf("%s %s %s %s documented=%s -> %s", key.method, key.path, name, vis, yesNo(documented), result))
@@ -111,15 +117,21 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 	}
 	for _, name := range slices.Sorted(maps.Keys(report.accepted)) {
 		unit := report.accepted[name]
+		outcome := func(key operationKey) string {
+			if !unit.binding.enabled() {
+				return "503 disabled"
+			}
+			return reportOutcome(key, true, true, table, compiled.services)
+		}
 		for _, from := range slices.SortedFunc(maps.Keys(unit.aliases), compareOperationKeys) {
 			target := unit.aliases[from]
-			result := reportOutcome(from, true, true, table, compiled.services)
+			result := outcome(from)
 			summary[result]++
 			summary["rewrites"]++
 			lines = append(lines, fmt.Sprintf("%s %s %s rewrite to=%s:%s -> %s", from.method, from.path, name, target.service, target.key.path, result))
 		}
 		for _, extra := range unit.extras {
-			result := reportOutcome(extra.key, true, true, table, compiled.services)
+			result := outcome(extra.key)
 			summary[result]++
 			summary["extras"]++
 			auth := extraAuthNone
@@ -149,7 +161,8 @@ func writeReport(w io.Writer, regs []registration, bindings upstreamBindings) (b
 
 // reportOutcome says what a request for an operation's template gets: 404
 // internal, 404 unselected (left out by the service's operations), 404
-// unmatched, 503 closed (a bound service without an accepted contract), or
+// unmatched, 503 closed (a bound service without an accepted contract), 503
+// disabled (set by the caller for a disabled service), or
 // proxy with the authorization that applies: authz (the gateway's
 // authorizer), none (an anonymous operation) or backend (a backendAuth
 // service).
