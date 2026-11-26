@@ -462,7 +462,9 @@ func TestLoadRejectsSettingsDarbanWouldOverride(t *testing.T) {
 		"reserved": `{"hostname": "api.example.net", "openapi": {"yamlPath": "/docs/openapi.yaml"}, "services": {"docs": {}}}`,
 		"projected": `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80",
 			"authorization": {"path": "/authz", "responseHeaders": ["X-Forwarded-User"]}}`,
-		"alias": `{"hostname": "api.example.net", "upstreamRequestHeaders": ["True-Client-IP"]}`,
+		"alias":      `{"hostname": "api.example.net", "upstreamRequestHeaders": ["True-Client-IP"]}`,
+		"upgrade":    `{"hostname": "api.example.net", "upstreamRequestHeaders": ["Upgrade"]}`,
+		"connection": `{"hostname": "api.example.net", "upstreamRequestHeaders": ["Connection"]}`,
 	} {
 		if err := writeBindings(t, body); err == nil {
 			t.Errorf("%s: accepted", name)
