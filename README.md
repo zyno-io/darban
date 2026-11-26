@@ -86,7 +86,8 @@ and requires the configured identity headers before forwarding. It strips
 caller-supplied copies and any `authorization.stripHeaderPrefixes`.
 
 Use `security` to select the credential policy on each operation. To allow
-anonymous requests, set `security: []` and `x-darban-policy: anonymous`.
+anonymous requests, set `security: []` and `x-darban-policy: anonymous`. (This was
+`x-gateway-policy` before; Darban now rejects the old name.)
 Rewrites use the destination's credentials and schema. An internal source or
 destination suppresses the alias. An unlisted source or destination keeps it
 out of the document.

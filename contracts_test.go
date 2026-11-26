@@ -497,7 +497,7 @@ func TestAnonymousPolicyUsesDarbanExtension(t *testing.T) {
 		t.Fatal("combined OpenAPI exposed x-darban-policy")
 	}
 	_, err = compileStrict([]registration{{serviceName: "catalog", openAPI: contract("x-gateway-policy"), rewrites: "[]"}}, bindings)
-	if err == nil || !strings.Contains(err.Error(), "explicit credential policy required") {
+	if err == nil || !strings.Contains(err.Error(), "x-gateway-policy was renamed to x-darban-policy") {
 		t.Fatalf("expected the old x-gateway-policy name to be rejected, got %v", err)
 	}
 }
