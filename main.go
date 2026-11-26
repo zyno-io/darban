@@ -160,8 +160,13 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 			if r.In.Host != g.bindings.Hostname {
 				r.Out.Host = r.In.Host
 			}
-			params, _ := r.In.Context().Value(routeParamsKey{}).(map[string]routeParam)
-			r.Out.URL.Path, r.Out.URL.RawPath = upstreamPath(route.path, params)
+			params, _ := r.In.Context().Value(routeParamsKey{}).(map[string]string)
+			r.Out.URL.Path, r.Out.URL.RawPath = upstreamPath(route.path, params), ""
+			// HEAD can match a GET operation. Backends need not route HEAD, so
+			// send GET; the server drops the body for the HEAD caller.
+			if r.In.Method == http.MethodHead && route.key.method == http.MethodGet {
+				r.Out.Method = http.MethodGet
+			}
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
 			stripForwardedIdentity(r.Out.Header, g.bindings.Authorization)
 			for _, header := range g.bindings.UpstreamRequestHeaders {
@@ -197,24 +202,25 @@ type snapshot struct {
 	// services holds the effective binding of each served contract service.
 	services map[string]serviceBinding
 	unserved map[string]bool
-	// routes and denied are keyed by public path template. table matches
-	// requests against both; it is built on first use.
-	denied    map[operationKey]bool
-	routes    map[operationKey]registeredRoute
-	table     routeTable
-	tableOnce sync.Once
-	revision  string
-	specYAML  []byte
-	specJSON  []byte
+	// routes, denied and passthrough are keyed by public path template. table
+	// matches requests against them; it is built on first use.
+	denied      map[operationKey]bool
+	passthrough map[operationKey]bool
+	routes      map[operationKey]registeredRoute
+	table       routeTable
+	tableOnce   sync.Once
+	revision    string
+	specYAML    []byte
+	specJSON    []byte
 }
 
 func (s *snapshot) routeTable() routeTable {
-	s.tableOnce.Do(func() { s.table = newRouteTable(s.routes, s.denied) })
+	s.tableOnce.Do(func() { s.table = newRouteTable(s.routes, s.denied, s.passthrough) })
 	return s.table
 }
 
-func (s *snapshot) match(method string, r *http.Request, legacyPrefix string) routeMatch {
-	return s.routeTable().matchRequest(method, r, legacyPrefix)
+func (s *snapshot) match(method, raw, decoded, legacyPrefix string) routeMatch {
+	return s.routeTable().matchRequest(method, raw, decoded, legacyPrefix)
 }
 
 type routeParamsKey struct{}
@@ -275,6 +281,10 @@ func (g *gateway) build(compiled candidate) *snapshot {
 	for _, key := range compiled.denied {
 		active.denied[key] = true
 	}
+	active.passthrough = make(map[operationKey]bool, len(compiled.passthrough))
+	for _, key := range compiled.passthrough {
+		active.passthrough[key] = true
+	}
 	for _, route := range compiled.routes {
 		binding, found := compiled.services[route.service]
 		if !found {
@@ -298,9 +308,7 @@ func (g *gateway) build(compiled candidate) *snapshot {
 }
 
 func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request) {
-	// The escaped path, also for an absolute-form request target, so the prefix
-	// policy and the operation match see the same path.
-	path := r.URL.EscapedPath()
+	path, _, _ := strings.Cut(r.RequestURI, "?")
 	legacyPrefix := g.legacyPrefixes[r.Host]
 	if r.Host != g.bindings.Hostname && legacyPrefix == "" {
 		writeStatus(w, http.StatusNotFound)
@@ -371,7 +379,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	match := active.match(method, r, legacyPrefix)
+	match := active.match(method, path, r.URL.Path, legacyPrefix)
 	switch {
 	case match.denied || match.invalid:
 		writeStatus(w, http.StatusNotFound)

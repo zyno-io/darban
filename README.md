@@ -90,8 +90,18 @@ A schema's `discriminator` is imported with it. Each `mapping` value, a
 `#/components/schemas/X` reference or a bare `X`, imports `X` and is renamed
 like a `$ref`, to `#/components/schemas/<service>.X` or `<service>.X`. A
 discriminator has a string `propertyName`, an optional `mapping` of strings
-and `x-` extensions. Any other value under that key, such as the schema of a
-property named `discriminator`, is imported as a schema.
+and `x-` extensions, whose references are renamed too. Any other value under
+that key, such as the schema of a property named `discriminator`, is imported
+as a schema. Without a full `mapping`, a discriminator infers a value from
+each schema's name, which renaming would change. Darban therefore adds a
+`mapping` entry, under the original name, for each `oneOf` or `anyOf` schema,
+or each schema that extends the base schema with `allOf`, that no mapping
+value targets.
+
+Values under `example`, `default`, `const` and `enum` are data and are copied
+as written. Where those words are names instead, such as a property called
+`default` or the `default` response, their objects are imported and their
+references renamed.
 
 `openapi.prefixTags` controls how Darban groups operations for SDK generation.
 The default `all` prefixes every tag with the lower-camel-case service name
@@ -109,24 +119,32 @@ literal of `A-Z a-z 0-9 . _ ~ @ -` (but not `.` or `..`) or a whole
 such as `/files/{name}.txt`, a repeated parameter name, an empty segment and a
 trailing `/` are rejected, as are two operations with the same method and path
 shape, such as `GET /items/{id}` and `GET /items/{itemId}`. That includes
-`internal` operations.
+`internal` operations. An `internal` operation may have any path: it is
+denied as written, with a template inside a segment matching any text, so
+`/items{batch}` denies `/items:batch`.
 
-A request matches one segment at a time, a literal before a parameter, and
-backtracks when the rest of the path does not match. So `GET /items/new`
-wins over `GET /items/{id}`, and `/items/new/reviews` still matches
+A request matches one segment at a time: a literal, then an `internal`
+operation's in-segment template, then a parameter. It backtracks when the
+rest of the path does not match. So `GET /items/new` wins over
+`GET /items/{id}`, and `/items/new/reviews` still matches
 `/items/{id}/reviews`. A parameter matches one non-empty segment. The
-upstream receives the operation's upstream path with each parameter as the
-caller encoded it. `HEAD` matches a `GET` operation unless the contract
-declares `HEAD` for the path.
+upstream receives the operation's upstream path with the decoded parameters,
+escaped only where needed: the path that was matched, not the caller's
+spelling of it. `HEAD` matches a `GET` operation unless the contract declares
+`HEAD` for the path, and is then sent upstream as `GET`, so a backend need not
+route `HEAD`. The caller gets the response headers without the body.
 
-Only a canonical path matches an operation. A path that encodes `/` or `\`
-(`%2F`, `%5C`), or that `path.Clean` changes in anything but a trailing `/`
-(`//`, `.` or `..` segments), matches none. Such a path is still refused with
-`404` when its cleaned form names an `internal` or denied operation. On a prefix
-with a [direct Service route](#direct-service-routes) it otherwise goes to
-that route, with the route's own path policy, and elsewhere it returns `404`.
-A parameter that decodes to `.`, `..`, or a value with `/` or `\` returns
-`404`.
+When a service's bindings select `operations`, the unselected ones still
+take part in matching, so a selected template cannot capture their paths.
+On a prefix with a [direct Service route](#direct-service-routes) they go to
+that route with its own policy, and elsewhere they return `404`.
+
+Only a canonical path matches an operation (see
+[Direct Service routes](#direct-service-routes)), and a path whose first
+segment is encoded returns `404`. On a direct route a non-canonical path
+returns `404`, and elsewhere it matches no operation, so it also returns
+`404`. A parameter that decodes to `.`, `..`, or a value with `/` or `\`
+returns `404`.
 
 ## Operation visibility
 

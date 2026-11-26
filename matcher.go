@@ -4,7 +4,6 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
-	pathpkg "path"
 	"regexp"
 	"slices"
 	"strings"
@@ -34,15 +33,13 @@ func templatePath(path string) bool {
 	return true
 }
 
-// parameterSegment reports whether a template segment is a parameter. A
-// segment that only contains a template, as an internal operation's path may,
-// is treated as one too, so a denial covers every value it could stand for.
+// parameterSegment reports whether a template segment is a whole {name}.
 func parameterSegment(segment string) bool {
-	return strings.Contains(segment, "{")
+	return strings.HasPrefix(segment, "{") && strings.HasSuffix(segment, "}") && strings.Count(segment, "{") == 1
 }
 
-// pathShape replaces every parameter of a template with {}, so two templates
-// that match the same paths have the same shape.
+// pathShape replaces every whole parameter of a template with {}, so two
+// templates that match the same paths have the same shape.
 func pathShape(template string) string {
 	segments := strings.Split(template, "/")
 	for i, segment := range segments {
@@ -54,35 +51,63 @@ func pathShape(template string) string {
 }
 
 // routeTable matches a method and path against the public templates of the
-// routed and denied operations. Each segment tries a literal before a
-// parameter and backtracks when the rest of the path does not match.
+// denied, routed and passed-through operations. Each segment tries a literal,
+// then a pattern, then a parameter, and backtracks when the rest of the path
+// does not match.
 type routeTable map[string]*routeNode
 
 type routeNode struct {
 	literals map[string]*routeNode
+	// patterns hold segments with a template inside them, such as
+	// items{batch}. Only an internal operation can have one, so it is denied.
+	patterns []routePattern
 	param    *routeNode
 	entry    *routeEntry
 }
 
+type routePattern struct {
+	source string
+	match  *regexp.Regexp
+	node   *routeNode
+}
+
+type routeEntryKind int
+
+const (
+	entryDenied routeEntryKind = iota
+	entryRoute
+	// entryPassthrough is an operation the service's bindings leave
+	// unselected. It is not routed through the contract, but it keeps a
+	// selected template from capturing its path.
+	entryPassthrough
+)
+
 type routeEntry struct {
-	key    operationKey
-	denied bool
-	route  *registeredRoute
-	// params names the parameter at each segment position, "" for a literal.
+	key   operationKey
+	kind  routeEntryKind
+	route *registeredRoute
+	// params names the parameter at each segment position, "" for others.
 	params []string
 }
 
-func newRouteTable(routes map[operationKey]registeredRoute, denied map[operationKey]bool) routeTable {
+func newRouteTable(routes map[operationKey]registeredRoute, denied, passthrough map[operationKey]bool) routeTable {
 	table := make(routeTable)
+	// Denials first: compilation rejects two operations of one shape, and a
+	// denial wins wherever one could still overlap.
+	for _, key := range slices.SortedFunc(maps.Keys(denied), compareOperationKeys) {
+		table.add(&routeEntry{key: key, kind: entryDenied})
+	}
 	for _, key := range slices.SortedFunc(maps.Keys(routes), compareOperationKeys) {
 		route := routes[key]
-		table.add(&routeEntry{key: key, route: &route})
+		table.add(&routeEntry{key: key, kind: entryRoute, route: &route})
 	}
-	for _, key := range slices.SortedFunc(maps.Keys(denied), compareOperationKeys) {
-		table.add(&routeEntry{key: key, denied: true})
+	for _, key := range slices.SortedFunc(maps.Keys(passthrough), compareOperationKeys) {
+		table.add(&routeEntry{key: key, kind: entryPassthrough})
 	}
 	return table
 }
+
+var templateSegment = regexp.MustCompile(`\{[^{}]*\}`)
 
 func (t routeTable) add(entry *routeEntry) {
 	node := t[entry.key.method]
@@ -93,26 +118,34 @@ func (t routeTable) add(entry *routeEntry) {
 	segments := strings.Split(strings.TrimPrefix(entry.key.path, "/"), "/")
 	entry.params = make([]string, len(segments))
 	for i, segment := range segments {
-		if parameterSegment(segment) {
+		switch {
+		case parameterSegment(segment):
 			entry.params[i] = strings.Trim(segment, "{}")
 			if node.param == nil {
 				node.param = &routeNode{}
 			}
 			node = node.param
-			continue
+		case strings.Contains(segment, "{"):
+			index := slices.IndexFunc(node.patterns, func(p routePattern) bool { return p.source == segment })
+			if index < 0 {
+				parts := templateSegment.Split(segment, -1)
+				for j, part := range parts {
+					parts[j] = regexp.QuoteMeta(part)
+				}
+				node.patterns = append(node.patterns, routePattern{segment, regexp.MustCompile("^" + strings.Join(parts, ".+") + "$"), &routeNode{}})
+				index = len(node.patterns) - 1
+			}
+			node = node.patterns[index].node
+		default:
+			if node.literals == nil {
+				node.literals = make(map[string]*routeNode)
+			}
+			if node.literals[segment] == nil {
+				node.literals[segment] = &routeNode{}
+			}
+			node = node.literals[segment]
 		}
-		if node.literals == nil {
-			node.literals = make(map[string]*routeNode)
-		}
-		if node.literals[segment] == nil {
-			node.literals[segment] = &routeNode{}
-		}
-		node = node.literals[segment]
 	}
-	// Compilation rejects two operations of one shape. The one exception is an
-	// internal operation whose path is not a valid template, such as
-	// /files/{name}.txt on a direct route. It is denied as a parameter, but a
-	// routed operation of that shape, added first, keeps it.
 	if node.entry == nil {
 		node.entry = entry
 	}
@@ -128,6 +161,13 @@ func (n *routeNode) match(segments []string) *routeEntry {
 	if entry := n.literals[segments[0]].match(segments[1:]); entry != nil {
 		return entry
 	}
+	for _, pattern := range n.patterns {
+		if pattern.match.MatchString(segments[0]) {
+			if entry := pattern.node.match(segments[1:]); entry != nil {
+				return entry
+			}
+		}
+	}
 	if segments[0] != "" {
 		return n.param.match(segments[1:])
 	}
@@ -142,41 +182,26 @@ func (t routeTable) lookup(method string, segments []string) *routeEntry {
 	return t[http.MethodGet].match(segments)
 }
 
-// routeParam is one matched path parameter, as sent and decoded.
-type routeParam struct {
-	raw, decoded string
-}
-
 // routeMatch is the outcome of matching a request against the snapshot.
 type routeMatch struct {
 	denied bool
-	// route is set for a routed operation, with its parameters by name.
+	// route is set for a routed operation, with its decoded parameters.
 	route  *registeredRoute
-	params map[string]routeParam
+	params map[string]string
 	// invalid marks a routed match whose parameter decodes to ., .., or a
 	// value with / or \.
 	invalid bool
 }
 
-// matchRequest matches a request path, or a legacy host's path below its
-// prefix. Only a canonical path matches an operation: one that path.Clean
-// changes in more than a trailing slash, or that encodes / or \, matches
-// none. Such a path is still denied when its cleaned form names a denied
-// operation, so a direct route cannot reach it.
-func (t routeTable) matchRequest(method string, r *http.Request, legacyPrefix string) routeMatch {
-	raw, decoded := r.URL.EscapedPath(), r.URL.Path
-	if legacyPrefix != "" {
-		raw, decoded = legacyPrefix+raw, legacyPrefix+decoded
-	}
-	cleaned := pathpkg.Clean(decoded)
-	lower := strings.ToLower(raw)
-	canonical := !strings.Contains(lower, "%2f") && !strings.Contains(lower, "%5c") &&
-		(decoded == cleaned || decoded == cleaned+"/") && cleaned != "/"
-	if !canonical {
-		if entry := t.lookup(method, strings.Split(strings.TrimPrefix(cleaned, "/"), "/")); entry != nil && entry.denied {
-			return routeMatch{denied: true}
-		}
+// matchRequest matches a request path, as sent (raw, without the query) and
+// decoded, or a legacy host's path below its prefix. Only a canonical path
+// (see canonicalPath) matches an operation.
+func (t routeTable) matchRequest(method, raw, decoded, legacyPrefix string) routeMatch {
+	if !canonicalPath(raw, decoded) {
 		return routeMatch{}
+	}
+	if legacyPrefix != "" {
+		raw = legacyPrefix + raw
 	}
 	rawSegments := strings.Split(strings.TrimPrefix(strings.TrimSuffix(raw, "/"), "/"), "/")
 	segments := make([]string, len(rawSegments))
@@ -189,9 +214,9 @@ func (t routeTable) matchRequest(method string, r *http.Request, legacyPrefix st
 	}
 	entry := t.lookup(method, segments)
 	switch {
-	case entry == nil:
+	case entry == nil || entry.kind == entryPassthrough:
 		return routeMatch{}
-	case entry.denied:
+	case entry.kind == entryDenied:
 		return routeMatch{denied: true}
 	}
 	match := routeMatch{route: entry.route}
@@ -204,25 +229,25 @@ func (t routeTable) matchRequest(method string, r *http.Request, legacyPrefix st
 			return routeMatch{route: entry.route, invalid: true}
 		}
 		if match.params == nil {
-			match.params = make(map[string]routeParam)
+			match.params = make(map[string]string)
 		}
-		match.params[name] = routeParam{raw: rawSegments[i], decoded: value}
+		match.params[name] = value
 	}
 	return match
 }
 
-// upstreamPath fills a route's upstream template with the matched
-// parameters, as a decoded path and its escaped form.
-func upstreamPath(template string, params map[string]routeParam) (string, string) {
+// upstreamPath fills a route's upstream template with the matched, decoded
+// parameters. The proxy escapes the result, so the upstream gets exactly the
+// path that was matched, not the caller's spelling of it.
+func upstreamPath(template string, params map[string]string) string {
 	if len(params) == 0 {
-		return template, ""
+		return template
 	}
 	segments := strings.Split(template, "/")
-	escaped := slices.Clone(segments)
 	for i, segment := range segments {
-		if param, ok := params[strings.Trim(segment, "{}")]; ok && parameterSegment(segment) {
-			segments[i], escaped[i] = param.decoded, param.raw
+		if value, ok := params[strings.Trim(segment, "{}")]; ok && parameterSegment(segment) {
+			segments[i] = value
 		}
 	}
-	return strings.Join(segments, "/"), strings.Join(escaped, "/")
+	return strings.Join(segments, "/")
 }

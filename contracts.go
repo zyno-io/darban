@@ -284,7 +284,9 @@ type candidate struct {
 	// unserved lists public prefixes of bound services with no serving contract.
 	unserved []string
 	denied   []operationKey
-	routes   []compiledOperation
+	// passthrough lists operations left unselected by their bindings.
+	passthrough []operationKey
+	routes      []compiledOperation
 	// services holds the effective binding of every assembled service.
 	services map[string]serviceBinding
 	// aliasWarnings holds, by owning service, why a rewrite of that service is
@@ -523,16 +525,44 @@ func importComponent(service, kind, name string, source sourceDoc, out map[strin
 	if err != nil {
 		return "", err
 	}
+	// Without oneOf or anyOf, a base schema's discriminator infers the names of
+	// the schemas that extend it with allOf. Map them, since importing renames
+	// them.
+	if schema, ok := component.(map[string]any); ok && kind == "schemas" && schema["oneOf"] == nil && schema["anyOf"] == nil {
+		if _, ok := discriminatorObject(schema["discriminator"]); ok {
+			if err := mapInferredDiscriminator(component, expanded, schemasExtending(name, source), service, source, out); err != nil {
+				return "", err
+			}
+		}
+	}
 	out[kind][prefixed] = expanded
 	return prefixed, nil
 }
 
+// nameMaps are the fields whose keys are names, such as property names, and
+// whose values are objects to import. A name such as default or $ref is then
+// not a keyword.
+var nameMaps = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+	"responses", "headers", "content", "encoding", "links", "schemas", "requestBodies", "parameters", "securitySchemes"}
+
 func importReferences(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
+	return importValue(value, false, service, source, out)
+}
+
+func importValue(value any, names bool, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
 	switch item := value.(type) {
 	case map[string]any:
 		copy := make(map[string]any, len(item))
 		for _, key := range slices.Sorted(maps.Keys(item)) {
 			val := item[key]
+			if names {
+				expanded, err := importValue(val, false, service, source, out)
+				if err != nil {
+					return nil, err
+				}
+				copy[key] = expanded
+				continue
+			}
 			switch key {
 			case "$ref":
 				ref, _ := val.(string)
@@ -554,31 +584,41 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 					return nil, err
 				}
 				copy[key] = expanded
-			case "example", "examples", "default", "const", "enum":
+			case "example", "default", "const", "enum":
 				// Singular example and schema values contain data, not references.
-				// Examples maps can hold OpenAPI Reference Objects.
-				if key == "examples" {
-					expanded, err := importReferences(val, service, source, out)
-					if err != nil {
-						return nil, err
-					}
-					copy[key] = expanded
-				} else {
-					copy[key] = val
-				}
+				copy[key] = val
 			default:
-				expanded, err := importReferences(val, service, source, out)
+				_, isMap := val.(map[string]any)
+				expanded, err := importValue(val, isMap && slices.Contains(nameMaps, key), service, source, out)
 				if err != nil {
 					return nil, err
 				}
 				copy[key] = expanded
 			}
 		}
+		if !names {
+			// A discriminator without a full mapping infers each oneOf or anyOf
+			// schema's name. Map them, since importing renames them.
+			var candidates []string
+			for _, key := range []string{"oneOf", "anyOf"} {
+				alternatives, _ := item[key].([]any)
+				for _, alternative := range alternatives {
+					if ref, ok := alternative.(map[string]any)["$ref"].(string); ok {
+						if name, found := strings.CutPrefix(ref, "#/components/schemas/"); found {
+							candidates = append(candidates, name)
+						}
+					}
+				}
+			}
+			if err := mapInferredDiscriminator(item, copy, candidates, service, source, out); err != nil {
+				return nil, err
+			}
+		}
 		return copy, nil
 	case []any:
 		copy := make([]any, 0, len(item))
 		for _, element := range item {
-			expanded, err := importReferences(element, service, source, out)
+			expanded, err := importValue(element, false, service, source, out)
 			if err != nil {
 				return nil, err
 			}
@@ -590,47 +630,140 @@ func importReferences(value any, service string, source sourceDoc, out map[strin
 	}
 }
 
+// discriminatorObject returns a Discriminator Object: a string propertyName,
+// an optional mapping of strings, and x- extensions.
+func discriminatorObject(value any) (map[string]any, bool) {
+	object, ok := value.(map[string]any)
+	if _, named := object["propertyName"].(string); !ok || !named {
+		return nil, false
+	}
+	for key, field := range object {
+		switch {
+		case key == "propertyName" || strings.HasPrefix(key, "x-"):
+		case key == "mapping":
+			mapping, ok := field.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			for _, target := range mapping {
+				if _, ok := target.(string); !ok {
+					return nil, false
+				}
+			}
+		default:
+			return nil, false
+		}
+	}
+	return object, true
+}
+
+// mappedSchema returns the schema name a discriminator mapping value names.
+func mappedSchema(target string) (string, bool) {
+	name, _ := strings.CutPrefix(target, "#/components/schemas/")
+	return name, componentID.MatchString(name)
+}
+
 // importDiscriminator imports the schemas a Discriminator Object maps to and
 // renames its mapping values like a $ref. A mapping value is a schema
 // reference or a bare schema name, and keeps its form. Any other value, such
 // as the schema of a property named discriminator, is imported as a schema.
 func importDiscriminator(value any, service string, source sourceDoc, out map[string]map[string]any) (any, error) {
-	object, ok := value.(map[string]any)
-	if _, named := object["propertyName"].(string); !ok || !named {
+	object, ok := discriminatorObject(value)
+	if !ok {
 		return importReferences(value, service, source, out)
 	}
-	mapping, hasMapping := object["mapping"].(map[string]any)
-	for key := range object {
-		if key != "propertyName" && !strings.HasPrefix(key, "x-") && !(key == "mapping" && hasMapping) {
-			return importReferences(value, service, source, out)
-		}
-	}
-	for _, target := range mapping {
-		if _, ok := target.(string); !ok {
-			return importReferences(value, service, source, out)
-		}
-	}
-	imported := maps.Clone(object)
-	if hasMapping {
-		renamed := make(map[string]any, len(mapping))
-		for _, key := range slices.Sorted(maps.Keys(mapping)) {
-			target := mapping[key].(string)
-			name, isRef := strings.CutPrefix(target, "#/components/schemas/")
-			if !componentID.MatchString(name) {
-				return nil, fmt.Errorf("unsupported discriminator mapping %q", target)
+	imported := make(map[string]any, len(object))
+	for _, key := range slices.Sorted(maps.Keys(object)) {
+		switch {
+		case key == "propertyName":
+			imported[key] = object[key]
+		case key == "mapping":
+			mapping := object[key].(map[string]any)
+			renamed := make(map[string]any, len(mapping))
+			for _, value := range slices.Sorted(maps.Keys(mapping)) {
+				target := mapping[value].(string)
+				name, valid := mappedSchema(target)
+				if !valid {
+					return nil, fmt.Errorf("unsupported discriminator mapping %q", target)
+				}
+				prefixed, err := importComponent(service, "schemas", name, source, out)
+				if err != nil {
+					return nil, err
+				}
+				if strings.HasPrefix(target, "#/") {
+					prefixed = "#/components/schemas/" + prefixed
+				}
+				renamed[value] = prefixed
 			}
-			prefixed, err := importComponent(service, "schemas", name, source, out)
+			imported[key] = renamed
+		default:
+			expanded, err := importReferences(object[key], service, source, out)
 			if err != nil {
 				return nil, err
 			}
-			if isRef {
-				prefixed = "#/components/schemas/" + prefixed
-			}
-			renamed[key] = prefixed
+			imported[key] = expanded
 		}
-		imported["mapping"] = renamed
 	}
 	return imported, nil
+}
+
+// mapInferredDiscriminator adds a mapping entry for each candidate schema the
+// discriminator of the source schema would name implicitly: one that no
+// mapping value targets and no mapping key already claims. The entry keeps
+// the original name as the value and targets the renamed schema.
+func mapInferredDiscriminator(source any, imported any, candidates []string, service string, doc sourceDoc, out map[string]map[string]any) error {
+	original, _ := source.(map[string]any)
+	discriminator, ok := discriminatorObject(original["discriminator"])
+	copy, _ := imported.(map[string]any)
+	if !ok || copy == nil || len(candidates) == 0 {
+		return nil
+	}
+	explicit, _ := discriminator["mapping"].(map[string]any)
+	covered := make(map[string]bool, len(explicit))
+	for _, target := range explicit {
+		if name, valid := mappedSchema(target.(string)); valid {
+			covered[name] = true
+		}
+	}
+	result, _ := copy["discriminator"].(map[string]any)
+	mapping, _ := result["mapping"].(map[string]any)
+	added := false
+	for _, name := range candidates {
+		if _, claimed := explicit[name]; claimed || covered[name] {
+			continue
+		}
+		prefixed, err := importComponent(service, "schemas", name, doc, out)
+		if err != nil {
+			return err
+		}
+		if mapping == nil {
+			mapping = make(map[string]any)
+		}
+		mapping[name] = "#/components/schemas/" + prefixed
+		covered[name], added = true, true
+	}
+	if added {
+		result["mapping"] = mapping
+	}
+	return nil
+}
+
+// schemasExtending lists, in order, the schemas whose allOf references the
+// named schema directly.
+func schemasExtending(name string, source sourceDoc) []string {
+	var names []string
+	ref := "#/components/schemas/" + name
+	for _, other := range slices.Sorted(maps.Keys(source.Components["schemas"])) {
+		schema, _ := source.Components["schemas"][other].(map[string]any)
+		parts, _ := schema["allOf"].([]any)
+		if slices.ContainsFunc(parts, func(part any) bool {
+			value, _ := part.(map[string]any)
+			return value["$ref"] == ref
+		}) {
+			names = append(names, other)
+		}
+	}
+	return names
 }
 
 func parseOpenAPI(openAPI string) (sourceDoc, error) {
@@ -645,7 +778,11 @@ func parseOpenAPI(openAPI string) (sourceDoc, error) {
 	return source, nil
 }
 
-func readOperations(service string, source sourceDoc, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied *[]operationKey) error {
+// readOperations validates a contract's operations and collects them by public
+// key: the routable ones in native, the internal ones in denied, and in
+// passthrough those the binding's operations leave unselected, so a selected
+// template cannot capture their paths.
+func readOperations(service string, source sourceDoc, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied, passthrough *[]operationKey) error {
 	selected := make(map[operationKey]*legacySecurity, len(binding.Operations))
 	for _, operation := range binding.Operations {
 		key := operationKey{operation.Method, operation.Path}
@@ -663,10 +800,6 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 			value := item[key]
 			legacy, included := selected[operationKey{key, path}]
 			excluded := len(selected) != 0 && !included
-			_, direct := bindings.ServiceRoutes[binding.Prefix]
-			if excluded && !direct {
-				continue
-			}
 			if key == "parameters" || key == "servers" || key == "summary" || key == "description" || strings.HasPrefix(key, "x-") {
 				continue
 			}
@@ -681,16 +814,29 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
-			if visibility == visibilityInternal && direct {
-				if suffix, ok := strings.CutPrefix(path, binding.Mount); ok {
+			// Deny an internal operation whatever its path, even one that is not a
+			// valid template, such as /items{batch} or /items:batch, so no other
+			// template can capture it.
+			if visibility == visibilityInternal {
+				if suffix, ok := strings.CutPrefix(path, binding.Mount); ok && strings.HasPrefix(suffix, "/") {
 					*denied = append(*denied, operationKey{strings.ToUpper(key), binding.Prefix + suffix})
 				}
 			}
+			publicPath, mapped := binding.publicPath(path)
+			if mapped {
+				shape := operationKey{strings.ToUpper(key), pathShape(path)}
+				if other, exists := shapes[shape]; exists {
+					return fmt.Errorf("%s %s and %s %s have the same path shape", key, other, key, path)
+				}
+				shapes[shape] = path
+			}
 			if excluded {
+				if mapped && visibility != visibilityInternal {
+					*passthrough = append(*passthrough, operationKey{strings.ToUpper(key), publicPath})
+				}
 				continue
 			}
 			matched++
-			publicPath, mapped := binding.publicPath(path)
 			if !mapped {
 				if visibility == visibilityInternal {
 					continue
@@ -698,11 +844,6 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 				return fmt.Errorf("invalid or unmapped public path %q: each segment must be a literal or a whole {name}", path)
 			}
 			publicKey := operationKey{strings.ToUpper(key), publicPath}
-			shape := operationKey{publicKey.method, pathShape(path)}
-			if other, exists := shapes[shape]; exists {
-				return fmt.Errorf("%s %s and %s %s have the same path shape", key, other, key, path)
-			}
-			shapes[shape] = path
 			if visibility == visibilityInternal {
 				native[publicKey] = sourceOperation{visibility: visibilityInternal}
 				continue
@@ -787,6 +928,7 @@ type serviceUnit struct {
 	native        map[operationKey]sourceOperation
 	aliases       map[operationKey]aliasTarget
 	denied        []operationKey
+	passthrough   []operationKey
 	// warnings lists operations a docs-only unit leaves out of the document
 	// because its direct route would refuse them.
 	warnings []string
@@ -873,7 +1015,7 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 	if !binding.routed() && len(rules) != 0 {
 		return nil, errors.New("a service with route: false cannot define rewrites")
 	}
-	if err := readOperations(reg.serviceName, source, binding, fallback, bindings, unit.native, &unit.denied); err != nil {
+	if err := readOperations(reg.serviceName, source, binding, fallback, bindings, unit.native, &unit.denied, &unit.passthrough); err != nil {
 		return nil, err
 	}
 	if !binding.routed() {
@@ -1256,6 +1398,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		for _, key := range unit.denied {
 			deny(key, name)
 		}
+		out.passthrough = append(out.passthrough, unit.passthrough...)
 	}
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
@@ -1435,6 +1578,10 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	for _, key := range out.denied {
 		fmt.Fprintf(hash, "internal %s %s\n", key.method, key.path)
 		count(deniedBy[key], func(c *serviceCounts) { c.denied++ })
+	}
+	slices.SortFunc(out.passthrough, compareOperationKeys)
+	for _, key := range out.passthrough {
+		fmt.Fprintf(hash, "unselected %s %s\n", key.method, key.path)
 	}
 	out.revision = hex.EncodeToString(hash.Sum(nil))
 	return out, nil

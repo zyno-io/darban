@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,8 +89,8 @@ func TestTemplatedRoutesMatchLiteralFirstWithBacktracking(t *testing.T) {
 		{"POST", "/shop/items/42", 404, ""},
 		{"GET", "/shop/items", 404, ""},
 		{"GET", "/shop/items/42/reviews", 404, ""},
-		// HEAD is implied by GET.
-		{"HEAD", "/shop/items/42", 418, "HEAD /api/items/42"},
+		// HEAD is implied by GET, and sent upstream as GET.
+		{"HEAD", "/shop/items/42", 418, "GET /api/items/42"},
 		// Guards: no encoded separators and no path that Clean changes.
 		{"GET", "/shop/items/a%2Fb", 404, ""},
 		{"GET", "/shop/items/a%2fb/reviews/latest", 404, ""},
@@ -127,7 +128,7 @@ func TestExplicitHeadOperationWinsOverGet(t *testing.T) {
 	}
 }
 
-func TestDirectRouteKeepsItsGatingForNonCanonicalPaths(t *testing.T) {
+func TestDirectRouteGatesContractOperations(t *testing.T) {
 	bindings := shopBindings()
 	bindings.Services["shop"] = serviceBinding{Prefix: "/shop"}
 	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {BackendAuth: true, DeniedPaths: []string{"/items/9"}}}
@@ -140,17 +141,19 @@ func TestDirectRouteKeepsItsGatingForNonCanonicalPaths(t *testing.T) {
 		code                 int
 	}{
 		{"/shop/items/1", "GET /items/1", 418},
-		// Not canonical, so no contract match: the direct route proxies it as is.
-		{"/shop/items/a%2Fb", "GET /items/a%2Fb", 418},
-		// The cleaned form of a non-canonical path is still denied.
+		{"/shop/items/1/secret/", "", 404},
+		// A direct route refuses a non-canonical path outright.
+		{"/shop/items/a%2Fb", "", 404},
 		{"/shop/items//1/secret", "", 404},
 		{"/shop/items/1/x/../secret", "", 404},
-		{"/shop/items/1/secret/", "", 404},
-		// The direct route's path policy also gates contract operations, in
-		// either request-target form.
+		// The direct route's path policy also gates contract operations.
 		{"/shop/items/9", "", 404},
+		// An encoded prefix would match the contract operation for /shop
+		// without that policy.
+		{"/sh%6Fp/items/9", "", 404},
+		{"/%73hop/items/1/secret", "", 404},
+		// An absolute-form target has no path prefix to key the policy on.
 		{"https://api.example.net/shop/items/9", "", 404},
-		{"https://api.example.net/shop/items/8", "GET /items/8", 418},
 	} {
 		if code, upstream := h.do("GET", test.path); code != test.code || upstream != test.upstreamTarget {
 			t.Errorf("GET %s = %d %q, want %d %q", test.path, code, upstream, test.code, test.upstreamTarget)
@@ -275,9 +278,219 @@ func TestInternalPartialTemplateOnDirectRoute(t *testing.T) {
 		"  /files/{name}.txt:\n    get:\n      x-darban-visibility: internal\n",
 		"  /logs/{name}.txt:\n    get:\n      x-darban-visibility: internal\n",
 	)
-	for path, want := range map[string]int{"/shop/files/a.txt": 418, "/shop/logs/a.txt": 404, "/shop/logs/a": 404, "/shop/other": 418} {
+	// The internal pattern wins over the routed parameter. A path it does not
+	// match is still routed, or goes to the direct route.
+	for path, want := range map[string]int{"/shop/files/a.txt": 404, "/shop/files/a": 418, "/shop/logs/a.txt": 404, "/shop/logs/a": 418, "/shop/other": 418} {
 		if code, _ := h.do("GET", path); code != want {
 			t.Errorf("GET %s = %d, want %d", path, code, want)
+		}
+	}
+}
+
+func TestInternalOperationsWinOverTemplates(t *testing.T) {
+	// No direct route, so a denial is the only thing that keeps a template
+	// from reaching an internal operation.
+	h := newTemplateHarness(t, shopBindings(),
+		anonymousOperation("get", "/api/v1/{id}", "getItem"),
+		anonymousOperation("get", "/api/v2/{id}/{part}", "getPart"),
+		"  /api/v1/secret:\n    get:\n      x-darban-visibility: internal\n",
+		"  /api/v1/items{batch}:\n    get:\n      x-darban-visibility: internal\n",
+		"  /api/v1/jobs:run:\n    get:\n      x-darban-visibility: internal\n",
+		"  /api/v2/{id}/admin:\n    get:\n      x-darban-visibility: internal\n",
+	)
+	table := h.active.Load().routeTable()
+	for _, test := range []struct {
+		method, path string
+		key          operationKey
+		kind         routeEntryKind
+	}{
+		{"GET", "/shop/v1/secret", operationKey{"GET", "/shop/v1/secret"}, entryDenied},
+		{"HEAD", "/shop/v1/secret", operationKey{"GET", "/shop/v1/secret"}, entryDenied},
+		{"GET", "/shop/v1/items:batch", operationKey{"GET", "/shop/v1/items{batch}"}, entryDenied},
+		{"GET", "/shop/v1/jobs:run", operationKey{"GET", "/shop/v1/jobs:run"}, entryDenied},
+		{"GET", "/shop/v1/items", operationKey{"GET", "/shop/v1/{id}"}, entryRoute},
+		{"GET", "/shop/v1/42", operationKey{"GET", "/shop/v1/{id}"}, entryRoute},
+		{"GET", "/shop/v2/7/admin", operationKey{"GET", "/shop/v2/{id}/admin"}, entryDenied},
+		{"GET", "/shop/v2/7/other", operationKey{"GET", "/shop/v2/{id}/{part}"}, entryRoute},
+	} {
+		entry := table.lookup(test.method, strings.Split(strings.TrimPrefix(test.path, "/"), "/"))
+		if entry == nil || entry.key != test.key || entry.kind != test.kind {
+			t.Errorf("%s %s matched %+v, want %v %v", test.method, test.path, entry, test.key, test.kind)
+		}
+		want := 404
+		if test.kind == entryRoute {
+			want = 418
+		}
+		if code, _ := h.do(test.method, test.path); code != want {
+			t.Errorf("%s %s = %d, want %d", test.method, test.path, code, want)
+		}
+	}
+	for _, path := range []string{"/shop/v1//secret", "/shop/v1/x/../secret", "/shop/v1/a%2F..%2Fsecret", "/shop/v1/%2e%2e/v1/secret", "/sh%6Fp/v1/secret"} {
+		if code, upstream := h.do("GET", path); code != 404 || upstream != "" {
+			t.Errorf("GET %s = %d %q", path, code, upstream)
+		}
+	}
+}
+
+func TestSelectedTemplateDoesNotCaptureUnselectedOperations(t *testing.T) {
+	paths := []string{
+		anonymousOperation("get", "/items/{id}", "getItem"),
+		anonymousOperation("get", "/items/special", "getSpecial"),
+		"  /items/secret:\n    get:\n      x-darban-visibility: internal\n",
+	}
+	selection := []operationSelection{{Method: "get", Path: "/items/{id}"}}
+
+	// On a direct route, an unselected operation keeps the route's own policy.
+	direct := shopBindings()
+	direct.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
+	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {AuthProfiles: []string{"account"}, PublicPaths: []string{"/items/special"}}}
+	direct.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	h := newTemplateHarness(t, direct, paths...)
+	for path, want := range map[string]int{"/shop/items/1": 418, "/shop/items/special": 418, "/shop/items/secret": 404, "/shop/items/other/x": 401} {
+		if code, _ := h.do("GET", path); code != want {
+			t.Errorf("direct: GET %s = %d, want %d", path, code, want)
+		}
+	}
+	entry := h.active.Load().routeTable().lookup("GET", []string{"shop", "items", "special"})
+	if entry == nil || entry.kind != entryPassthrough {
+		t.Fatalf("unselected operation matched %+v", entry)
+	}
+
+	// Without a direct route, an unselected operation is not served at all.
+	plain := isolationBindings("shop")
+	plain.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
+	h = newTemplateHarness(t, plain, paths...)
+	for path, want := range map[string]int{"/shop/items/1": 418, "/shop/items/special": 404, "/shop/items/secret": 404} {
+		if code, _ := h.do("GET", path); code != want {
+			t.Errorf("plain: GET %s = %d, want %d", path, code, want)
+		}
+	}
+}
+
+func composedComponents(t *testing.T, contract string) (map[string]map[string]any, map[string]any) {
+	t.Helper()
+	got, report := compile([]registration{{serviceName: "zoo", rewrites: "[]", openAPI: contract}}, isolationBindings("zoo"), nil)
+	if rejection := report.services["zoo"].rejection; rejection != "" {
+		t.Fatal(rejection)
+	}
+	var document struct {
+		Paths      map[string]map[string]any `json:"paths"`
+		Components struct {
+			Schemas   map[string]map[string]any `json:"schemas"`
+			Responses map[string]any            `json:"responses"`
+		} `json:"components"`
+	}
+	if err := yaml.Unmarshal(got.specYAML, &document); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got.specYAML), "'#/components/schemas/Cat'") || strings.Contains(string(got.specYAML), "#/components/schemas/Tag\n") {
+		t.Fatalf("a reference was not renamed:\n%s", got.specYAML)
+	}
+	return document.Components.Schemas, document.Paths["/zoo/pets"]["get"].(map[string]any)
+}
+
+func TestReferencesUnderNamesThatAreKeywordsAreRenamed(t *testing.T) {
+	schemas, operation := composedComponents(t, `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Settings'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  responses:
+    Error: {description: Error}
+  schemas:
+    Settings:
+      type: object
+      default: {$ref: not-a-reference}
+      properties:
+        default: {anyOf: [{$ref: '#/components/schemas/Tag'}, {type: 'null'}]}
+        example: {$ref: '#/components/schemas/Tag'}
+        enum: {$ref: '#/components/schemas/Tag'}
+        const: {$ref: '#/components/schemas/Tag'}
+        $ref: {type: string}
+    Tag: {type: string}
+`)
+	properties := schemas["zoo.Settings"]["properties"].(map[string]any)
+	for _, name := range []string{"example", "enum", "const"} {
+		if ref := properties[name].(map[string]any)["$ref"]; ref != "#/components/schemas/zoo.Tag" {
+			t.Errorf("property %s: %v", name, ref)
+		}
+	}
+	if ref := properties["default"].(map[string]any)["anyOf"].([]any)[0].(map[string]any)["$ref"]; ref != "#/components/schemas/zoo.Tag" {
+		t.Errorf("property default: %v", ref)
+	}
+	if properties["$ref"].(map[string]any)["type"] != "string" {
+		t.Errorf("property $ref: %v", properties["$ref"])
+	}
+	// A schema's own default is data.
+	if schemas["zoo.Settings"]["default"].(map[string]any)["$ref"] != "not-a-reference" {
+		t.Errorf("default value changed: %v", schemas["zoo.Settings"]["default"])
+	}
+	if ref := operation["responses"].(map[string]any)["default"].(map[string]any)["$ref"]; ref != "#/components/responses/zoo.Error" {
+		t.Errorf("default response: %v", ref)
+	}
+}
+
+func TestDiscriminatorExtensionsAndInferredValues(t *testing.T) {
+	schemas, _ := composedComponents(t, `openapi: 3.1.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      security: []
+      x-darban-policy: anonymous
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf: [{$ref: '#/components/schemas/Pet'}, {$ref: '#/components/schemas/Animal'}]
+components:
+  schemas:
+    Pet:
+      oneOf: [{$ref: '#/components/schemas/Cat'}, {$ref: '#/components/schemas/Dog'}, {$ref: '#/components/schemas/Bird'}]
+      discriminator:
+        propertyName: kind
+        x-default: {$ref: '#/components/schemas/Cat'}
+        mapping: {hound: Dog}
+    Cat: {type: object}
+    Dog: {type: object}
+    Bird: {type: object}
+    Animal:
+      type: object
+      discriminator: {propertyName: species}
+    Fish:
+      allOf: [{$ref: '#/components/schemas/Animal'}, {type: object}]
+    Snake:
+      allOf: [{$ref: '#/components/schemas/Animal'}]
+`)
+	pet := schemas["zoo.Pet"]["discriminator"].(map[string]any)
+	if ref := pet["x-default"].(map[string]any)["$ref"]; ref != "#/components/schemas/zoo.Cat" {
+		t.Errorf("x- extension: %v", ref)
+	}
+	// Dog is mapped explicitly. Cat and Bird keep the values they inferred.
+	want := map[string]any{"hound": "zoo.Dog", "Cat": "#/components/schemas/zoo.Cat", "Bird": "#/components/schemas/zoo.Bird"}
+	if mapping := pet["mapping"].(map[string]any); !maps.Equal(mapping, want) {
+		t.Errorf("Pet mapping %v, want %v", mapping, want)
+	}
+	animal := schemas["zoo.Animal"]["discriminator"].(map[string]any)
+	want = map[string]any{"Fish": "#/components/schemas/zoo.Fish", "Snake": "#/components/schemas/zoo.Snake"}
+	if mapping, _ := animal["mapping"].(map[string]any); !maps.Equal(mapping, want) {
+		t.Errorf("Animal mapping %v, want %v", mapping, want)
+	}
+	for _, name := range []string{"zoo.Fish", "zoo.Snake"} {
+		if _, ok := schemas[name]; !ok {
+			t.Errorf("%s not imported", name)
 		}
 	}
 }
