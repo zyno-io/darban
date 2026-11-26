@@ -68,20 +68,24 @@ func TestServiceRouteCannotOverrideManagedOperationOrInternalPath(t *testing.T) 
 	defer upstream.Close()
 
 	bindings := upstreamBindings{
-		Hostname: "api.example.net", ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, AuthProfiles: []string{"account"}, PublicPaths: []string{"/tabs/*"}, DeniedPaths: []string{"/technician-rpc/*"}}},
+		Hostname: "api.example.net", ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, PublicPaths: []string{"/tabs/*"}, DeniedPaths: []string{"/technician-rpc/*"}}},
 		BrowserOrigins: []string{"https://app.example.net"},
 	}
 	gw := newGateway(bindings)
+	prices := operationKey{http.MethodGet, "/catalog/prices"}
 	active := &snapshot{
-		routes: map[operationKey]registeredRoute{{http.MethodGet, "/catalog/prices"}: {credentials: []string{"account"}}},
+		routed: map[string]bool{"/catalog": true},
+		routes: map[operationKey]registeredRoute{prices: {key: prices, protected: true, direct: "/catalog"}},
 		denied: map[operationKey]bool{{http.MethodGet, "/catalog/private"}: true, {http.MethodGet, "/catalog/internal/{id}"}: true},
 	}
 	for _, tc := range []struct {
 		method, path, origin string
 		want                 int
 	}{
-		{"GET", "/catalog/tabs/123", "", 200},
-		{"GET", "/catalog/tabs-other/123", "", 401},
+		// The routed service's contract decides: the route's path rules and
+		// public paths no longer let other paths through.
+		{"GET", "/catalog/tabs/123", "", 404},
+		{"GET", "/catalog/tabs-other/123", "", 404},
 		{"GET", "/catalog/technician-rpc", "", 404},
 		{"GET", "/catalog/prices", "", 401},
 		{"GET", "/catalog/%70rices/", "", 401},
@@ -140,24 +144,22 @@ func TestLegacyHostPreservesRequestAndEnforcesRoutePolicy(t *testing.T) {
 		Hostname: "api.example.net", Authz: authz.URL,
 		Authorization: authorizationConfig{
 			ResponseHeaders: []string{"X-Identity"},
-			Profiles: map[string]credentialProfile{
-				"account": {Scheme: "bearer", RequiredHeaders: []string{"X-Identity"}},
-			},
 		},
 		OpenAPI: openAPIConfig{JSONPath: "/openapi.json"},
 		ServiceRoutes: map[string]serviceRoute{
-			"/catalog": {Origin: upstream.URL, LegacyHosts: []string{host}, AllowedPaths: []string{"/items/*"}, AuthProfiles: []string{"account"}},
+			"/catalog": {Origin: upstream.URL, LegacyHosts: []string{host}, AllowedPaths: []string{"/items/*"}},
 		},
 	}
 	gw := newGateway(bindings)
-	active := &snapshot{denied: map[operationKey]bool{{http.MethodGet, "/catalog/items/private"}: true}}
+	// No routed service, so the route's own policy applies.
+	active := &snapshot{}
 	for _, tc := range []struct {
 		host, path, authorization string
 		want                      int
 	}{
 		{host, uri, "Bearer example", 307},
 		{host, uri, "", 401},
-		{host, "/items/%70rivate", "Bearer example", 404},
+		{host, "/other", "Bearer example", 404},
 		{host, "/openapi.json", "", 404},
 		{"other.example.net", uri, "Bearer example", 404},
 	} {
@@ -290,9 +292,8 @@ func TestProtectedServiceRouteChecksAuthzAndProjectsOnlyItsIdentity(t *testing.T
 		Hostname: "api.example.net", Authz: authz.URL,
 		Authorization: authorizationConfig{
 			Path: "/authorize", RequestHeaders: []string{"Content-Type"}, ResponseHeaders: []string{"X-Identity"},
-			Profiles: map[string]credentialProfile{"account": {Scheme: "bearer", RequiredHeaders: []string{"X-Identity"}}},
 		},
-		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL, AuthProfiles: []string{"account"}}},
+		ServiceRoutes: map[string]serviceRoute{"/catalog": {Origin: upstream.URL}},
 	}
 	gw := newGateway(bindings)
 	for _, authorized := range []bool{false, true} {

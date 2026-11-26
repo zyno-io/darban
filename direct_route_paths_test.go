@@ -26,11 +26,11 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 	const legacyHost = "legacy.example.net"
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authz: authz.URL,
-		Authorization: authorizationConfig{Path: "/authz", Profiles: map[string]credentialProfile{"account": {Scheme: "bearer"}}},
+		Authorization: authorizationConfig{Path: "/authz"},
 		ServiceRoutes: map[string]serviceRoute{
 			"/denied":  {Origin: upstream.URL, BackendAuth: true, DeniedPaths: []string{"/authz", "/zrpc/*"}, LegacyHosts: []string{legacyHost}},
 			"/allowed": {Origin: upstream.URL, BackendAuth: true, AllowedPaths: []string{"/open/*"}},
-			"/public":  {Origin: upstream.URL, AuthProfiles: []string{"account"}, PublicPaths: []string{"/tabs/*"}},
+			"/public":  {Origin: upstream.URL, PublicPaths: []string{"/tabs/*"}},
 		},
 	}
 	gw := newGateway(bindings)
@@ -119,9 +119,9 @@ func TestDirectRouteForwardsTheGatedPath(t *testing.T) {
 	defer upstream.Close()
 	bindings := upstreamBindings{
 		Hostname:      "api.example.net",
-		Authorization: authorizationConfig{Profiles: map[string]credentialProfile{"account": {Scheme: "bearer"}}},
+		Authorization: authorizationConfig{},
 		ServiceRoutes: map[string]serviceRoute{
-			"/suite": {Origin: upstream.URL, AuthProfiles: []string{"account"}, PublicPaths: []string{"/sdk/me"}},
+			"/suite": {Origin: upstream.URL, PublicPaths: []string{"/sdk/me"}},
 			"/shop":  {Origin: upstream.URL, BackendAuth: true, AllowedPaths: []string{"/sdk/me"}},
 		},
 	}
@@ -141,9 +141,8 @@ func TestDirectRouteForwardsTheGatedPath(t *testing.T) {
 func TestDirectRoutePreflightOnNonCanonicalPathIs404(t *testing.T) {
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", BrowserOrigins: []string{"https://app.example.net"},
-		Authorization: authorizationConfig{Profiles: map[string]credentialProfile{"account": {Scheme: "bearer"}}},
-		ServiceRoutes: map[string]serviceRoute{"/suite": {Origin: "http://suite.fixtures.svc.cluster.local:80",
-			AuthProfiles: []string{"account"}, DeniedPaths: []string{"/zrpc/*"}}},
+		Authorization: authorizationConfig{},
+		ServiceRoutes: map[string]serviceRoute{"/suite": {Origin: "http://suite.fixtures.svc.cluster.local:80", DeniedPaths: []string{"/zrpc/*"}}},
 	}
 	gw := newGateway(bindings)
 	for path, want := range map[string]int{"/suite/x": 204, "/suite/zrpc//../x": 404, "/suite/x/%2e%2e/zrpc/y": 404, "/suite/x%2Fy": 404} {

@@ -124,8 +124,7 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 			binding.Prefix = "/" + name
 		}
 	} else {
-		// A service with route: false routes nothing through its contract.
-		if !hasStatic || (static.Origin == "" && static.routed()) {
+		if !hasStatic {
 			return binding, "", fmt.Errorf("no upstream: set spec.upstream or bindings.services.%s.origin", name)
 		}
 		if reg.prefix != "" {
@@ -133,6 +132,19 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 		} else if binding.Prefix == "" {
 			binding.Prefix = "/" + name
 		}
+		// A routed service on a direct route falls back to the route's origin.
+		// A service with route: false routes nothing through its contract.
+		if route, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.Origin == "" && binding.routed() {
+			binding.Origin = route.Origin
+		}
+		if binding.Origin == "" && binding.routed() {
+			return binding, "", fmt.Errorf("no upstream: set spec.upstream or bindings.services.%s.origin", name)
+		}
+	}
+	// A routed service on a direct route uses the route's transport, so its
+	// upstream must be the route's origin.
+	if route, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.routed() && binding.Origin != "" && !sameOrigin(binding.Origin, route.Origin) {
+		return binding, "", fmt.Errorf("upstream %s differs from the serviceRoutes origin %s of %s", binding.Origin, route.Origin, binding.Prefix)
 	}
 
 	// Ownership of a direct serviceRoutes prefix comes from the bindings entry.
@@ -180,6 +192,15 @@ func resolveBinding(reg registration, bindings upstreamBindings) (serviceBinding
 		note = fmt.Sprintf("service %s: contract overrides bindings: %s", name, strings.Join(differences, "; "))
 	}
 	return binding, note, nil
+}
+
+// sameOrigin compares two validated origins by scheme, host and port, ignoring
+// case.
+func sameOrigin(a, b string) bool {
+	x, errX := url.Parse(a)
+	y, errY := url.Parse(b)
+	return errX == nil && errY == nil && strings.EqualFold(x.Scheme, y.Scheme) &&
+		strings.EqualFold(x.Hostname(), y.Hostname()) && effectivePort(x) == effectivePort(y)
 }
 
 // reservedPrefixes maps each first path segment Darban serves itself to a

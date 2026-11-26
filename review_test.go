@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -141,7 +139,7 @@ func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
 	rec.apply(func() ([]registration, error) {
 		return []registration{{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}}, nil
 	})
-	if got := probe("api.example.net", "/catalog/public/x"); got != http.StatusNoContent {
+	if got := probe("api.example.net", "/catalog/prices"); got != http.StatusNoContent {
 		t.Fatalf("served: %d", got)
 	}
 	for pass := 0; pass < 2; pass++ {
@@ -152,7 +150,7 @@ func TestDeletedContractFailsLegacyAndPublicPathsClosed(t *testing.T) {
 		}{
 			{"api.example.net", "/catalog/public/x", http.StatusServiceUnavailable},
 			{"catalog.example.net", "/public/x", http.StatusServiceUnavailable},
-			{"api.example.net", "/catalog/zrpc/x", http.StatusNotFound},
+			{"api.example.net", "/catalog/zrpc/x", http.StatusServiceUnavailable},
 		} {
 			if got := probe(test.host, test.path); got != test.want {
 				t.Errorf("pass %d: %s%s returned %d, want %d", pass, test.host, test.path, got, test.want)
@@ -338,40 +336,6 @@ func TestFirstSnapshotNeverWaitsOnContracts(t *testing.T) {
 	apply(contractFor("alpha", "/items", "listAlpha"))
 	if s := active.Load(); !slices.Equal(s.contractServices, []string{"alpha"}) || len(s.routes) != 1 {
 		t.Fatalf("snapshot is stale: %v", s.contractServices)
-	}
-}
-
-func TestSecurityRequirementSetsMatchBothWays(t *testing.T) {
-	a := securityRequirements{{"sessionBearer": {}}, {"clientBasic": {}}}
-	if !sameRequirementSet(a, securityRequirements{{"clientBasic": nil}, {"sessionBearer": {}}}) {
-		t.Fatal("order or nil scopes changed the result")
-	}
-	if sameRequirementSet(securityRequirements{{"sessionBearer": {}}, {"sessionBearer": {}}}, a) ||
-		sameRequirementSet(a, securityRequirements{{"sessionBearer": {}}, {"sessionBearer": {}}}) {
-		t.Fatal("a duplicate matched a distinct set")
-	}
-	allowed := fixtureAuthorization().Profiles
-	legacy := &legacySecurity{Source: securityRequirements{{"staffBearer": {}}}, Profiles: []string{"sessionBearer", "sessionBearer"}}
-	op := map[string]any{"security": []any{map[string]any{"sessionBearer": []any{}}, map[string]any{"clientBasic": []any{}}}}
-	source := &sourceDoc{}
-	if err := applyLegacySecurity(op, source, legacy, allowed); err == nil {
-		t.Fatal("a superset was accepted as the native target")
-	}
-	if err := legacy.validate(); err == nil {
-		t.Fatal("duplicate profiles accepted")
-	}
-	dupSource := &legacySecurity{Source: securityRequirements{{"a": {}}, {"a": {}}}, Profiles: []string{"sessionBearer"}}
-	if err := dupSource.validate(); err == nil {
-		t.Fatal("duplicate source requirements accepted")
-	}
-	raw := `{"hostname":"api.example.net","services":{"alpha":{"prefix":"/alpha","origin":"http://localhost:1",` +
-		`"operations":[{"method":"get","path":"/x","legacy":{"source":[{"a":[]}],"profiles":["p","p"]}}]}}}`
-	path := filepath.Join(t.TempDir(), "bindings.json")
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadBindings(path, true); err == nil || !strings.Contains(err.Error(), "duplicate legacy profiles") {
-		t.Fatalf("loadBindings = %v", err)
 	}
 }
 

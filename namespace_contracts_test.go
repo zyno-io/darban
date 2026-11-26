@@ -358,7 +358,7 @@ func TestContractPrefixCollidesWithBindingService(t *testing.T) {
 
 func TestContractPrefixCollidesWithServiceRoutes(t *testing.T) {
 	bindings := contractOnlyBindings()
-	bindings.ServiceRoutes = map[string]serviceRoute{"/legacy": {Origin: "http://legacy.zyno-alpha.svc.cluster.local:80"}, "/owned": {Origin: "http://owned.zyno-alpha.svc.cluster.local:80"}}
+	bindings.ServiceRoutes = map[string]serviceRoute{"/legacy": {Origin: "http://legacy.zyno-alpha.svc.cluster.local:80"}, "/owned": {Origin: "http://owner.zyno-alpha.svc.cluster.local:80"}}
 	bindings.Services["owner"] = serviceBinding{Origin: "http://owner.zyno-alpha.svc.cluster.local:80", Prefix: "/owned"}
 	regs := []registration{
 		clusterContract("intruder", "/items", "listIntruder", "http://intruder", "/legacy"),

@@ -20,7 +20,7 @@ func writeBindings(t *testing.T, body string) error {
 func TestBindingsRejectUnknownKeysAndTrailingData(t *testing.T) {
 	const valid = `{"hostname": "api.example.net",
 		"authz": "http://authz.fixtures.svc.cluster.local:3000",
-		"authorization": {"path": "/authz", "responseHeaders": ["X-Id"], "profiles": {"p": {"scheme": "bearer"}}},
+		"authorization": {"path": "/authz", "responseHeaders": ["X-Id"]},
 		"openapi": {"yamlPath": "/openapi.yaml"},
 		"serviceRoutes": {"/x": {"origin": "http://x.fixtures.svc.cluster.local:80", "backendAuth": true}},
 		"services": {"a": {"prefix": "/a", "operations": [{"method": "get", "path": "/a"}]}}}`
@@ -33,7 +33,6 @@ func TestBindingsRejectUnknownKeysAndTrailingData(t *testing.T) {
 		"operation":      strings.Replace(valid, `"path": "/a"}`, `"path": "/a", "bogus": 1}`, 1),
 		"service route":  strings.Replace(valid, `"backendAuth": true`, `"backendAuth": true, "bogus": []`, 1),
 		"authorization":  strings.Replace(valid, `"path": "/authz"`, `"path": "/authz", "bogus": ""`, 1),
-		"profile":        strings.Replace(valid, `"scheme": "bearer"`, `"scheme": "bearer", "bogus": []`, 1),
 		"openapi":        strings.Replace(valid, `"yamlPath"`, `"bogus": "", "yamlPath"`, 1),
 		"trailing value": valid + ` {}`,
 		"trailing junk":  valid + ` x`,

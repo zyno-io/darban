@@ -26,9 +26,64 @@ data after the JSON object, fails startup.
 
 `bindings.services` entries are optional overrides. A contract that sets
 `spec.upstream` needs none. Use an entry for what only bindings carry:
-`operations` (with `legacy`), `debugOrigin`, `route` and `publish`. Its
+`operations`, `extraRoutes`, `debugOrigin`, `route` and `publish`. Its
 `origin`, `prefix` and `mount` are the transition fallback for contracts
 that do not yet set `spec.upstream`, and are validated when present.
+
+## The proxy model
+
+For a routed service, Darban is a route-aware reverse proxy that authorizes
+before it routes:
+
+1. **Match.** The method and path must match one of the service's contract
+   operations (see [Operation paths](#operation-paths)) or one of its
+   [`extraRoutes`](#extra-routes).
+2. **Deny.** Anything else, and any `internal` operation, returns `404`.
+   Nothing falls through to a prefix proxy.
+3. **Authorize.** An operation with `x-darban-policy: anonymous`, and every
+   operation of a service whose direct route sets `backendAuth`, goes to the
+   backend with the caller's `Authorization` unchanged. Any other operation
+   goes to the [authorizer](#authorization-and-debug-routing) first, with the
+   caller's credentials as sent, whatever their scheme. A `2xx` answer
+   proceeds, and `401`, `403` and `429` pass back to the caller. The
+   contract's `security` and `securitySchemes` are documentation only: they
+   must say what the operation needs, but Darban decides nothing from them.
+4. **Proxy.** The upstream gets the identity headers the authorizer
+   returned, trusted as returned, instead of the credentials. Caller copies
+   of those headers and of `stripHeaderPrefixes` are always removed. Darban
+   does not validate bodies, queries or schemas.
+5. **Transport.** A service whose prefix has a
+   [direct route](#direct-service-routes) is served with that route's
+   transport. Otherwise it uses its contract upstream.
+
+A service with `route: false` keeps its traffic on its direct route instead
+(see [Route and publish](#route-and-publish)).
+
+### Extra routes
+
+`extraRoutes` on a routed service's binding lists paths it serves that its
+contract cannot declare, such as probes, static assets and event streams:
+
+```json
+"extraRoutes": [
+  {"method": "GET", "path": "/healthz", "auth": "none"},
+  {"method": "GET", "path": "/assets/*", "auth": "none"},
+  {"method": "GET", "path": "/events/{channel}", "auth": "gateway"}
+]
+```
+
+- `method` is one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or
+  `OPTIONS`, in capitals. `HEAD` matches a `GET` route as for operations.
+- `path` is an upstream path like an operation's, under the mount, and may
+  end in `/*` for a subtree, which also matches the path without it.
+- `auth` is `gateway` (the authorizer decides, which needs `authz`) or
+  `none` (the backend does). A `backendAuth` route takes only `none`.
+
+They use the same matcher and guards as operations. An operation of the same
+shape keeps its own path. Unknown keys, two routes of one method and path
+shape, a route on a `route: false` service and an invalid method, path or
+`auth` fail startup.
+They count as `routes` in `/status`, and never appear in the document.
 
 ### Route and publish
 
@@ -66,13 +121,6 @@ docs-only one, even when it has a last good contract.
 
 With `publish: false` a routed service's operations, and the rewrites into or
 out of it, are callable but left out of the document.
-
-An operation selection can carry a `legacy` block with the `source` security
-requirements and the target credential `profiles`. Darban replaces the source
-security with the target profiles. If the operation already declares exactly
-the target requirements, in any order, Darban accepts it unchanged, so a
-service can switch to the target security before the bindings drop `legacy`.
-Any other security is rejected as a legacy security mismatch.
 
 ## Public paths and SDK names
 
@@ -173,17 +221,32 @@ local contract entry's `defaultVisibility`. The service setting overrides
 
 ### Authorization and debug routing
 
-Use `authz` for the private origin and `authorization.path` for the HTTP
-authorizer path. Each `authorization.profiles` entry names an OpenAPI HTTP
-security scheme and specifies its `scheme` and `requiredHeaders`. The gateway
-forwards credentials, original request metadata, and `authorization.requestHeaders`
-to the authorizer. It projects only `authorization.responseHeaders` upstream
-and requires the configured identity headers before forwarding. It strips
-caller-supplied copies and any `authorization.stripHeaderPrefixes`.
+Set `authz` to the authorizer's private origin and `authorization` to how
+Darban talks to it:
 
-Use `security` to select the credential policy on each operation. To allow
+```json
+"authorization": {
+  "path": "/authz",
+  "requestHeaders": ["Content-Type", "X-Tenant"],
+  "responseHeaders": ["X-Identity", "X-Account"],
+  "stripHeaderPrefixes": ["X-Identity-"]
+}
+```
+
+- `path` is the authorizer path, requested with `GET`.
+- `requestHeaders` are copied from the request to the authorizer, with the
+  caller's `Authorization` and the original request as `X-Original-Method`,
+  `X-Original-URI` and `X-Original-URL`. A request without exactly one
+  non-empty `Authorization` header returns `401` without a call.
+- `responseHeaders` are the identity the authorizer returns. Darban sends
+  each single, non-empty one upstream, and removes caller copies of them
+  from every request.
+- `stripHeaderPrefixes` removes every request header with one of these
+  prefixes.
+
+Use `security` to state the credential policy on each operation. To allow
 anonymous requests, set `security: []` and `x-darban-policy: anonymous`.
-Rewrites use the destination's credentials and schema. An internal source or
+Rewrites use the destination's policy and schema. An internal source or
 destination suppresses the alias. An unlisted source or destination keeps it
 out of the document.
 
@@ -193,6 +256,8 @@ bindings. A request opts in by setting the debug header to `true`. The
 authorizer must return the required value in a projected header. The
 alternate Service must have a ready EndpointSlice. Otherwise the gateway
 uses the primary Service. A failure after dispatch is returned to the caller.
+A routed service on a direct route uses that route's transport, so it cannot
+have a `debugOrigin`.
 
 ### Combined OpenAPI endpoints
 
@@ -215,29 +280,62 @@ extensions from published operations.
 ## Direct Service routes
 
 `serviceRoutes` binds a single-segment path prefix to a private Kubernetes
-Service. A route chooses credential profiles for the gateway's authorization
-subrequest or explicitly sets `backendAuth` for an origin that authenticates
-requests itself. `publicPaths` lists exceptions to gateway authorization.
-`allowedPaths` can restrict the exposed surface and `deniedPaths` can exclude
-paths within it. A trailing `/*` matches a path subtree. The rules see the
-decoded path. A direct route returns `404` for a path that is not canonical:
+Service. By default the gateway authorizes its requests, which needs `authz`.
+Set `backendAuth` for an origin that authenticates requests itself.
+
+A routed service whose prefix has a direct route is served by its contract
+(see [The proxy model](#the-proxy-model)) with the route's transport: its
+`origin` and `upstreamHost`, timeouts and `longResponsePaths`, CORS mode,
+cookie and `Location` rewriting, `forwardTrustedClientIP`, `X-Original-*`
+headers and `legacyHosts`. Its contract upstream must have the route's
+origin (scheme, host and port, ignoring case), and without one it uses the
+route's origin. A rewrite, also one within the prefix, is sent to its
+target's path through the target's origin. Gateway CORS applies to the
+operations the gateway authorizes. Anonymous operations, `backendAuth` routes
+and `backendCORS` routes leave CORS to the backend, so a preflight from an
+origin outside `browserOrigins` reaches the backend. The route's path rules below do not
+apply to it, except for the operations its `operations` selection leaves
+out, which keep the route's own policy until the selection is removed.
+
+For a service with `route: false`, or a prefix with no routed service, the
+route's own policy decides. `publicPaths` lists exceptions to gateway
+authorization. `allowedPaths` can restrict the exposed surface and
+`deniedPaths` can exclude paths within it. A trailing `/*` matches a path
+subtree. The rules see the decoded path. A direct route returns `404` for a path that is not canonical:
 one with an empty, `.` or `..` segment (also when encoded), an encoded `/` or
 `\` (`%2F`, `%5C`), a `\`, or anything else `path.Clean` changes beyond one
 trailing `/`. It forwards the decoded path, re-encoded by Go's `url.URL` path
 escaping, not the caller's spelling, so `/sdk/m%65` reaches the backend as
 `/sdk/me` and `/a(1)` as `/a%281%29`.
 Darban also returns `404` for a request whose first path segment is encoded.
-Registered operations
-and internal-route exclusions take precedence.
 
 `browserOrigins` lists the exact origins for gateway CORS, and
-`upstreamRequestHeaders` allows safe request metadata. Protected service
-routes receive the identity returned by the authorizer. Backend-authenticated
-routes receive the original credentials and request metadata.
+`upstreamRequestHeaders` allows safe request metadata. Requests the gateway
+authorizes carry the identity returned by the authorizer. Others carry the
+original credentials, and those on `backendAuth` routes also the original
+request metadata and the `authorization.requestHeaders` that name no
+identity. A caller's copy of an identity header, one of
+`authorization.responseHeaders` or with a stripped prefix, is removed even
+there, unless the route lists it in `forwardRequestHeaders`, for example
+tenant selectors an authenticating backend reads:
+
+```json
+"/auth": {"origin": "http://auth.zyno-alpha.svc.cluster.local:3000", "backendAuth": true,
+  "forwardRequestHeaders": ["X-Tenant", "X-Account"]}
+```
+
+`forwardRequestHeaders` needs `backendAuth`, and cannot name
+`Authorization`, `Host`, `Forwarded`, `X-Real-IP`, `X-Forwarded-*` or
+`X-Original-*`.
 Same-service redirects and cookie paths are scoped to the gateway prefix.
 
 Set `backendCORS` to let a direct Service handle its own CORS responses,
-including preflight. Set `forwardTrustedClientIP` only when the HTTP listener
+including preflight. A real preflight, an `OPTIONS` request whose
+`Access-Control-Request-Method` names another method, then reaches the
+backend without authorization, since it carries no credentials, whether or
+not `browserOrigins` is set. For a routed service it must be for a path and
+method the contract serves, and a contract `OPTIONS` operation on the path is
+served as itself, with its own policy. Set `forwardTrustedClientIP` only when the HTTP listener
 is reachable exclusively through an ingress that overwrites `X-Real-IP` with
 the verified connection address. On those Service routes, Darban forwards a
 single valid IP address and returns 503 if the header is missing or invalid.
@@ -316,10 +414,11 @@ version if it had one, when:
   (its `prefix`, or `/<name>` when it has none, `route: false` included),
   whether or not that service has a contract yet;
 - its prefix has a `serviceRoutes` direct route and its upstream (or bindings
-  `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`, so
-  a mount would make its `internal` deny list miss the public paths. A
-  `bindings.services` entry that combines a `mount` with a `serviceRoutes`
-  prefix is a startup error;
+  `mount`) has a path. A direct route proxies `<prefix>/X` to upstream `X`,
+  so it cannot add a mount. A `bindings.services` entry that combines a
+  `mount` with a `serviceRoutes` prefix is a startup error;
+- it is routed, its prefix has a `serviceRoutes` direct route, and its
+  upstream is not that route's origin;
 - its prefix is the first path segment of `openapi.yamlPath`,
   `openapi.jsonPath` or `authorization.path`, which Darban serves or reserves.
 
@@ -353,7 +452,7 @@ helm upgrade --install darban ./charts/darban --namespace darban -f values.local
 
 Register `api-contract-catalog` in the same namespace. The example API
 must declare anonymous operations explicitly. To serve protected operations,
-configure an authorizer and credential profiles as described above. The
+configure an authorizer as described above. The
 chart creates a ClusterIP Service. Set `ingress.enabled`, `ingress.namespace`,
 and `ingress.gatewayName` to restrict its traffic port to a Gateway API
 controller's labeled pods.
@@ -394,7 +493,7 @@ block the others once the gateway is running.
   when it sets `spec.upstream`. Without an upstream or a bindings origin it is
   rejected, logged, and reported in `/status`.
 - If a service's contract fails to compile (invalid OpenAPI or visibility,
-  legacy security mismatch, bad rewrites, unreadable `GatewayContract`), Darban
+  missing credential policy, bad rewrites, unreadable `GatewayContract`), Darban
   keeps that service's last good compiled contract. Without one, the service
   is omitted. The other services update normally.
 - A service with no accepted contract is not installed: its public prefix
@@ -402,11 +501,10 @@ block the others once the gateway is running.
   `bindings.services` entry with no contract, and a deleted `GatewayContract`.
   Only a bad **update** keeps the service's last good unit in memory; deleting
   the contract removes the service.
-- A service whose prefix has a `serviceRoutes` direct route (proxy-all minus
-  the `internal` operations) needs its contract to know those operations.
-  With no good contract, including after the contract was deleted, only that
-  direct route fails closed with `503` until a good contract arrives, exactly
-  as on a fresh pod. Rewrites into a service that is not installed are denied.
+- A routed service whose prefix has a `serviceRoutes` direct route serves
+  only what its contract declares. With no good contract, including after
+  the contract was deleted, only that direct route fails closed with `503`
+  until a good contract arrives, exactly as on a fresh pod. Rewrites into a service that is not installed are denied.
   Services with `route: false` keep proxying through `serviceRoutes`.
 - Checks across services still apply: duplicate `operationId` values, routes
   that shadow the OpenAPI endpoints, and prefix collisions. Darban first keeps every service's last good contract, then tries
