@@ -496,9 +496,9 @@ func TestAnonymousPolicyUsesDarbanExtension(t *testing.T) {
 	if strings.Contains(string(compiled.specYAML), "x-darban-policy") {
 		t.Fatal("combined OpenAPI exposed x-darban-policy")
 	}
-	_, err = compileStrict([]registration{{serviceName: "catalog", openAPI: contract("x-gateway-policy"), rewrites: "[]"}}, bindings)
-	if err == nil || !strings.Contains(err.Error(), "x-gateway-policy was renamed to x-darban-policy") {
-		t.Fatalf("expected the old x-gateway-policy name to be rejected, got %v", err)
+	_, err = compileStrict([]registration{{serviceName: "catalog", openAPI: contract("x-other-policy"), rewrites: "[]"}}, bindings)
+	if err == nil || !strings.Contains(err.Error(), "explicit credential policy required") {
+		t.Fatalf("expected only x-darban-policy to make an operation anonymous, got %v", err)
 	}
 }
 
