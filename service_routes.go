@@ -61,13 +61,21 @@ func (b *upstreamBindings) validateServiceRoutes(local bool) error {
 				return fmt.Errorf("service route %q requires a positive duration and paths for extended responses", prefix)
 			}
 		}
+		if len(route.ForwardRequestHeaders) > 0 && !route.BackendAuth {
+			return fmt.Errorf("service route %q sets forwardRequestHeaders, which needs backendAuth", prefix)
+		}
 		for i, header := range route.ForwardRequestHeaders {
 			canonical := http.CanonicalHeaderKey(header)
-			if !route.BackendAuth || !httpguts.ValidHeaderFieldName(header) || canonical == "Authorization" || canonical == "Host" ||
-				slices.Contains(forwardedMetadata, canonical) || strings.HasPrefix(canonical, "X-Forwarded-") || canonical == "Forwarded" ||
-				canonical == "X-Real-Ip" || slices.Contains(route.ForwardRequestHeaders[:i], header) {
-				return fmt.Errorf("service route %q cannot forward request header %q (forwardRequestHeaders needs backendAuth)", prefix, header)
+			switch {
+			case !httpguts.ValidHeaderFieldName(header):
+				return fmt.Errorf("service route %q: invalid forwardRequestHeaders entry %q", prefix, header)
+			case canonical == "Authorization" || canonical == "Host" || slices.Contains(forwardedMetadata, canonical) ||
+				strings.HasPrefix(canonical, "X-Forwarded-") || canonical == "Forwarded" || canonical == "X-Real-Ip":
+				return fmt.Errorf("service route %q cannot forward request header %q, which Darban manages", prefix, header)
+			case slices.Contains(route.ForwardRequestHeaders[:i], canonical):
+				return fmt.Errorf("service route %q lists forwardRequestHeaders entry %q twice", prefix, header)
 			}
+			// Earlier entries are already canonical.
 			route.ForwardRequestHeaders[i] = canonical
 		}
 		for _, paths := range [][]string{route.PublicPaths, route.AllowedPaths, route.DeniedPaths, route.LongResponsePaths} {
