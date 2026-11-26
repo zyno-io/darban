@@ -73,9 +73,8 @@ func TestServiceRouteCannotOverrideManagedOperationOrInternalPath(t *testing.T) 
 	}
 	gw := newGateway(bindings)
 	active := &snapshot{
-		routes:          map[operationKey]registeredRoute{{http.MethodGet, "/catalog/prices"}: {credentials: []string{"account"}}},
-		denied:          map[operationKey]bool{{http.MethodGet, "/catalog/private"}: true},
-		deniedTemplates: []operationKey{{http.MethodGet, "/catalog/internal/{id}"}},
+		routes: map[operationKey]registeredRoute{{http.MethodGet, "/catalog/prices"}: {credentials: []string{"account"}}},
+		denied: map[operationKey]bool{{http.MethodGet, "/catalog/private"}: true, {http.MethodGet, "/catalog/internal/{id}"}: true},
 	}
 	for _, tc := range []struct {
 		method, path, origin string

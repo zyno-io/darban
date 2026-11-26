@@ -48,9 +48,8 @@ under `contractServices`. It has no traffic effect: it adds no routes and no
 denials, and the service's direct route keeps its own gating. The contract is
 optional, and a rejected one changes only the document. Such a service cannot
 select `operations` or define rewrites, and rewrites into it are denied with a
-warning on their owner. Its paths may be templates, such as `/items/{id}`,
-where each segment is a literal (`[A-Za-z0-9._~@-]+`, not `.` or `..`) or a
-whole `{name}`. Its component references are checked only when it publishes.
+warning on their owner. Its component references are checked only when it
+publishes.
 
 `route: false` with `publish: true` documents the service's public operations
 while its traffic stays on the direct route. It needs an explicit `prefix` that
@@ -87,6 +86,25 @@ The composed OpenAPI preserves upstream `operationId` values and rejects
 duplicates among published operations. A rewrite keeps the ID of the
 original route when it has one.
 
+A schema's `discriminator` is imported with it. Each `mapping` value, a
+`#/components/schemas/X` reference or a bare `X`, imports `X` and is renamed
+like a `$ref`, to `#/components/schemas/<service>.X` or `<service>.X`. A
+discriminator has a string `propertyName`, an optional `mapping` of strings
+and `x-` extensions, whose references are renamed too. Any other shape is
+rejected. A property named `discriminator` is a name, not a discriminator, and
+is imported as a schema. Without a full `mapping`, a discriminator infers a
+value from each schema's name, which renaming would change. Darban therefore
+adds a `mapping` entry, under the original name, for each `oneOf` or `anyOf`
+schema that no mapping value targets. For a base schema without `oneOf` or
+`anyOf`, it does the same for each schema that extends it with `allOf` and
+that a published operation already references. It never publishes an
+extender for this alone.
+
+Values under `example`, `default`, `const` and `enum`, an Example Object's
+`value` and a schema's list of `examples` are data and are copied as written. Where those words are names instead, such as a property called
+`default`, the `default` response or a `default` entry under `examples`,
+their objects are imported and their references renamed.
+
 `openapi.prefixTags` controls how Darban groups operations for SDK generation.
 The default `all` prefixes every tag with the lower-camel-case service name
 and capitalizes the first letter of the upstream tag. For example, `items`
@@ -94,6 +112,50 @@ in `book-catalog` becomes `bookCatalogItems`. Set `firstOnly` to prefix the
 first tag and leave the rest as written. Set `openapi.populateEmptyTags` to
 `true` to add the service name as the tag when an operation has none. This
 setting defaults to `false`.
+
+## Operation paths
+
+An operation path below the mount is a sequence of segments. Each is a
+literal of `A-Z a-z 0-9 . _ ~ @ -` (but not `.` or `..`) or a whole
+`{name}` parameter, such as `/items/{id}/reviews`. A template within a segment,
+such as `/files/{name}.txt`, a repeated parameter name, an empty segment and a
+trailing `/` are rejected, as are two operations with the same method and path
+shape, such as `GET /items/{id}` and `GET /items/{itemId}`. That includes
+`internal` operations. An `internal` operation may have any path: it is
+denied as written, with a template inside a segment matching one or more
+characters, so `/items{batch}` denies `/items:batch`. That also denies
+`/itemsX`, which fails closed.
+
+A request matches one segment at a time: a literal, then an `internal`
+operation's in-segment template, then a parameter. It backtracks when the
+rest of the path does not match. So `GET /items/new` wins over
+`GET /items/{id}`, and `/items/new/reviews` still matches
+`/items/{id}/reviews`. A parameter matches one non-empty segment. The
+upstream receives the operation's upstream path with the decoded parameters,
+re-encoded by Go's `url.URL` path escaping: the path that was matched, not the
+caller's spelling of it. `HEAD` matches a `GET` operation unless the contract declares
+`HEAD` for the path, and is then sent upstream as `GET`, so a backend need not
+route `HEAD`. The caller gets the response headers without the body.
+
+When a service's bindings select `operations`, the unselected ones still
+take part in matching, as written like `internal` ones, so a selected template
+cannot capture their paths. A template inside an unselected operation's
+segment may claim more than the backend's literal does, so a match through
+one is provisional. If the path, matched again without such templates,
+reaches an `internal` or a selected operation at any depth, it returns
+`404`. The direct route would skip a selected operation's authorization, and
+routing the path to it could capture the unselected one. With an unselected
+`/v1/items{batch}` and an internal `/{ver}/{id}`, or a selected `/v1/{c}`,
+`/v1/itemsZ` and `/v1/items:batch` both return `404`.
+On a prefix with a [direct Service route](#direct-service-routes) they go to
+that route with its own policy, and elsewhere they return `404`.
+
+Only a canonical path matches an operation (see
+[Direct Service routes](#direct-service-routes)), and a path whose first
+segment is encoded returns `404`. On a direct route a non-canonical path
+returns `404`, and elsewhere it matches no operation, so it also returns
+`404`. A parameter that decodes to `.`, `..`, or a value with `/` or `\`
+returns `404`.
 
 ## Operation visibility
 
