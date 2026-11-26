@@ -43,7 +43,8 @@ var forwardedMetadata = []string{"X-Original-Method", "X-Original-URI", "X-Origi
 
 // hopByHopHeaders belong to one connection, so they are never copied to the
 // authorizer or an upstream.
-var hopByHopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+var hopByHopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "Te",
+	"Trailer", "Transfer-Encoding", "Upgrade"}
 
 func (a *authorizationConfig) validate(origin string) error {
 	if (origin != "" || a.Path != "") && (origin == "" || a.Path != "/" && !docPath.MatchString(a.Path)) {

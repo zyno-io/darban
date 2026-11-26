@@ -421,13 +421,22 @@ func loadBindings(path string, local bool) (upstreamBindings, error) {
 // parses; a reload skips that, since upstreamTLS cannot change at runtime and
 // the verifier re-reads the file on its own.
 func readBindings(path string, local, readCA bool) (upstreamBindings, string, error) {
-	raw, err := os.ReadFile(path)
+	raw, revision, err := readBindingsFile(path)
 	if err != nil {
 		return upstreamBindings{}, "", err
 	}
-	sum := sha256.Sum256(raw)
 	bindings, err := parseBindings(raw, path, local, readCA)
-	return bindings, hex.EncodeToString(sum[:]), err
+	return bindings, revision, err
+}
+
+// readBindingsFile reads a bindings file and the SHA-256 of its content.
+func readBindingsFile(path string) ([]byte, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return raw, hex.EncodeToString(sum[:]), nil
 }
 
 func parseBindings(raw []byte, path string, local, readCA bool) (upstreamBindings, error) {
