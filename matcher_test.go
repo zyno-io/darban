@@ -536,7 +536,9 @@ func TestUnselectedOperationsCountAsWritten(t *testing.T) {
 		unselected int
 	}{"direct": {direct, 401}, "plain": {plain, 404}} {
 		h := newTemplateHarness(t, test.bindings, paths...)
-		for path, want := range map[string]int{"/shop/v1/things": 418, "/shop/v1/items:batch": test.unselected, "/shop/v1/jobs:run": test.unselected} {
+		// items{batch} is a pattern, so its match is provisional, and the
+		// selected template also claims the path: it is refused either way.
+		for path, want := range map[string]int{"/shop/v1/things": 418, "/shop/v1/items:batch": 404, "/shop/v1/jobs:run": test.unselected} {
 			if code, _ := h.do("GET", path); code != want {
 				t.Errorf("%s: GET %s = %d, want %d", name, path, code, want)
 			}
@@ -656,6 +658,26 @@ func TestPassthroughPatternNeverShadowsAnAncestorInternalParameter(t *testing.T)
 		"  /{ver}/{id}:\n    get:\n      x-darban-visibility: internal\n",
 	)
 	for path, want := range map[string]int{"/shop/v1/itemsZ": 404, "/shop/v1/items:batch": 404, "/shop/v2/itemsZ": 404, "/shop/v1/other": 404, "/shop/sel": 418} {
+		if code, _ := h.do("GET", path); code != want {
+			t.Errorf("GET %s = %d, want %d", path, code, want)
+		}
+	}
+}
+
+func TestPassthroughPatternNeverSkipsASelectedOperationsAuthorization(t *testing.T) {
+	bindings := shopBindings()
+	bindings.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: []operationSelection{{Method: "get", Path: "/v1/{c}"}}}
+	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {BackendAuth: true}}
+	bindings.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	h := newTemplateHarness(t, bindings,
+		"  /v1/{c}:\n    get:\n      operationId: c\n      security: [{account: []}]\n      responses: {'200': {description: OK}}\n",
+		anonymousOperation("get", "/v1/items{batch}", "batch"),
+		"components:\n  securitySchemes:\n    account: {type: http, scheme: bearer}\n",
+	)
+	// TSF runs the selected /v1/:c for /v1/itemsZ, which needs credentials.
+	// The direct route would skip that, and routing it to the contract could
+	// capture the unselected literal, so it is refused.
+	for path, want := range map[string]int{"/shop/v1/other": 401, "/shop/v1/itemsZ": 404, "/shop/v1/items:batch": 404} {
 		if code, _ := h.do("GET", path); code != want {
 			t.Errorf("GET %s = %d, want %d", path, code, want)
 		}

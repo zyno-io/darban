@@ -142,9 +142,11 @@ take part in matching, as written like `internal` ones, so a selected template
 cannot capture their paths. A template inside an unselected operation's
 segment may claim more than the backend's literal does, so a match through
 one is provisional. If the path, matched again without such templates,
-reaches an `internal` operation at any depth, it returns `404`. With an
-unselected `/v1/items{batch}` and an internal `/{ver}/{id}`, `/v1/itemsZ` and
-`/v1/items:batch` both return `404`.
+reaches an `internal` or a selected operation at any depth, it returns
+`404`. The direct route would skip a selected operation's authorization, and
+routing the path to it could capture the unselected one. With an unselected
+`/v1/items{batch}` and an internal `/{ver}/{id}`, or a selected `/v1/{c}`,
+`/v1/itemsZ` and `/v1/items:batch` both return `404`.
 On a prefix with a [direct Service route](#direct-service-routes) they go to
 that route with its own policy, and elsewhere they return `404`.
 

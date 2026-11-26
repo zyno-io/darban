@@ -186,14 +186,20 @@ func (n *routeNode) match(segments []string, strict, patterned bool) (*routeEntr
 // A pattern segment such as items{batch} is looser than the backend's
 // literal (items:batch), so a passthrough entry reached through one is
 // provisional: the backend may give the path to a parameter route instead.
-// If the path also reaches a denied entry once such passthroughs are set
-// aside, the denial wins.
+// The path is matched again with such passthroughs set aside. If that reaches
+// a denied entry, the denial wins. If it reaches a routed operation, the path
+// is denied too: passing it through would skip that operation's
+// authorization, and routing it could capture the unselected operation.
 func (t routeTable) lookup(method string, segments []string) *routeEntry {
 	find := func(method string) *routeEntry {
 		entry, patterned := t[method].match(segments, false, false)
 		if entry != nil && entry.kind == entryPassthrough && patterned {
-			if strict, _ := t[method].match(segments, true, false); strict != nil && strict.kind == entryDenied {
+			switch strict, _ := t[method].match(segments, true, false); {
+			case strict == nil || strict.kind == entryPassthrough:
+			case strict.kind == entryDenied:
 				return strict
+			default:
+				return &routeEntry{key: strict.key, kind: entryDenied}
 			}
 		}
 		return entry
