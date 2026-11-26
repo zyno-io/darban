@@ -287,7 +287,7 @@ func TestBindingsReloadRacesWithContractUpdates(t *testing.T) {
 	}
 }
 
-func TestBindingsReloadRecompilesWhenARewriteTargetGoes(t *testing.T) {
+func TestBindingsReloadKeepsServingWhenARewriteTargetGoes(t *testing.T) {
 	origin := teapotUpstream(t)
 	withLegacy := fmt.Sprintf(`{"hostname": "api.example.net", "services": {"alpha": {"origin": %q}, "beta": {"origin": %q}, "legacy": {"origin": %q}}}`, origin, origin, origin)
 	r := newReloadRig(t, withLegacy)
@@ -297,12 +297,23 @@ func TestBindingsReloadRecompilesWhenARewriteTargetGoes(t *testing.T) {
 	if r.get("/alpha/items") != http.StatusTeapot {
 		t.Fatal("alpha not served")
 	}
-	// Without legacy in the bindings, alpha's rewrite is outside them, as a
-	// fresh pod would find: the unit is compiled again, and rejected.
+	// Without legacy in the bindings, only the rewrite into it is denied:
+	// alpha keeps serving, as on a fresh pod.
 	r.files.write(reloadBindingsJSON(origin, ""))
-	r.waitFor("alpha rejected", func() bool { return r.get("/alpha/items") == http.StatusServiceUnavailable })
-	if r.get("/beta/items") != http.StatusTeapot {
-		t.Error("beta stopped serving")
+	r.waitFor("legacy removed", func() bool {
+		_, bound := r.active.Load().gateway.bindings.Services["legacy"]
+		return !bound
+	})
+	if r.get("/alpha/items") != http.StatusTeapot || r.get("/alpha/old") != http.StatusNotFound || r.get("/beta/items") != http.StatusTeapot {
+		t.Errorf("alpha %d, alpha/old %d, beta %d", r.get("/alpha/items"), r.get("/alpha/old"), r.get("/beta/items"))
+	}
+	// A fresh compile agrees.
+	bindings, _, err := readBindings(r.files.path(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, report := compile([]registration{alpha}, bindings, nil); report.services["alpha"].rejection != "" {
+		t.Errorf("fresh alpha %+v", report.services["alpha"])
 	}
 }
 

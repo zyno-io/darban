@@ -25,8 +25,10 @@ spec:
              by name. */}}
         {{- $origins := list (.Values.bindings.authz | default "") }}
         {{- range $name, $service := (.Values.bindings.services | default dict) }}
-        {{- $origins = append $origins ($service.origin | default "") }}
-        {{- $origins = append $origins ($service.debugOrigin | default "") }}
+        {{- with $service }}
+        {{- $origins = append $origins (.origin | default "") }}
+        {{- $origins = append $origins (.debugOrigin | default "") }}
+        {{- end }}
         {{- end }}
         {{- $external := list }}
         {{- range $origins }}

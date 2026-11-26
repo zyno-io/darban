@@ -1003,12 +1003,9 @@ type serviceUnit struct {
 	openAPIDigest [sha256.Size]byte
 	native        map[operationKey]sourceOperation
 	aliases       map[operationKey]aliasTarget
-	// targets are the services the rewrites name, which must stay in the
-	// effective bindings for the unit to be reused.
-	targets     []string
-	denied      []operationKey
-	passthrough []operationKey
-	extras      []compiledOperation
+	denied        []operationKey
+	passthrough   []operationKey
+	extras        []compiledOperation
 }
 
 const (
@@ -1117,8 +1114,10 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 	}
 	for _, rule := range rules {
 		from := operationKey{rule.From.Method, rule.From.Path}
-		_, approved := bindings.Services[rule.To.ServiceName]
-		if !approved || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
+		// A rewrite into a service that is not served, or not known at all, is
+		// denied when the units are assembled. Rejecting it here would let one
+		// service's contract deletion take another service offline.
+		if rule.To.ServiceName == "" || !literalPath.MatchString(rule.To.Path) || !strings.HasPrefix(from.path, binding.Prefix+"/") ||
 			!literalPath.MatchString(from.path) {
 			return nil, errors.New("rewrite outside its registered service bindings")
 		}
@@ -1126,9 +1125,6 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 			return nil, fmt.Errorf("duplicate rewrite for %s %s", from.method, from.path)
 		}
 		unit.aliases[from] = aliasTarget{operationKey{from.method, rule.To.Path}, rule.To.ServiceName}
-		if !slices.Contains(unit.targets, rule.To.ServiceName) {
-			unit.targets = append(unit.targets, rule.To.ServiceName)
-		}
 	}
 	return unit, nil
 }
@@ -1188,8 +1184,8 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		}
 	}
 	maps.Copy(effective, resolved)
-	// Approve a rewrite target whichever way it fails: any registration counts.
-	// Rewrites into a target that is not served stay denied in assemble.
+	// Every registered service is known, whichever way it fails. Rewrites
+	// into a target that is not served are denied in assemble.
 	for name := range count {
 		if _, known := effective[name]; !known {
 			effective[name] = serviceBinding{}
@@ -1204,7 +1200,7 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 		if !ok {
 			continue
 		}
-		if prev := lastGood[name]; prev != nil && prev.reusable(reg, binding, effectiveBindings) {
+		if prev := lastGood[name]; prev != nil && prev.digest == registrationDigest(reg, binding, effectiveBindings) {
 			current[name] = prev
 			continue
 		}
@@ -1270,18 +1266,6 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	return out, report
 }
 
-// reusable reports whether the unit is what compiling reg with binding under
-// these bindings would give: the same inputs, and every rewrite target still
-// a service the bindings know.
-func (u *serviceUnit) reusable(reg registration, binding serviceBinding, bindings upstreamBindings) bool {
-	for _, target := range u.targets {
-		if _, known := bindings.Services[target]; !known {
-			return false
-		}
-	}
-	return u.digest == registrationDigest(reg, binding, bindings)
-}
-
 // refreshUnits compiles each last-good unit again from its contract when the
 // bindings it depends on changed, so that a service kept on its last good
 // contract follows new bindings too. A unit that no longer compiles is
@@ -1290,7 +1274,7 @@ func refreshUnits(units map[string]*serviceUnit, bindings, effective upstreamBin
 	var out map[string]*serviceUnit
 	for name, unit := range units {
 		binding, _, err := resolveBinding(unit.reg, bindings)
-		if err == nil && unit.reusable(unit.reg, binding, effective) {
+		if err == nil && unit.digest == registrationDigest(unit.reg, binding, effective) {
 			continue
 		}
 		if out == nil {
