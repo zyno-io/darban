@@ -432,6 +432,10 @@ image from the repository's Dockerfile. Supply the TLS certificate and key in a 
 bindings. This example configures a catalog API and publishes both
 OpenAPI formats.
 
+The chart requests 64Mi of memory and limits it to 256Mi. Composing the
+contracts needs more than serving them: eight full-size contracts peak near
+120Mi while they compose. Raise `resources.limits.memory` for a larger set.
+
 ```yaml
 image: ghcr.io/zyno-io/darban:<short-sha>
 bindings:
