@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -462,7 +463,9 @@ func TestLoadRejectsSettingsDarbanWouldOverride(t *testing.T) {
 		"reserved": `{"hostname": "api.example.net", "openapi": {"yamlPath": "/docs/openapi.yaml"}, "services": {"docs": {}}}`,
 		"projected": `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80",
 			"authorization": {"path": "/authz", "responseHeaders": ["X-Forwarded-User"]}}`,
-		"alias": `{"hostname": "api.example.net", "upstreamRequestHeaders": ["True-Client-IP"]}`,
+		"alias":      `{"hostname": "api.example.net", "upstreamRequestHeaders": ["True-Client-IP"]}`,
+		"upgrade":    `{"hostname": "api.example.net", "upstreamRequestHeaders": ["Upgrade"]}`,
+		"connection": `{"hostname": "api.example.net", "upstreamRequestHeaders": ["Connection"]}`,
 	} {
 		if err := writeBindings(t, body); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -486,5 +489,35 @@ func TestProtectedOperationsNeedAnAuthorizer(t *testing.T) {
 	bindings.Services["shop"] = serviceBinding{Origin: "http://shop." + testNamespace + ".svc.cluster.local:80", BackendAuth: true}
 	if _, report := compile([]registration{reg}, bindings, nil); report.services["shop"].rejection != "" {
 		t.Fatalf("backendAuth: %+v", report.services["shop"])
+	}
+}
+
+func TestRewriteTargetNamesAreValidated(t *testing.T) {
+	bindings := contractOnlyBindings()
+	bindings.Services["alpha"] = serviceBinding{Origin: "http://alpha." + testNamespace + ".svc.cluster.local:80"}
+	alpha := contractFor("alpha", "/items", "listAlpha")
+	alpha.rewrites = `[{from: {method: GET, path: /alpha/old}, to: {serviceName: "bad\nname", path: /items}}]`
+	if _, report := compile([]registration{alpha}, bindings, nil); report.services["alpha"].rejection == "" {
+		t.Error("a rewrite target that is not a service name was accepted")
+	}
+	// An unknown target is denied with a warning, and the owner serves.
+	alpha.rewrites = `[{from: {method: GET, path: /alpha/old}, to: {serviceName: typo, path: /items}}]`
+	got, report := compile([]registration{alpha}, bindings, nil)
+	outcome := report.services["alpha"]
+	if outcome.rejection != "" || len(outcome.warnings) != 1 || !strings.Contains(outcome.warnings[0], "typo") {
+		t.Errorf("alpha %+v", outcome)
+	}
+	wantPaths(t, got, "/alpha/items")
+}
+
+func TestAuthorizerRequestHeadersCannotBeHopByHop(t *testing.T) {
+	base := `{"hostname": "api.example.net", "authz": "http://authz.fixtures.svc.cluster.local:80", "authorization": {"path": "/authz", "requestHeaders": [%q]}}`
+	if err := writeBindings(t, fmt.Sprintf(base, "Content-Type")); err != nil {
+		t.Errorf("Content-Type: %v", err)
+	}
+	for _, header := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		if err := writeBindings(t, fmt.Sprintf(base, header)); err == nil {
+			t.Errorf("%s accepted", header)
+		}
 	}
 }

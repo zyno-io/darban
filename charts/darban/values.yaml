@@ -2,8 +2,17 @@ version: dev
 image: ''
 replicas: 2
 
+# Darban matches bindings keys in any letter case, but the chart reads
+# contractAPIGroup, upstreamTLS, authz, services.*.origin and
+# services.*.debugOrigin by their exact names to decide when to roll the pods.
+# Spell every key exactly as documented.
 bindings:
   contractAPIGroup: darban.zyno.io
+
+# Darban reloads its bindings in place when the ConfigMap changes. Set true
+# to also roll the pods on every bindings change. Changes to contractAPIGroup
+# and upstreamTLS, which cannot reload, always roll the pods.
+rolloutOnBindingsChange: false
 
 # Trust a private CA for HTTPS upstreams. Set at most one of the two names.
 # When unset, upstreams are verified against the system roots.

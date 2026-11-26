@@ -94,7 +94,10 @@ func (b *upstreamBindings) validateRequestHeaders(local bool) error {
 			return fmt.Errorf("invalid upstream request header %q", header)
 		}
 		header = http.CanonicalHeaderKey(header)
-		if !httpguts.ValidTrailerHeader(header) || managedHeader(header, *b) || slices.Contains(b.Authorization.ResponseHeaders, header) {
+		// ValidTrailerHeader covers the hop-by-hop and framing headers except
+		// Upgrade.
+		if !httpguts.ValidTrailerHeader(header) || header == "Upgrade" || managedHeader(header, *b) ||
+			slices.Contains(b.Authorization.ResponseHeaders, header) {
 			return fmt.Errorf("cannot pass upstream request header %q", header)
 		}
 		b.UpstreamRequestHeaders[i] = header

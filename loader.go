@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -83,7 +84,12 @@ func nameFromResource(name string) (string, bool) {
 }
 
 type reconciler struct {
+	// mu serializes contract and bindings updates. gateway is the one for the
+	// current bindings, and load reads the current contracts.
+	mu        sync.Mutex
 	gateway   *gateway
+	load      func() ([]registration, error)
+	watched   string
 	active    *atomic.Pointer[snapshot]
 	lastError string
 	// lastGood holds the units serving in the active snapshot, by service.
@@ -93,7 +99,11 @@ type reconciler struct {
 	warned map[string]string
 	// overrides remembers the binding-over-contract messages already logged.
 	overrides map[string]string
-	now       func() time.Time
+	// dropped holds, per service, why a bindings change cost it its last
+	// good contract, until it is accepted again.
+	dropped     map[string]string
+	lastDropped []string
+	now         func() time.Time
 }
 
 // classify sets each service's explicit state and reason. A bound service
@@ -135,13 +145,26 @@ func (r *reconciler) classify(report *compileReport) {
 				reason += "; its prefix returns 503 until a good contract is seen"
 			}
 		}
+		if dropped := r.dropped[name]; dropped != "" {
+			if reason != "" {
+				reason += "; "
+			}
+			reason += dropped
+		}
 		outcome.reason = reason
 		report.services[name] = outcome
 	}
 }
 
 func (r *reconciler) apply(load func() ([]registration, error)) {
-	regs, err := load()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.load = load
+	r.applyLocked()
+}
+
+func (r *reconciler) applyLocked() {
+	regs, err := r.load()
 	if err != nil {
 		// Nothing was loaded, so keep serving what is active.
 		if message := err.Error(); message != r.lastError {
@@ -153,6 +176,19 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.lastError = ""
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
+	for _, name := range slices.Sorted(maps.Keys(report.dropped)) {
+		log.Print(report.dropped[name])
+		if r.dropped == nil {
+			r.dropped = make(map[string]string)
+		}
+		r.dropped[name] = report.dropped[name]
+		r.lastDropped = append(r.lastDropped, report.dropped[name])
+	}
+	for name := range r.dropped {
+		if report.accepted[name] != nil {
+			delete(r.dropped, name)
+		}
+	}
 	r.classify(&report)
 	r.logRejections(report)
 	r.logOverrides(report)
@@ -163,8 +199,9 @@ func (r *reconciler) apply(load func() ([]registration, error)) {
 	r.gateway.contractStatus.update(report, now())
 	old := r.active.Load()
 	// The first apply always stores a snapshot, so a pod is ready once its
-	// contracts are loaded whether or not any of them is valid.
-	if old == nil || old.revision != compiled.revision {
+	// contracts are loaded whether or not any of them is valid. New bindings
+	// always do, since the gateway serving the snapshot changed.
+	if old == nil || old.revision != compiled.revision || old.gateway != r.gateway {
 		r.active.Store(r.gateway.build(compiled))
 		log.Printf("contract snapshot active revision=%s", compiled.revision)
 	}

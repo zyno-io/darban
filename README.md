@@ -88,7 +88,8 @@ Every service is described by its contract, and optionally by an entry under
   merges with bindings the same way.
 
 The bindings file is parsed strictly. An unknown key at any depth, or any
-data after the JSON object, fails startup. A minimal file for a gateway
+data after the JSON object, fails startup. A changed file is reloaded in place (see
+[Bindings reload](#bindings-reload)). A minimal file for a gateway
 whose contracts all set `spec.upstream` is:
 
 ```json
@@ -401,7 +402,9 @@ Darban talks to it:
 - `requestHeaders` are copied from the request to the authorizer, with the
   caller's `Authorization` and the original request as `X-Original-Method`,
   `X-Original-URI` and `X-Original-URL`. A request without exactly one
-  non-empty `Authorization` header returns `401` without a call.
+  non-empty `Authorization` header returns `401` without a call. They
+  cannot name a hop-by-hop header: `Connection`, `Keep-Alive`,
+  `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding` or `Upgrade`.
 - `responseHeaders` are the identity the authorizer returns. Darban sends
   each single, non-empty one upstream, and removes caller copies of them
   from every request. They cannot name a header Darban manages, such as
@@ -576,6 +579,44 @@ In the chart, set `upstreamTLS.caSecretName` or `upstreamTLS.caConfigMapName`
 mounts it at `/etc/darban/upstream-ca` and sets `bindings.upstreamTLS.caFile`
 to match. Leaving them unset changes nothing.
 
+### Bindings reload
+
+Darban reloads the `-bindings` file while it runs. It reads the file every
+two seconds and compares the SHA-256 of its content, so the atomic `..data`
+symlink swap of a ConfigMap volume is picked up whatever the file times say.
+On a change it:
+
+1. parses and validates the file as strictly as at startup;
+2. checks that nothing changed that cannot change at runtime;
+3. compiles the current contracts with it, including the last good contract
+   of a service whose current one is rejected; and
+4. swaps the snapshot, which carries the new bindings, in one atomic store.
+
+A request is served entirely by one bindings revision, and readiness never
+changes during a reload. On any error, the active bindings keep serving, and
+the error is logged once and shown in `/status` as `lastBindingsError`, with
+the `revision` of the rejected content (none when the file could not be
+read). A
+file that does not parse, validate or hot-swap is not tried again until its
+content changes. A failure that does not depend on the content, such as
+contracts that cannot be read, is retried on the next read. A reload does not
+read `upstreamTLS.caFile`: the verifier re-reads it on its own. A reload that
+costs a service its last good contract, because that contract no longer
+compiles with the new bindings, still applies. The service fails closed like
+any bound service without an accepted contract, its `/status` reason says
+why, and the reload's `bindingsWarnings` and log list it. `contractAPIGroup`, `upstreamTLS` and, in cluster mode,
+the set of Services named outside the watched namespace (whose
+EndpointSlices are watched by name) cannot change at runtime: such a change
+is rejected with an error that says to restart the gateway. Everything else
+in the bindings applies in place.
+
+The chart rolls the pods only when one of those changes: `contractAPIGroup`,
+`upstreamTLS`, or the Services that `authz`, `origin` and `debugOrigin` name
+outside the release namespace. Set `rolloutOnBindingsChange: true` to roll them on every bindings
+change, as before reloads existed. The chart reads those keys by their exact
+names, so spell every bindings key exactly as documented, although Darban
+itself accepts any letter case.
+
 ### Contract isolation
 
 Darban compiles each service's contract on its own, so one service cannot
@@ -596,7 +637,9 @@ block the others once the gateway is running.
   - without one, nothing reserves its prefix, which returns `404` like any
     unknown path.
 
-  Rewrites into a service that is not served are denied.
+  Rewrites into a service that is not served, or not known at all, are
+  denied, with a warning on their owner. A rewrite target must be a valid
+  service name.
 - Checks across services still apply: duplicate `operationId` values, routes
   that hide the OpenAPI endpoints, and prefix collisions. Darban first keeps
   every service's last good contract, then tries each changed contract and
@@ -636,7 +679,10 @@ Darban has no Prometheus registry, so the rejections appear in `/status` only.
 ### Status
 
 `GET /status` on the private admin port (8081) reports the active revision,
-route count, and EndpointSlice state for the authorizer and each backend,
+the bindings (`bindingsRevision`, the SHA-256 of the active file,
+`bindingsLoadedAt`, and `lastBindingsError` with its message and time, which
+stays after a later reload succeeds), route count, and EndpointSlice state
+for the authorizer and each backend,
 including the upstreams that contracts add at runtime. Darban watches every
 EndpointSlice in its own namespace, and the Services named in `bindings` in
 other namespaces.
