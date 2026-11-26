@@ -77,11 +77,12 @@ contract cannot declare, such as probes, static assets and event streams:
 - `path` is an upstream path like an operation's, under the mount, and may
   end in `/*` for a subtree, which also matches the path without it.
 - `auth` is `gateway` (the authorizer decides, which needs `authz`) or
-  `none` (the backend does).
+  `none` (the backend does). A `backendAuth` route takes only `none`.
 
 They use the same matcher and guards as operations. An operation of the same
-shape keeps its own path. Unknown keys, duplicates, a route on a
-`route: false` service and an invalid method, path or `auth` fail startup.
+shape keeps its own path. Unknown keys, two routes of one method and path
+shape, a route on a `route: false` service and an invalid method, path or
+`auth` fail startup.
 They count as `routes` in `/status`, and never appear in the document.
 
 ### Route and publish
@@ -288,10 +289,11 @@ A routed service whose prefix has a direct route is served by its contract
 cookie and `Location` rewriting, `forwardTrustedClientIP`, `X-Original-*`
 headers and `legacyHosts`. Its contract upstream must have the route's
 origin (scheme, host and port, ignoring case), and without one it uses the
-route's origin. Gateway CORS applies to the operations the gateway
-authorizes. Anonymous operations, `backendAuth` routes and `backendCORS`
-routes leave CORS to the backend, so a preflight from an origin outside
-`browserOrigins` reaches the backend. The route's path rules below do not
+route's origin. A rewrite, also one within the prefix, is sent to its
+target's path through the target's origin. Gateway CORS applies to the
+operations the gateway authorizes. Anonymous operations, `backendAuth` routes
+and `backendCORS` routes leave CORS to the backend, so a preflight from an
+origin outside `browserOrigins` reaches the backend. The route's path rules below do not
 apply to it, except for the operations its `operations` selection leaves
 out, which keep the route's own policy until the selection is removed.
 
@@ -311,12 +313,29 @@ Darban also returns `404` for a request whose first path segment is encoded.
 `upstreamRequestHeaders` allows safe request metadata. Requests the gateway
 authorizes carry the identity returned by the authorizer. Others carry the
 original credentials, and those on `backendAuth` routes also the original
-request metadata.
+request metadata and the `authorization.requestHeaders` that name no
+identity. A caller's copy of an identity header, one of
+`authorization.responseHeaders` or with a stripped prefix, is removed even
+there, unless the route lists it in `forwardRequestHeaders`, for example
+tenant selectors an authenticating backend reads:
+
+```json
+"/auth": {"origin": "http://auth.zyno-alpha.svc.cluster.local:3000", "backendAuth": true,
+  "forwardRequestHeaders": ["X-Tenant", "X-Account"]}
+```
+
+`forwardRequestHeaders` needs `backendAuth`, and cannot name
+`Authorization`, `Host`, `Forwarded`, `X-Real-IP`, `X-Forwarded-*` or
+`X-Original-*`.
 Same-service redirects and cookie paths are scoped to the gateway prefix.
 
 Set `backendCORS` to let a direct Service handle its own CORS responses,
-including preflight. A preflight then reaches the backend without
-authorization, since it carries no credentials. Set `forwardTrustedClientIP` only when the HTTP listener
+including preflight. A real preflight, an `OPTIONS` request whose
+`Access-Control-Request-Method` names another method, then reaches the
+backend without authorization, since it carries no credentials, whether or
+not `browserOrigins` is set. For a routed service it must be for a path and
+method the contract serves, and a contract `OPTIONS` operation on the path is
+served as itself, with its own policy. Set `forwardTrustedClientIP` only when the HTTP listener
 is reachable exclusively through an ingress that overwrites `X-Real-IP` with
 the verified connection address. On those Service routes, Darban forwards a
 single valid IP address and returns 503 if the header is missing or invalid.

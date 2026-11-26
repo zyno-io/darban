@@ -78,12 +78,12 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 	}
 	extras := make(map[operationKey]bool, len(b.ExtraRoutes))
 	for _, extra := range b.ExtraRoutes {
-		key := operationKey{extra.Method, extra.Path}
+		key := operationKey{extra.Method, pathShape(extra.Path)}
 		if !b.routed() {
 			return fmt.Errorf("service %q has route: false, so it cannot have extraRoutes", name)
 		}
 		if extras[key] {
-			return fmt.Errorf("service %q: duplicate extra route %s %s", name, extra.Method, extra.Path)
+			return fmt.Errorf("service %q: duplicate or same-shape extra route %s %s", name, extra.Method, extra.Path)
 		}
 		extras[key] = true
 		if err := extra.validate(b, bindings); err != nil {
@@ -153,6 +153,8 @@ func (e extraRoute) validate(binding serviceBinding, bindings upstreamBindings) 
 		return fmt.Errorf("extra route %s %s: auth must be gateway or none", e.Method, e.Path)
 	case e.Auth == extraAuthGateway && bindings.Authz == "":
 		return fmt.Errorf("extra route %s %s: auth gateway needs authz", e.Method, e.Path)
+	case e.Auth == extraAuthGateway && bindings.ServiceRoutes[binding.Prefix].BackendAuth:
+		return fmt.Errorf("extra route %s %s: auth gateway on a backendAuth route would be ignored", e.Method, e.Path)
 	}
 	if _, ok := binding.publicPath(base); !ok {
 		return fmt.Errorf("extra route %s %s is outside the mount %q", e.Method, e.Path, binding.Mount)

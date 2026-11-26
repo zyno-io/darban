@@ -312,8 +312,10 @@ func (g *gateway) build(compiled candidate) *snapshot {
 		}
 		registered := registeredRoute{key: route.key, service: route.service, protected: route.protected}
 		// A service's own operations on its direct route use that route's
-		// transport. A rewrite from another prefix uses the target's origin.
-		if _, direct := g.bindings.ServiceRoutes[binding.Prefix]; direct && routePrefix(route.key.path) == binding.Prefix {
+		// transport, which forwards the request path below the prefix. A
+		// rewrite, even within the prefix, forwards its target's path through
+		// the target's origin.
+		if _, direct := g.bindings.ServiceRoutes[binding.Prefix]; direct && route.key.path == binding.Prefix+route.path {
 			registered.direct = binding.Prefix
 			return registered
 		}
@@ -368,10 +370,15 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		return
 	}
 	method := r.Method
-	preflight := len(g.bindings.BrowserOrigins) > 0 && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+	requested := r.Header.Get("Access-Control-Request-Method")
+	preflight := len(g.bindings.BrowserOrigins) > 0 && r.Method == http.MethodOptions && requested != ""
 	if preflight {
-		method = r.Header.Get("Access-Control-Request-Method")
+		method = requested
 	}
+	// A real preflight asks about another method. On a backendCORS route the
+	// backend answers it, without authorization, since it carries no
+	// credentials.
+	corsPreflight := r.Method == http.MethodOptions && requested != "" && requested != http.MethodOptions
 	prefix := routePrefix(path)
 	if legacyPrefix != "" {
 		prefix = legacyPrefix
@@ -383,7 +390,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
-	_, direct := g.bindings.ServiceRoutes[prefix]
+	route, direct := g.bindings.ServiceRoutes[prefix]
 	servicePath := ""
 	if direct {
 		// The policy below checks path.Clean of the decoded path, but the route
@@ -411,12 +418,22 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		}
 		// Without a routed service, the route's own path policy decides.
 		if !active.routed[prefix] {
-			g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method)
+			g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method, route.BackendCORS && corsPreflight)
 			return
 		}
 	}
 	// A routed service serves only its contract operations and extra routes.
 	match := active.match(method, path, r.URL.Path, legacyPrefix)
+	backendPreflight := false
+	if direct && route.BackendCORS && corsPreflight {
+		// An OPTIONS operation is served as itself, with its own policy. Any
+		// other preflight goes to the backend for a path the contract serves.
+		if options := active.match(http.MethodOptions, path, r.URL.Path, legacyPrefix); options.route != nil || options.denied || options.invalid || options.passthrough {
+			match, method = options, http.MethodOptions
+		} else {
+			match, method, backendPreflight = active.match(requested, path, r.URL.Path, legacyPrefix), requested, true
+		}
+	}
 	switch {
 	case match.denied || match.invalid:
 		writeStatus(w, http.StatusNotFound)
@@ -424,7 +441,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	case match.passthrough && direct:
 		// An operation the bindings leave unselected keeps the route's own
 		// policy until the selection is removed.
-		g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method)
+		g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method, backendPreflight)
 		return
 	case match.route == nil:
 		writeStatus(w, http.StatusNotFound)
@@ -440,7 +457,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	if registered.direct != "" {
 		// Anonymous operations and backendAuth routes leave authorization to
 		// the backend, with the caller's Authorization.
-		backendAuthorization := !registered.protected || g.bindings.ServiceRoutes[registered.direct].BackendAuth
+		backendAuthorization := !registered.protected || g.bindings.ServiceRoutes[registered.direct].BackendAuth || backendPreflight
 		g.serveService(w, r, registered.direct, backendAuthorization, preflight, method, upstreamMethod)
 		return
 	}
@@ -458,8 +475,8 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	}
 	proxy := registered.proxy
 	debug := g.bindings.Debug
-	requested := r.Header.Values(debug.RequestHeader)
-	if registered.debugProxy != nil && debug.RequestHeader != "" && len(requested) == 1 && requested[0] == "true" &&
+	debugRequested := r.Header.Values(debug.RequestHeader)
+	if registered.debugProxy != nil && debug.RequestHeader != "" && len(debugRequested) == 1 && debugRequested[0] == "true" &&
 		caller.headers.Get(debug.RequiredHeader) == debug.RequiredValue {
 		state := g.endpoints.state(registered.debugOrigin)
 		if state == endpointReady || state == endpointLocal {
@@ -473,13 +490,15 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 // serveByRoutePolicy serves a direct route by its own path rules: deniedPaths
 // and allowedPaths gate the path, and publicPaths leave authorization to the
 // backend.
-func (g *gateway) serveByRoutePolicy(w http.ResponseWriter, r *http.Request, prefix, servicePath string, preflight bool, method string) {
+// A backendPreflight is a real preflight on a backendCORS route.
+func (g *gateway) serveByRoutePolicy(w http.ResponseWriter, r *http.Request, prefix, servicePath string, preflight bool, method string, backendPreflight bool) {
 	route := g.bindings.ServiceRoutes[prefix]
 	if !route.allowsPath(servicePath) {
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
-	g.serveService(w, r, prefix, route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath), preflight, method, "")
+	backendAuthorization := route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath) || backendPreflight
+	g.serveService(w, r, prefix, backendAuthorization, preflight, method, "")
 }
 
 func main() {

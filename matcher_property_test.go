@@ -18,8 +18,10 @@ type propertyOperation struct {
 }
 
 // tsfSelect emulates TSF routing: the method must match exactly, a literal
-// segment beats a :param, an in-segment {x} is the literal :x, and the first
-// segment where two candidates differ decides.
+// segment beats a :param, which beats a trailing wildcard, an in-segment {x}
+// is the literal :x, and the first segment where two candidates differ
+// decides. An extra route's trailing /* is the wildcard, matching any rest of
+// the path or none.
 func tsfSelect(operations []propertyOperation, method, path string) (propertyOperation, bool) {
 	request := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	var best []string
@@ -27,10 +29,17 @@ func tsfSelect(operations []propertyOperation, method, path string) (propertyOpe
 	found := false
 	for _, operation := range operations {
 		segments := strings.Split(strings.TrimPrefix(operation.path, "/"), "/")
-		if operation.method != method || len(segments) != len(request) {
+		rest := segments[len(segments)-1] == "*"
+		if rest {
+			segments = segments[:len(segments)-1]
+		}
+		if operation.method != method || len(segments) > len(request) || !rest && len(segments) != len(request) {
 			continue
 		}
-		ranks := make([]string, len(segments))
+		ranks := make([]string, len(request))
+		for i := len(segments); i < len(request); i++ {
+			ranks[i] = "2"
+		}
 		matched := true
 		for i, segment := range segments {
 			if parameterSegment(segment) {
@@ -59,7 +68,7 @@ type propertyRig struct {
 	authorized bool
 }
 
-func newPropertyRig(t *testing.T, selection []operationSelection, publicPaths []string, openAPI string) *propertyRig {
+func newPropertyRig(t *testing.T, selection []operationSelection, extras []extraRoute, publicPaths []string, openAPI string) *propertyRig {
 	r := &propertyRig{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		r.sent = q.Method + " " + q.URL.Path
@@ -72,7 +81,7 @@ func newPropertyRig(t *testing.T, selection []operationSelection, publicPaths []
 	t.Cleanup(upstream.Close)
 	t.Cleanup(authz.Close)
 	bindings := upstreamBindings{Hostname: "api.example.net", Authz: authz.URL,
-		Services:      map[string]serviceBinding{"shop": {Prefix: "/shop", Operations: selection}},
+		Services:      map[string]serviceBinding{"shop": {Prefix: "/shop", Operations: selection, ExtraRoutes: extras}},
 		ServiceRoutes: map[string]serviceRoute{"/shop": {Origin: upstream.URL, PublicPaths: publicPaths}}}
 	r.h = newSkipHarness(t, bindings)
 	r.h.apply(registration{serviceName: "shop", rewrites: "[]", openAPI: openAPI})
@@ -129,11 +138,29 @@ func TestProxiedRequestsReachTheOperationTSFRuns(t *testing.T) {
 			}
 			operations = append(operations, operation)
 		}
+		// Extra routes with a trailing /* that the backend serves itself.
+		var extras []extraRoute
+		extraShapes := map[string]bool{}
+		for range random.Intn(3) {
+			parts := []string{[]string{"v1", "items", "{e}"}[random.Intn(3)]}
+			if random.Intn(2) == 0 {
+				parts = append(parts, []string{"v1", "items", "{f}"}[random.Intn(3)])
+			}
+			extra := extraRoute{methods[random.Intn(len(methods))], "/" + strings.Join(parts, "/") + "/*", extraAuthNone}
+			if shape := extra.Method + pathShape(extra.Path); !extraShapes[shape] {
+				extraShapes[shape] = true
+				extras = append(extras, extra)
+				operations = append(operations, propertyOperation{extra.Method, extra.Path, "extra"})
+			}
+		}
 		byPath := map[string]string{}
 		var order []string
 		selection := []operationSelection{{Method: "get", Path: "/sel"}}
 		for i, operation := range operations {
 			method := strings.ToLower(operation.method)
+			if operation.kind == "extra" {
+				continue
+			}
 			if _, ok := byPath[operation.path]; !ok {
 				order = append(order, operation.path)
 			}
@@ -152,13 +179,13 @@ func TestProxiedRequestsReachTheOperationTSFRuns(t *testing.T) {
 		}
 		openAPI += "components:\n  securitySchemes:\n    account: {type: http, scheme: bearer}\n"
 		probe := upstreamBindings{Hostname: "api.example.net",
-			Services:      map[string]serviceBinding{"shop": {Prefix: "/shop", Operations: selection}},
+			Services:      map[string]serviceBinding{"shop": {Prefix: "/shop", Operations: selection, ExtraRoutes: extras}},
 			ServiceRoutes: map[string]serviceRoute{"/shop": {Origin: "http://shop.fixtures.svc.cluster.local:80"}}}
 		if _, report := compile([]registration{{serviceName: "shop", rewrites: "[]", openAPI: openAPI}}, probe, nil); report.services["shop"].rejection != "" {
 			counts["rejected"]++ // for example, two operations of one shape
 			continue
 		}
-		r := newPropertyRig(t, selection, publicPaths, openAPI)
+		r := newPropertyRig(t, selection, extras, publicPaths, openAPI)
 		for range 15 {
 			parts := make([]string, 1+random.Intn(3))
 			for i := range parts {
@@ -173,7 +200,10 @@ func TestProxiedRequestsReachTheOperationTSFRuns(t *testing.T) {
 				counts["refused"]++
 			case !authorized:
 				counts["direct"]++
-				if found && chosen.kind != "unselected" {
+				if found && chosen.kind == "extra" {
+					counts["extra"]++
+				}
+				if found && chosen.kind != "unselected" && chosen.kind != "extra" {
 					t.Errorf("%s /shop%s took the route's own policy, but TSF runs %s %s %s; operations %v", method, path, chosen.kind, chosen.method, chosen.path, operations)
 				}
 			default:
@@ -184,7 +214,7 @@ func TestProxiedRequestsReachTheOperationTSFRuns(t *testing.T) {
 			}
 		}
 	}
-	if counts["checked"] < 10000 || counts["contract"] == 0 || counts["direct"] == 0 {
+	if counts["checked"] < 10000 || counts["contract"] == 0 || counts["direct"] == 0 || counts["extra"] == 0 {
 		t.Fatalf("too little coverage: %v", counts)
 	}
 	t.Logf("counts %v", counts)

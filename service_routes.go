@@ -29,6 +29,9 @@ type serviceRoute struct {
 	DeniedPaths               []string
 	LongResponsePaths         []string
 	LongResponseHeaderTimeout string
+	// ForwardRequestHeaders are caller headers a backendAuth route sends
+	// upstream although they name an identity, such as tenant selectors.
+	ForwardRequestHeaders []string
 }
 
 func (b *upstreamBindings) validateServiceRoutes(local bool) error {
@@ -57,6 +60,15 @@ func (b *upstreamBindings) validateServiceRoutes(local bool) error {
 			if err != nil || timeout <= 0 || len(route.LongResponsePaths) == 0 {
 				return fmt.Errorf("service route %q requires a positive duration and paths for extended responses", prefix)
 			}
+		}
+		for i, header := range route.ForwardRequestHeaders {
+			canonical := http.CanonicalHeaderKey(header)
+			if !route.BackendAuth || !httpguts.ValidHeaderFieldName(header) || canonical == "Authorization" || canonical == "Host" ||
+				slices.Contains(forwardedMetadata, canonical) || strings.HasPrefix(canonical, "X-Forwarded-") || canonical == "Forwarded" ||
+				canonical == "X-Real-Ip" || slices.Contains(route.ForwardRequestHeaders[:i], header) {
+				return fmt.Errorf("service route %q cannot forward request header %q (forwardRequestHeaders needs backendAuth)", prefix, header)
+			}
+			route.ForwardRequestHeaders[i] = canonical
 		}
 		for _, paths := range [][]string{route.PublicPaths, route.AllowedPaths, route.DeniedPaths, route.LongResponsePaths} {
 			for _, pattern := range paths {
@@ -163,10 +175,6 @@ func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix st
 		return
 	}
 	originAllowed := false
-	if route.BackendCORS && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-		// The backend answers its own preflights, which carry no credentials.
-		backendAuthorization = true
-	}
 	if !route.BackendCORS {
 		originAllowed = slices.Contains(g.bindings.BrowserOrigins, r.Header.Get("Origin"))
 		if preflight && (!backendAuthorization || originAllowed) {
@@ -236,7 +244,15 @@ func matchesServicePaths(patterns []string, value string) bool {
 func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport http.RoundTripper, bindings upstreamBindings) *httputil.ReverseProxy {
 	requestHeaders := slices.Clone(bindings.UpstreamRequestHeaders)
 	if route.BackendAuth {
-		requestHeaders = append(requestHeaders, bindings.Authorization.RequestHeaders...)
+		// The backend authenticates, so it gets the authorizer's request
+		// headers, but a caller's copy of an identity header only when the
+		// route lists it.
+		for _, header := range bindings.Authorization.RequestHeaders {
+			if !bindings.Authorization.identityHeader(header) {
+				requestHeaders = append(requestHeaders, header)
+			}
+		}
+		requestHeaders = append(requestHeaders, route.ForwardRequestHeaders...)
 	}
 	return &httputil.ReverseProxy{
 		Transport: transport,

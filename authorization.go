@@ -61,6 +61,15 @@ func (a *authorizationConfig) validate(origin string) error {
 	return nil
 }
 
+// identityHeader reports whether a header names an identity: one the
+// authorizer returns, or one with a stripped prefix.
+func (a authorizationConfig) identityHeader(name string) bool {
+	return slices.Contains(a.ResponseHeaders, http.CanonicalHeaderKey(name)) ||
+		slices.ContainsFunc(a.StripHeaderPrefixes, func(prefix string) bool {
+			return len(name) >= len(prefix) && strings.EqualFold(name[:len(prefix)], prefix)
+		})
+}
+
 func (d *debugConfig) validate(authorization authorizationConfig) error {
 	if *d == (debugConfig{}) {
 		return nil
