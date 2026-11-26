@@ -129,22 +129,26 @@ func TestRouteAndPublishCombinations(t *testing.T) {
 }
 
 func TestRejectedUnroutedContractLeavesTrafficAlone(t *testing.T) {
-	bindings := talkBindings(teapotUpstream(t), false, false)
+	origin := teapotUpstream(t)
 	good := registration{serviceName: "talk", openAPI: talkContract, rewrites: "[]"}
 	bad := registration{serviceName: "talk", rewrites: "[]",
 		openAPI: strings.Replace(talkContract, "x-darban-visibility: internal", "x-darban-visibility: bogus", 1)}
-	for name, sequence := range map[string][]registration{"bad first": {bad}, "bad update": {good, bad}} {
-		h := newSkipHarness(t, bindings)
-		for _, reg := range sequence {
-			h.apply(reg)
-			for _, path := range []string{"/talk/items", "/talk/secret", "/talk/undeclared"} {
-				if code := h.get(path); code != 418 {
-					t.Errorf("%s: GET %s = %d", name, path, code)
+	for _, publish := range []bool{false, true} {
+		bindings := talkBindings(origin, false, publish)
+		for sequenceName, sequence := range map[string][]registration{"bad first": {bad}, "bad update": {good, bad}} {
+			name := fmt.Sprintf("publish=%v %s", publish, sequenceName)
+			h := newSkipHarness(t, bindings)
+			for _, reg := range sequence {
+				h.apply(reg)
+				for _, path := range []string{"/talk/items", "/talk/secret", "/talk/undeclared"} {
+					if code := h.get(path); code != 418 {
+						t.Errorf("%s: GET %s = %d", name, path, code)
+					}
 				}
 			}
-		}
-		if status := h.status()["talk"]; !status.Rejected || status.Route || status.LastRejection == nil {
-			t.Errorf("%s: status %+v", name, status)
+			if status := h.status()["talk"]; !status.Rejected || status.Route || status.Publish != publish || status.LastRejection == nil {
+				t.Errorf("%s: status %+v", name, status)
+			}
 		}
 	}
 }
@@ -229,6 +233,8 @@ func TestTemplateMatches(t *testing.T) {
 		{"/a/*", "/b/{x}", false, false},
 		{"/a/b/*", "/a", false, false},
 		{"/", "/a", false, false},
+		{"/", "/{x}", false, false},
+		{"/", "/", true, true},
 	} {
 		if all := templateMatches([]string{test.pattern}, test.template, true); all != test.all {
 			t.Errorf("%s covers %s = %v", test.pattern, test.template, all)
@@ -322,5 +328,54 @@ func TestRewritesIntoUnroutedOrUnpublishedServices(t *testing.T) {
 	got, _ = compile([]registration{alpha, talk, beta}, bindings, nil)
 	if paths := documentedPaths(t, got); !slices.Equal(paths, []string{"GET /beta/items"}) {
 		t.Fatalf("documented %v", paths)
+	}
+}
+
+func TestDocsOnlyUnitSurvivesABrokenRoutedContract(t *testing.T) {
+	bindings := talkBindings("http://talk.fixtures.svc.cluster.local:80", false, true)
+	bindings.Services["zeta"] = serviceBinding{Prefix: "/zeta", Origin: "http://zeta.fixtures.svc.cluster.local:80"}
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	docs := contractFor("talk", "/items", "shared")
+	docs.created = older
+	good := contractFor("zeta", "/items", "zetaItems")
+	good.created = older.Add(time.Hour)
+	// The broken routed contract shares the docs-only operationId and also
+	// fails on its own, on a later path.
+	bad := registration{serviceName: "zeta", rewrites: "[]", created: good.created, openAPI: anonymousContract("/items", "shared") +
+		"  /zz:\n    get:\n      operationId: zz\n      security: []\n      x-darban-policy: anonymous\n" +
+		"      responses: {'200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Missing'}}}}}\n"}
+	check := func(label string, report compileReport, zetaServing string) {
+		t.Helper()
+		if talk := report.services["talk"]; talk.serving != servingCurrent || talk.rejection != "" {
+			t.Errorf("%s: talk = %+v", label, talk)
+		}
+		if zeta := report.services["zeta"]; zeta.serving != zetaServing || !strings.Contains(zeta.rejection, "Missing") {
+			t.Errorf("%s: zeta = %+v", label, zeta)
+		}
+	}
+	for _, order := range [][]registration{{docs, bad}, {bad, docs}} {
+		_, fresh := compile(order, bindings, nil)
+		check("fresh", fresh, servingNone)
+		_, again := compile(order, bindings, fresh.accepted)
+		check("fresh re-run", again, servingNone)
+	}
+	_, r1 := compile([]registration{docs, good}, bindings, nil)
+	_, r2 := compile([]registration{docs, bad}, bindings, r1.accepted)
+	check("established", r2, servingLastGood)
+	_, r3 := compile([]registration{docs, bad}, bindings, r2.accepted)
+	check("established re-run", r3, servingLastGood)
+}
+
+func TestRewriteIntoUnroutedServiceWithoutContractIsWarned(t *testing.T) {
+	bindings := talkBindings("http://talk.fixtures.svc.cluster.local:80", false, false)
+	bindings.Services["alpha"] = serviceBinding{Prefix: "/alpha", Origin: "http://alpha.fixtures.svc.cluster.local:80"}
+	alpha := registration{serviceName: "alpha", openAPI: anonymousContract("/items", "listAlpha"),
+		rewrites: `[{from: {method: GET, path: /alpha/old}, to: {serviceName: talk, path: /items}}]`}
+	got, report := compile([]registration{alpha}, bindings, nil)
+	if !slices.Contains(got.denied, operationKey{"GET", "/alpha/old"}) {
+		t.Fatalf("denied %v", got.denied)
+	}
+	if warnings := report.services["alpha"].warnings; len(warnings) != 1 || !strings.Contains(warnings[0], "route: false") {
+		t.Fatalf("alpha warnings %q", warnings)
 	}
 }

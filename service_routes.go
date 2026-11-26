@@ -416,10 +416,16 @@ func omitRefusedOperations(native map[operationKey]sourceOperation, route servic
 // templateMatches reports whether one of the service path patterns matches
 // every path the template stands for (all), or at least one of them.
 func templateMatches(patterns []string, template string, all bool) bool {
-	have := strings.Split(template[1:], "/")
+	segments := func(path string) []string {
+		if path == "/" {
+			return nil
+		}
+		return strings.Split(path[1:], "/")
+	}
+	have := segments(template)
 	for _, pattern := range patterns {
 		prefix, subtree := strings.CutSuffix(pattern, "/*")
-		want := strings.Split(prefix[1:], "/")
+		want := segments(prefix)
 		if len(have) < len(want) || !subtree && len(have) != len(want) {
 			continue
 		}

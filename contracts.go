@@ -1107,6 +1107,17 @@ restart:
 				culprit := faultService(err)
 				other, present := accepted[culprit]
 				blameCulprit := culprit != "" && culprit != name && present
+				if blameCulprit && !other.binding.routed() && unit.binding.routed() {
+					// A docs-only culprit is blamed for any conflict with a routed
+					// unit, so first check that the routed unit fits without it.
+					// Otherwise the routed unit is at fault on its own.
+					trial := maps.Clone(accepted)
+					trial[name] = unit
+					delete(trial, culprit)
+					if _, alone := assemble(trial, bindings, name); alone != nil {
+						blameCulprit, culprit, err = false, "", alone
+					}
+				}
 				switch {
 				case blameCulprit && other != lastGood[culprit]:
 					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
@@ -1230,13 +1241,6 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		alias := aliases[from]
 		owner := owners[from]
 		targetUnit, serving := units[alias.service]
-		if !serving {
-			// The target service has no serving contract. Deny the alias path so
-			// it cannot reach a direct service route.
-			delete(published, from)
-			deny(from, owner)
-			continue
-		}
 		// A rewrite that cannot reach its served target is denied and reported
 		// on its owner. It never faults a service, so the outcome does not
 		// depend on arrival order or on what was served before.
@@ -1247,6 +1251,17 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 				out.aliasWarnings = make(map[string][]string)
 			}
 			out.aliasWarnings[owner] = append(out.aliasWarnings[owner], fmt.Sprintf(format, args...))
+		}
+		if !serving {
+			// The target service has no serving contract. Deny the alias path so
+			// it cannot reach a direct service route.
+			if target, bound := bindings.Services[alias.service]; bound && !target.routed() {
+				warn("rewrite %s %s targets service %s, which has route: false", from.method, from.path, alias.service)
+				continue
+			}
+			delete(published, from)
+			deny(from, owner)
+			continue
 		}
 		if !targetUnit.binding.routed() {
 			warn("rewrite %s %s targets service %s, which has route: false", from.method, from.path, alias.service)
