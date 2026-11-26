@@ -12,7 +12,7 @@ import (
 
 func anonymousContract(path, operationID string, extra ...string) string {
 	return "openapi: 3.1.0\npaths:\n  " + path + ":\n    get:\n      operationId: " + operationID +
-		"\n      security: []\n      x-gateway-policy: anonymous\n" + strings.Join(extra, "") +
+		"\n      security: []\n      x-darban-policy: anonymous\n" + strings.Join(extra, "") +
 		"      responses: {'200': {description: OK}}\n"
 }
 

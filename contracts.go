@@ -157,7 +157,7 @@ const (
 	visibilityUnlisted  operationVisibility = "unlisted"
 	visibilityInternal  operationVisibility = "internal"
 	visibilityExtension                     = "x-darban-visibility"
-	policyExtension                         = "x-gateway-policy"
+	policyExtension                         = "x-darban-policy"
 	firstTagOnly                            = "firstOnly"
 )
 

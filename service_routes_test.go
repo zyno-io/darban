@@ -243,7 +243,7 @@ paths:
   /prices:
     get:
       security: []
-      x-gateway-policy: anonymous
+      x-darban-policy: anonymous
       responses:
         "200": {description: OK}
   /private/{id}:
