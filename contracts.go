@@ -1217,7 +1217,7 @@ func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string
 		}
 	}
 	for {
-		_, err := assemble(seed, bindings, "")
+		err := validateAssembly(seed, bindings, "")
 		if err == nil {
 			break
 		}
@@ -1241,7 +1241,7 @@ restart:
 				}
 				previous, had := accepted[name]
 				accepted[name] = unit
-				_, err := assemble(accepted, bindings, name)
+				err := validateAssembly(accepted, bindings, name)
 				if err == nil {
 					continue
 				}
@@ -1260,7 +1260,7 @@ restart:
 					trial := maps.Clone(accepted)
 					trial[name] = unit
 					delete(trial, culprit)
-					if _, alone := assemble(trial, bindings, name); alone != nil {
+					if alone := validateAssembly(trial, bindings, name); alone != nil {
 						blameCulprit, culprit, err = false, "", alone
 					}
 				}
@@ -1316,6 +1316,18 @@ func faultService(err error) string {
 // span services: rewrites, route and OpenAPI endpoint conflicts, duplicate
 // operationIds and component imports.
 func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) (candidate, error) {
+	return assembleUnits(units, bindings, prefer, true)
+}
+
+// validateAssembly runs every check of assemble without rendering the
+// document, for the trial assemblies that only need to know whether a set of
+// units fits together.
+func validateAssembly(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) error {
+	_, err := assembleUnits(units, bindings, prefer, false)
+	return err
+}
+
+func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, prefer string, render bool) (candidate, error) {
 	var out candidate
 	unroutedDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
@@ -1510,7 +1522,9 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 			operationIDs[id] = key
 			operation["operationId"] = id
 		}
-		paths[key.path][strings.ToLower(key.method)] = operation
+		if render {
+			paths[key.path][strings.ToLower(key.method)] = operation
+		}
 		count(keyOwners[key], func(c *serviceCounts) { c.documented++ })
 	}
 	for _, service := range slices.Sorted(maps.Keys(documentedSources)) {
@@ -1519,6 +1533,9 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		}
 	}
 
+	if !render {
+		return out, nil
+	}
 	document := map[string]any{
 		"openapi":    "3.1.0",
 		"info":       map[string]string{"title": "Darban", "version": "1"},
@@ -1530,7 +1547,13 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	if err != nil {
 		return out, err
 	}
-	out.specYAML, err = yaml.JSONToYAML(rawJSON)
+	// Write the YAML from the JSON without parsing it back into a tree. A
+	// document with a key only a complex YAML key can hold, which no
+	// OpenAPI path or name needs, takes the slower general converter.
+	out.specYAML, err = jsonToYAML(rawJSON)
+	if errors.Is(err, errComplexKey) {
+		out.specYAML, err = yaml.JSONToYAML(rawJSON)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -1541,7 +1564,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		return strings.Compare(a.key.method+" "+a.key.path, b.key.method+" "+b.key.path)
 	})
 	hash := sha256.New()
-	hash.Write(out.specYAML)
+	hash.Write(rawJSON)
 	fmt.Fprintf(hash, "services %v\n", out.contractServices)
 	for _, name := range out.contractServices {
 		binding := units[name].binding
