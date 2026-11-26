@@ -84,6 +84,8 @@ func nameFromResource(name string) (string, bool) {
 }
 
 type reconciler struct {
+	// bindingsParses counts the bindings files the watcher parsed.
+	bindingsParses atomic.Int64
 	// mu serializes contract and bindings updates. gateway is the one for the
 	// current bindings, and load reads the current contracts.
 	mu        sync.Mutex
@@ -177,6 +179,10 @@ func (r *reconciler) applyLocked() {
 	compiled, report := compile(regs, r.gateway.bindings, r.lastGood)
 	r.lastGood = report.accepted
 	for _, name := range slices.Sorted(maps.Keys(report.dropped)) {
+		// A service that serves its current contract lost nothing.
+		if report.accepted[name] != nil {
+			continue
+		}
 		log.Print(report.dropped[name])
 		if r.dropped == nil {
 			r.dropped = make(map[string]string)
@@ -185,7 +191,8 @@ func (r *reconciler) applyLocked() {
 		r.lastDropped = append(r.lastDropped, report.dropped[name])
 	}
 	for name := range r.dropped {
-		if report.accepted[name] != nil {
+		// Accepted again, or its contract is gone.
+		if outcome, present := report.services[name]; report.accepted[name] != nil || !present || outcome.missing {
 			delete(r.dropped, name)
 		}
 	}

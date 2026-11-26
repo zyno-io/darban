@@ -42,6 +42,12 @@ func (s *bindingsStatusStore) failed(err error, revision string, now time.Time) 
 	s.err = &bindingsError{Message: err.Error(), Time: now.UTC().Format(time.RFC3339), Revision: revision}
 }
 
+func (s *bindingsStatusStore) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = nil
+}
+
 func (s *bindingsStatusStore) reloaded(warnings []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,14 +132,27 @@ func (r *reconciler) watchBindings(ctx context.Context, path string, local bool,
 			return
 		case <-ticker.C:
 		}
-		bindings, next, err := readBindings(path, local, false)
-		if next == current || next != "" && next == failed {
+		// Hash first: only new content is parsed.
+		raw, next, err := readBindingsFile(path)
+		if next == current {
+			// Back to the active content: the error, if any, no longer applies.
+			if reported != "" {
+				status.clear()
+				failed, reported = "", ""
+			}
+			continue
+		}
+		if next != "" && next == failed {
 			continue
 		}
 		now := time.Now()
 		var warnings []string
 		if err == nil {
-			warnings, err = r.reloadBindings(bindings, next, now)
+			r.bindingsParses.Add(1)
+			var bindings upstreamBindings
+			if bindings, err = parseBindings(raw, path, local, false); err == nil {
+				warnings, err = r.reloadBindings(bindings, next, now)
+			}
 		}
 		if err != nil {
 			// A file that cannot be read has no revision, and a failure that

@@ -596,8 +596,8 @@ A request is served entirely by one bindings revision, and readiness never
 changes during a reload. On any error, the active bindings keep serving, and
 the error is logged once and shown in `/status` as `lastBindingsError`, with
 the `revision` of the rejected content (none when the file could not be
-read). A
-file that does not parse, validate or hot-swap is not tried again until its
+read). It clears when the file returns to the active content. Only new
+content is parsed: a file that does not parse, validate or hot-swap is not tried again until its
 content changes. A failure that does not depend on the content, such as
 contracts that cannot be read, is retried on the next read. A reload does not
 read `upstreamTLS.caFile`: the verifier re-reads it on its own. A reload that
@@ -680,8 +680,9 @@ Darban has no Prometheus registry, so the rejections appear in `/status` only.
 
 `GET /status` on the private admin port (8081) reports the active revision,
 the bindings (`bindingsRevision`, the SHA-256 of the active file,
-`bindingsLoadedAt`, and `lastBindingsError` with its message and time, which
-stays after a later reload succeeds), route count, and EndpointSlice state
+`bindingsLoadedAt`, `lastBindingsError` with its message, time and rejected
+revision, which stays after a later reload succeeds and clears when the file
+returns to the active content, and `bindingsWarnings` from the latest reload), route count, and EndpointSlice state
 for the authorizer and each backend,
 including the upstreams that contracts add at runtime. Darban watches every
 EndpointSlice in its own namespace, and the Services named in `bindings` in

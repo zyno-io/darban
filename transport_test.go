@@ -515,7 +515,8 @@ func TestAuthorizerRequestHeadersCannotBeHopByHop(t *testing.T) {
 	if err := writeBindings(t, fmt.Sprintf(base, "Content-Type")); err != nil {
 		t.Errorf("Content-Type: %v", err)
 	}
-	for _, header := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
+	for _, header := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
+		"Proxy-Authorization", "Proxy-Authenticate"} {
 		if err := writeBindings(t, fmt.Sprintf(base, header)); err == nil {
 			t.Errorf("%s accepted", header)
 		}

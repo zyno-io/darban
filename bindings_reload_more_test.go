@@ -55,12 +55,65 @@ func TestBindingsReloadDoesNotRetryARejectedRevision(t *testing.T) {
 	if got := r.status().LastBindingsError; got.Revision != hex.EncodeToString(sum[:]) || got.Revision == r.status().BindingsRevision {
 		t.Errorf("error %+v", got)
 	}
-	r.first.bindingsStatus.mu.Lock()
-	r.first.bindingsStatus.err = nil
-	r.first.bindingsStatus.mu.Unlock()
+	// The watcher keeps reading the file, but parses the rejected content
+	// only once.
+	parses := r.rec.bindingsParses.Load()
 	time.Sleep(60 * time.Millisecond)
-	if got := r.status().LastBindingsError; got != nil {
-		t.Errorf("the rejected revision was tried again: %+v", got)
+	if again := r.rec.bindingsParses.Load(); again != parses {
+		t.Errorf("the rejected revision was parsed again: %d, then %d", parses, again)
+	}
+	// Back to the active content, the error clears.
+	r.files.write(reloadBindingsJSON(origin, ""))
+	r.waitFor("error cleared", func() bool { return r.status().LastBindingsError == nil })
+	if r.rec.bindingsParses.Load() != parses {
+		t.Error("the active content was parsed again")
+	}
+}
+
+func TestBindingsReloadWarnsOnlyWhenAServiceLosesItsContract(t *testing.T) {
+	origin := teapotUpstream(t)
+	r := newReloadRig(t, reloadBindingsJSON(origin, ""))
+	// C1 is last good; C2 is rejected because it selects nothing it declares.
+	c2 := contractFor("alpha", "/other", "listOther")
+	r.files.write(reloadBindingsJSON(origin, `, "operations": [{"method": "get", "path": "/items"}]`))
+	r.waitFor("selection applied", func() bool {
+		return len(r.active.Load().gateway.bindings.Services["alpha"].Operations) == 1
+	})
+	r.setContracts(c2, contractFor("beta", "/items", "listBeta"))
+	if r.get("/alpha/items") != http.StatusTeapot {
+		t.Fatal("alpha lost its last good contract")
+	}
+	// The new selection breaks C1 but makes C2 compile: alpha serves C2.
+	r.files.write(reloadBindingsJSON(origin, `, "operations": [{"method": "get", "path": "/other"}]`))
+	r.waitFor("alpha serves C2", func() bool { return r.get("/alpha/other") == http.StatusTeapot })
+	if warnings := r.status().BindingsWarnings; len(warnings) != 0 {
+		t.Errorf("warnings %q", warnings)
+	}
+	for _, entry := range r.status().Contracts {
+		if entry.Service == "alpha" && strings.Contains(entry.Reason, "last good") {
+			t.Errorf("alpha %+v", entry)
+		}
+	}
+}
+
+func TestDroppedReasonsArePrunedWithTheirContract(t *testing.T) {
+	origin := teapotUpstream(t)
+	r := newReloadRig(t, strings.Replace(reloadBindingsJSON(origin, ""), `"beta": {"origin"`, `"gamma": {"origin": "`+origin+`"}, "beta": {"origin"`, 1))
+	r.setContracts(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"), contractFor("gamma", "/items", "listGamma"))
+	r.setContracts(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"), contractFor("gamma", "/items", "listGamma", badVisibility))
+	// gamma loses its last good contract to a reload, then its contract goes.
+	r.files.write(strings.Replace(reloadBindingsJSON(origin, ""), `"beta": {"origin"`,
+		`"gamma": {"origin": "`+origin+`", "operations": [{"method": "get", "path": "/nope"}]}, "beta": {"origin"`, 1))
+	r.waitFor("gamma dropped", func() bool {
+		r.rec.mu.Lock()
+		defer r.rec.mu.Unlock()
+		return r.rec.dropped["gamma"] != ""
+	})
+	r.setContracts(contractFor("alpha", "/items", "listAlpha"), contractFor("beta", "/items", "listBeta"))
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	if reason := r.rec.dropped["gamma"]; reason != "" {
+		t.Errorf("kept %q for a deleted contract", reason)
 	}
 }
 
