@@ -68,7 +68,7 @@ func TestDebugServiceSelection(t *testing.T) {
 	}
 	const path = "/observatory/objects"
 	active := g.build(candidate{routes: []compiledOperation{{
-		key: operationKey{"POST", path}, service: "observatory", path: "/observatory/objects", credentials: []string{"sessionBearer"},
+		key: operationKey{"POST", path}, service: "observatory", path: "/observatory/objects", protected: true,
 	}}})
 	send := func(account, wantBody string, wantStatus int) {
 		t.Helper()

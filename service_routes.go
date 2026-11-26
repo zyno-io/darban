@@ -21,7 +21,6 @@ type serviceRoute struct {
 	Origin                    string
 	UpstreamHost              string
 	LegacyHosts               []string
-	AuthProfiles              []string
 	BackendAuth               bool
 	BackendCORS               bool
 	ForwardTrustedClientIP    bool
@@ -35,8 +34,11 @@ type serviceRoute struct {
 func (b *upstreamBindings) validateServiceRoutes(local bool) error {
 	hosts := map[string]bool{b.Hostname: true}
 	for prefix, route := range b.ServiceRoutes {
-		if !prefixPath.MatchString(prefix) || route.BackendAuth == (len(route.AuthProfiles) > 0) {
-			return fmt.Errorf("service route %q requires a prefix and exactly one authorization policy", prefix)
+		if !prefixPath.MatchString(prefix) {
+			return fmt.Errorf("invalid service route prefix %q", prefix)
+		}
+		if !route.BackendAuth && b.Authz == "" {
+			return fmt.Errorf("service route %q authorizes at the gateway, which needs authz (or set backendAuth)", prefix)
 		}
 		if _, err := upstreamOrigin(route.Origin, local); err != nil {
 			return fmt.Errorf("service route %q: %w", prefix, err)
@@ -49,11 +51,6 @@ func (b *upstreamBindings) validateServiceRoutes(local bool) error {
 				return fmt.Errorf("invalid or duplicate legacy host %q for %q", host, prefix)
 			}
 			hosts[host] = true
-		}
-		for _, profile := range route.AuthProfiles {
-			if _, found := b.Authorization.Profiles[profile]; !found {
-				return fmt.Errorf("unknown credential profile %q for %q", profile, prefix)
-			}
 		}
 		if route.LongResponseHeaderTimeout != "" || len(route.LongResponsePaths) > 0 {
 			timeout, err := time.ParseDuration(route.LongResponseHeaderTimeout)
@@ -155,14 +152,21 @@ func (t serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.normal.RoundTrip(r)
 }
 
-func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix, servicePath string, preflight bool, method string) {
+// serveService proxies a request through a direct route's transport. With
+// backendAuthorization the backend authorizes the request and gets its
+// Authorization; otherwise the gateway does and the backend gets the identity.
+// upstreamMethod, when set, replaces the method sent upstream.
+func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix string, backendAuthorization, preflight bool, method, upstreamMethod string) {
 	route, found := g.bindings.ServiceRoutes[prefix]
 	if !found {
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
-	backendAuthorization := route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath)
 	originAllowed := false
+	if route.BackendCORS && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		// The backend answers its own preflights, which carry no credentials.
+		backendAuthorization = true
+	}
 	if !route.BackendCORS {
 		originAllowed = slices.Contains(g.bindings.BrowserOrigins, r.Header.Get("Origin"))
 		if preflight && (!backendAuthorization || originAllowed) {
@@ -188,14 +192,14 @@ func (g *gateway) serveService(w http.ResponseWriter, r *http.Request, prefix, s
 	var caller identity
 	if !backendAuthorization {
 		var ok bool
-		caller, ok = g.authorizeRequest(w, r, route.AuthProfiles)
+		caller, ok = g.authorizeRequest(w, r)
 		if !ok {
 			return
 		}
 	}
 	state := serviceRequest{
 		identity: caller, backendAuthorization: backendAuthorization, originAllowed: originAllowed,
-		legacy: r.Host != g.bindings.Hostname, clientIP: clientIP,
+		legacy: r.Host != g.bindings.Hostname, clientIP: clientIP, method: upstreamMethod,
 	}
 	g.serviceProxies[prefix].ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), serviceRequestKey{}, state)))
 }
@@ -208,6 +212,7 @@ type serviceRequest struct {
 	originAllowed        bool
 	legacy               bool
 	clientIP             string
+	method               string
 }
 
 func (r serviceRoute) allowsPath(value string) bool {
@@ -238,6 +243,9 @@ func serviceProxy(prefix string, route serviceRoute, target *url.URL, transport 
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			state := r.In.Context().Value(serviceRequestKey{}).(serviceRequest)
+			if state.method != "" {
+				r.Out.Method = state.method
+			}
 			if state.legacy {
 				r.Out.Host = r.In.Host
 				r.Out.URL.RawQuery = r.In.URL.RawQuery

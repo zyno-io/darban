@@ -172,14 +172,13 @@ func TestPublishOnlyOmitsOperationsTheDirectRouteRefuses(t *testing.T) {
 		op("/items/open", "anonymous") + // the gateway would require credentials
 		"components:\n  securitySchemes:\n    bearerAuth: {type: http, scheme: bearer}\n"
 	route := serviceRoute{
-		Origin: "http://talk.fixtures.svc.cluster.local:80", AuthProfiles: []string{"bearerAuth"},
+		Origin:       "http://talk.fixtures.svc.cluster.local:80",
 		PublicPaths:  []string{"/public/*"},
 		AllowedPaths: []string{"/items/*", "/public/*", "/admin/*", "/protected"},
 		DeniedPaths:  []string{"/admin/*", "/items/blocked"},
 	}
 	bindings := talkBindings(route.Origin, false, true)
 	bindings.ServiceRoutes["/talk"] = route
-	bindings.Authorization.Profiles = map[string]credentialProfile{"bearerAuth": {Scheme: "bearer"}}
 	reg := registration{serviceName: "talk", openAPI: contract, rewrites: "[]"}
 	got, report := compile([]registration{reg}, bindings, nil)
 	outcome := report.services["talk"]
@@ -211,7 +210,7 @@ func TestPublishOnlyOmitsOperationsTheDirectRouteRefuses(t *testing.T) {
 	}
 
 	// A backendAuth route accepts anonymous requests on every path.
-	route.BackendAuth, route.AuthProfiles = true, nil
+	route.BackendAuth = true
 	bindings.ServiceRoutes["/talk"] = route
 	got, report = compile([]registration{reg}, bindings, nil)
 	if paths := documentedPaths(t, got); !slices.Contains(paths, "GET /talk/items/open") || len(report.services["talk"].warnings) != 3 {

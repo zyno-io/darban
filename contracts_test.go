@@ -24,10 +24,6 @@ func fixtureAuthorization() authorizationConfig {
 		Path:                "/authorize",
 		ResponseHeaders:     []string{"X-Auth-Subject", "X-Auth-Account", "X-Auth-Debug-Allowed"},
 		StripHeaderPrefixes: []string{"X-Auth-"},
-		Profiles: map[string]credentialProfile{
-			"sessionBearer": {Scheme: "bearer", RequiredHeaders: []string{"X-Auth-Subject", "X-Auth-Account"}},
-			"clientBasic":   {Scheme: "basic", RequiredHeaders: []string{"X-Auth-Subject"}},
-		},
 	}
 }
 
@@ -117,10 +113,13 @@ components:
 	}{
 		{"POST", "/observatory/objects", "", 401},
 		{"POST", "/observatory/objects", "Bearer fixture", 200},
-		{"POST", "/observatory/objects", "Bearer incomplete", 503},
+		// The authorizer's identity is trusted as returned.
+		{"POST", "/observatory/objects", "Bearer incomplete", 200},
 		{"POST", "/observatory/alias", "", 401},
 		{"POST", "/observatory/alias", "Bearer fixture", 200},
-		{"GET", "/observatory/legacy-objects", "Bearer fixture", 401},
+		// Any scheme goes to the authorizer: the contract's schemes are
+		// documentation only.
+		{"GET", "/observatory/legacy-objects", "Bearer fixture", 200},
 		{"GET", "/observatory/legacy-objects", "Basic fixture", 200},
 		{"GET", "/observatory/internal", "Bearer fixture", 404},
 	} {
@@ -142,6 +141,14 @@ components:
 	if err != nil {
 		t.Fatal(err)
 	}
+	if string(changed.specYAML) != string(compiled.specYAML) || changed.revision != compiled.revision {
+		t.Fatal("an unlisted route's scheme is documentation only")
+	}
+	reg.openAPI = strings.Replace(raw, "security: [{sessionBearer: []}]", "security: []\n      x-darban-policy: anonymous", 1)
+	changed, err = compileStrict([]registration{reg}, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(changed.specYAML) != string(compiled.specYAML) || changed.revision == compiled.revision {
 		t.Fatal("changing only an unlisted route's auth policy should change the active revision")
 	}
@@ -156,6 +163,7 @@ func TestSelectsOperationsFromFullServiceContract(t *testing.T) {
 paths:
   /sky/objects:
     get:
+      security: [{sessionBearer: []}]
       responses:
         '200': {description: OK}
     post:
@@ -165,13 +173,13 @@ paths:
     get:
       responses:
         '200': {description: OK}
+components:
+  securitySchemes:
+    sessionBearer: {type: http, scheme: bearer}
 `
 	binding := serviceBinding{
 		Prefix: "/observatory", Origin: "http://observatory.fixtures.svc.cluster.local:80",
-		Operations: []operationSelection{{
-			Method: "get", Path: "/sky/objects",
-			Legacy: &legacySecurity{Profiles: []string{"sessionBearer"}},
-		}},
+		Operations: []operationSelection{{Method: "get", Path: "/sky/objects"}},
 	}
 	bindings := upstreamBindings{
 		Hostname: "api.example.net", Authorization: fixtureAuthorization(),
@@ -182,14 +190,14 @@ paths:
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := compiledOperation{operationKey{"GET", "/observatory/sky/objects"}, "observatory", "/sky/objects", []string{"sessionBearer"}}
+	want := compiledOperation{operationKey{"GET", "/observatory/sky/objects"}, "observatory", "/sky/objects", true}
 	if !reflect.DeepEqual(got.routes, []compiledOperation{want}) {
 		t.Fatalf("unexpected routes: %+v", got.routes)
 	}
 
-	reg.openAPI = strings.Replace(raw, "    get:\n", "    get:\n      security: []\n", 1)
+	reg.openAPI = strings.Replace(raw, "      security: [{sessionBearer: []}]\n", "      security: []\n", 1)
 	if _, err := compileStrict([]registration{reg}, bindings); err == nil {
-		t.Fatal("selected operation accepted with a changed security policy")
+		t.Fatal("selected operation accepted without a credential policy")
 	}
 	reg.openAPI = strings.Replace(raw, "    get:\n", "    get:\n      x-darban-visibility: internal\n", 1)
 	got, err = compileStrict([]registration{reg}, bindings)
@@ -283,25 +291,28 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 		<-done
 	}()
 	path := operationKey{"GET", "/herbarium/specimens/leaves"}
-	waitPolicy := func(profile string) {
+	// The route is herbarium's own operation until the rewrite sends it to
+	// observatory.
+	waitPolicy := func(service string) {
 		t.Helper()
 		timer := time.NewTimer(5 * time.Second)
 		defer timer.Stop()
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			if current := active.Load(); current != nil &&
-				reflect.DeepEqual(current.routes[path].credentials, []string{profile}) {
-				return
+			if current := active.Load(); current != nil {
+				if route, ok := current.routes[path]; ok && route.protected && route.service == service {
+					return
+				}
 			}
 			select {
 			case <-timer.C:
-				t.Fatalf("local watcher did not activate %s", profile)
+				t.Fatalf("local watcher did not activate %s", service)
 			case <-ticker.C:
 			}
 		}
 	}
-	waitPolicy("clientBasic")
+	waitPolicy("herbarium")
 	initial := active.Load()
 	if !strings.Contains(string(initial.specYAML), "/observatory/sky/v2/objects:") {
 		t.Fatal("the upstream version segment disappeared")
@@ -318,7 +329,7 @@ func TestLocalWatchReloadsReferencedRewrite(t *testing.T) {
 	if err := os.Rename(target+".new", target); err != nil {
 		t.Fatal(err)
 	}
-	waitPolicy("sessionBearer")
+	waitPolicy("observatory")
 	updatedSnapshot := active.Load()
 	if updatedSnapshot.revision == old {
 		t.Fatal("policy changed without a new snapshot")

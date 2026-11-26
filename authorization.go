@@ -13,17 +13,14 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
+// authorizationConfig locates the authorizer at authz+Path. RequestHeaders
+// are forwarded to it, ResponseHeaders are the identity it returns and Darban
+// projects upstream, and StripHeaderPrefixes are removed from every request.
 type authorizationConfig struct {
 	Path                string
 	RequestHeaders      []string
 	ResponseHeaders     []string
 	StripHeaderPrefixes []string
-	Profiles            map[string]credentialProfile
-}
-
-type credentialProfile struct {
-	Scheme          string
-	RequiredHeaders []string
 }
 
 type debugConfig struct {
@@ -32,8 +29,12 @@ type debugConfig struct {
 	RequiredValue  string
 }
 
+// identity is the caller as the authorizer described it. authorized is false
+// when the gateway did not authorize the request, whose Authorization then
+// goes upstream unchanged.
 type identity struct {
-	headers http.Header
+	authorized bool
+	headers    http.Header
 }
 
 type identityKey struct{}
@@ -41,7 +42,7 @@ type identityKey struct{}
 var forwardedMetadata = []string{"X-Original-Method", "X-Original-URI", "X-Original-URL"}
 
 func (a *authorizationConfig) validate(origin string) error {
-	if (origin != "" || len(a.Profiles) != 0) && (origin == "" || a.Path != "/" && !docPath.MatchString(a.Path)) {
+	if (origin != "" || a.Path != "") && (origin == "" || a.Path != "/" && !docPath.MatchString(a.Path)) {
 		return errors.New("authorization requires a private origin and a path")
 	}
 	for _, headers := range [][]string{a.RequestHeaders, a.ResponseHeaders, a.StripHeaderPrefixes} {
@@ -56,20 +57,6 @@ func (a *authorizationConfig) validate(origin string) error {
 		if name == "Authorization" || name == "Host" || slices.Contains(forwardedMetadata, name) || !httpguts.ValidTrailerHeader(name) {
 			return fmt.Errorf("authorization cannot project header %q", name)
 		}
-	}
-	for name, profile := range a.Profiles {
-		if !componentID.MatchString(name) || !httpguts.ValidHeaderFieldName(profile.Scheme) {
-			return fmt.Errorf("invalid credential profile %q", name)
-		}
-		profile.Scheme = strings.ToLower(profile.Scheme)
-		for i, header := range profile.RequiredHeaders {
-			canonical := http.CanonicalHeaderKey(header)
-			if !slices.Contains(a.ResponseHeaders, canonical) {
-				return fmt.Errorf("credential profile %q requires an unprojected header %q", name, header)
-			}
-			profile.RequiredHeaders[i] = canonical
-		}
-		a.Profiles[name] = profile
 	}
 	return nil
 }
@@ -86,15 +73,10 @@ func (d *debugConfig) validate(authorization authorizationConfig) error {
 	return nil
 }
 
-func credentialScheme(authorization string) string {
-	prefix, value, ok := strings.Cut(authorization, " ")
-	if !ok || value == "" {
-		return ""
-	}
-	return strings.ToLower(prefix)
-}
-
-func (g *gateway) authorize(ctx context.Context, profile credentialProfile, authorization string, original *http.Request) (identity, int, string) {
+// authorize asks the authorizer about the caller's credentials as sent,
+// whatever their scheme. A 2xx answer's identity headers are trusted as
+// returned.
+func (g *gateway) authorize(ctx context.Context, authorization string, original *http.Request) (identity, int, string) {
 	settings := g.bindings.Authorization
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.bindings.Authz+settings.Path, nil)
 	if err != nil {
@@ -115,22 +97,17 @@ func (g *gateway) authorize(ctx context.Context, profile credentialProfile, auth
 	if _, err := io.Copy(io.Discard, io.LimitReader(res.Body, 65536)); err != nil {
 		return identity{}, http.StatusServiceUnavailable, ""
 	}
-	switch res.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return identity{}, res.StatusCode, ""
-	case http.StatusTooManyRequests:
-		return identity{}, res.StatusCode, res.Header.Get("Retry-After")
-	case http.StatusOK, http.StatusNoContent:
-		caller := identity{headers: make(http.Header)}
+	switch code := res.StatusCode; {
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		return identity{}, code, ""
+	case code == http.StatusTooManyRequests:
+		return identity{}, code, res.Header.Get("Retry-After")
+	case code >= 200 && code < 300:
+		caller := identity{authorized: true, headers: make(http.Header)}
 		for _, name := range settings.ResponseHeaders {
 			values := res.Header.Values(name)
 			if len(values) == 1 && values[0] != "" {
 				caller.headers.Set(name, values[0])
-			}
-		}
-		for _, name := range profile.RequiredHeaders {
-			if caller.headers.Get(name) == "" {
-				return identity{}, http.StatusServiceUnavailable, ""
 			}
 		}
 		return caller, 0, ""
@@ -144,12 +121,11 @@ func setOriginalRequestHeaders(headers http.Header, r *http.Request) {
 	headers.Set("X-Original-URL", "https://"+r.Host+r.RequestURI)
 }
 
-func (g *gateway) authorizeRequest(w http.ResponseWriter, r *http.Request, credentials []string) (identity, bool) {
-	if len(credentials) == 0 {
-		return identity{}, true
-	}
+// authorizeRequest authorizes a request at the gateway. It needs exactly one
+// non-empty Authorization header, which goes to the authorizer unchanged.
+func (g *gateway) authorizeRequest(w http.ResponseWriter, r *http.Request) (identity, bool) {
 	values := r.Header.Values("Authorization")
-	if len(values) != 1 {
+	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
 		writeStatus(w, http.StatusUnauthorized)
 		return identity{}, false
 	}
@@ -158,18 +134,9 @@ func (g *gateway) authorizeRequest(w http.ResponseWriter, r *http.Request, crede
 		writeStatus(w, http.StatusRequestHeaderFieldsTooLarge)
 		return identity{}, false
 	}
-	scheme := credentialScheme(authorization)
-	profiles := g.bindings.Authorization.Profiles
-	index := slices.IndexFunc(credentials, func(name string) bool {
-		return scheme != "" && profiles[name].Scheme == scheme
-	})
-	if index < 0 {
-		writeStatus(w, http.StatusUnauthorized)
-		return identity{}, false
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	caller, status, retry := g.authorize(ctx, profiles[credentials[index]], authorization, r)
+	caller, status, retry := g.authorize(ctx, authorization, r)
 	if status != 0 {
 		if retry != "" {
 			w.Header().Set("Retry-After", retry)

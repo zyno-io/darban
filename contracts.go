@@ -52,6 +52,9 @@ type serviceBinding struct {
 	Mount       string
 	DebugOrigin string
 	Operations  []operationSelection
+	// ExtraRoutes are paths a routed service serves that its contract cannot
+	// declare, such as probes, static assets and event streams.
+	ExtraRoutes []extraRoute `json:",omitempty"`
 	// Route and Publish default to true. Route false keeps the service's
 	// traffic on its serviceRoutes entry and makes the contract docs-only.
 	// Publish false keeps its operations out of the combined OpenAPI.
@@ -73,10 +76,22 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 		(b.Mount != "" && !literalPath.MatchString(b.Mount)) {
 		return fmt.Errorf("invalid service binding %q", name)
 	}
-	for _, operation := range b.Operations {
-		if err := operation.Legacy.validate(); err != nil {
+	extras := make(map[operationKey]bool, len(b.ExtraRoutes))
+	for _, extra := range b.ExtraRoutes {
+		key := operationKey{extra.Method, extra.Path}
+		if !b.routed() {
+			return fmt.Errorf("service %q has route: false, so it cannot have extraRoutes", name)
+		}
+		if extras[key] {
+			return fmt.Errorf("service %q: duplicate extra route %s %s", name, extra.Method, extra.Path)
+		}
+		extras[key] = true
+		if err := extra.validate(b, bindings); err != nil {
 			return fmt.Errorf("service %q: %w", name, err)
 		}
+	}
+	if _, direct := bindings.ServiceRoutes[b.Prefix]; direct && b.Prefix != "" && b.routed() && b.DebugOrigin != "" {
+		return fmt.Errorf("service %q uses the serviceRoutes transport of %s, which has no debug origin", name, b.Prefix)
 	}
 	if !b.routed() && len(b.Operations) != 0 {
 		return fmt.Errorf("service %q has route: false, so it cannot select operations", name)
@@ -108,27 +123,39 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 type operationSelection struct {
 	Method string
 	Path   string
-	Legacy *legacySecurity
 }
 
-type legacySecurity struct {
-	Source   securityRequirements
-	Profiles []string
+// extraRoute is a path a routed service serves besides its contract
+// operations. Path is an upstream path like an operation's, and may end in /*
+// for a subtree. Auth is gateway (the authorizer decides) or none (the
+// backend does).
+type extraRoute struct {
+	Method string
+	Path   string
+	Auth   string
 }
 
-func (l *legacySecurity) validate() error {
-	if l == nil {
-		return nil
+const (
+	extraAuthGateway = "gateway"
+	extraAuthNone    = "none"
+)
+
+var extraMethods = []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+
+func (e extraRoute) validate(binding serviceBinding, bindings upstreamBindings) error {
+	base, _ := strings.CutSuffix(e.Path, "/*")
+	switch {
+	case !slices.Contains(extraMethods, e.Method):
+		return fmt.Errorf("extra route %s %s: method must be one of %s", e.Method, e.Path, strings.Join(extraMethods, ", "))
+	case !templatePath(base):
+		return fmt.Errorf("extra route %s %s: the path must be an operation path, optionally ending in /*", e.Method, e.Path)
+	case e.Auth != extraAuthGateway && e.Auth != extraAuthNone:
+		return fmt.Errorf("extra route %s %s: auth must be gateway or none", e.Method, e.Path)
+	case e.Auth == extraAuthGateway && bindings.Authz == "":
+		return fmt.Errorf("extra route %s %s: auth gateway needs authz", e.Method, e.Path)
 	}
-	if len(slices.Compact(slices.Sorted(slices.Values(l.Profiles)))) != len(l.Profiles) {
-		return errors.New("duplicate legacy profiles")
-	}
-	for i, requirement := range l.Source {
-		for _, other := range l.Source[i+1:] {
-			if sameRequirementSet(securityRequirements{requirement}, securityRequirements{other}) {
-				return errors.New("duplicate legacy source security requirements")
-			}
-		}
+	if _, ok := binding.publicPath(base); !ok {
+		return fmt.Errorf("extra route %s %s is outside the mount %q", e.Method, e.Path, binding.Mount)
 	}
 	return nil
 }
@@ -253,9 +280,10 @@ type sourceDoc struct {
 }
 
 type sourceOperation struct {
-	service      string
-	path         string
-	credentials  []string
+	service string
+	path    string
+	// protected reports that the gateway authorizes the operation.
+	protected    bool
 	visibility   operationVisibility
 	operationID  string
 	doc          map[string]any
@@ -267,10 +295,12 @@ type sourceOperation struct {
 }
 
 type compiledOperation struct {
-	key         operationKey
-	service     string
-	path        string
-	credentials []string
+	key     operationKey
+	service string
+	// path is the upstream path template. An extra route's may end in /*.
+	path string
+	// protected reports that the gateway authorizes the operation.
+	protected bool
 }
 
 // serviceCounts is what the assembled snapshot does with one service's
@@ -287,6 +317,7 @@ type candidate struct {
 	// passthrough lists operations left unselected by their bindings.
 	passthrough []operationKey
 	routes      []compiledOperation
+	extras      []compiledOperation
 	// services holds the effective binding of every assembled service.
 	services map[string]serviceBinding
 	// aliasWarnings holds, by owning service, why a rewrite of that service is
@@ -396,114 +427,26 @@ func operationSecurity(doc map[string]any, source sourceDoc) (securityRequiremen
 	return requirements, nil
 }
 
-func effectiveSecurity(doc map[string]any, source sourceDoc, allowed map[string]credentialProfile) (securityRequirements, []string, error) {
-	requirements, err := operationSecurity(doc, source)
+// operationPolicy checks that an operation declares its credential policy:
+// non-empty security, or security: [] with x-darban-policy: anonymous. The
+// schemes are documentation only. protected reports that the gateway
+// authorizes the operation.
+func operationPolicy(doc map[string]any, source sourceDoc) (requirements securityRequirements, protected bool, err error) {
+	requirements, err = operationSecurity(doc, source)
 	if err != nil {
-		return nil, nil, err
+		return nil, false, err
 	}
 	if len(requirements) == 0 {
 		security, explicit := doc["security"].([]any)
 		if explicit && len(security) == 0 && doc[policyExtension] == "anonymous" {
-			return securityRequirements{}, nil, nil
+			return securityRequirements{}, false, nil
 		}
-		return nil, nil, errors.New("explicit credential policy required")
+		return nil, false, errors.New("explicit credential policy required")
 	}
 	if _, hasPolicy := doc[policyExtension]; hasPolicy {
-		return nil, nil, errors.New("unknown or conflicting gateway policy")
+		return nil, false, errors.New("unknown or conflicting gateway policy")
 	}
-	profiles := make([]string, 0, len(requirements))
-	schemes := make(map[string]bool, len(requirements))
-	for _, alternative := range requirements {
-		if len(alternative) != 1 {
-			return nil, nil, errors.New("each alternative must specify one approved credential")
-		}
-		for name, scopes := range alternative {
-			profile, configured := allowed[name]
-			scheme, _ := source.Components["securitySchemes"][name].(map[string]any)
-			declaredScheme, _ := scheme["scheme"].(string)
-			if !configured || scopes == nil || len(scopes) != 0 || scheme["type"] != "http" ||
-				!strings.EqualFold(declaredScheme, profile.Scheme) || schemes[profile.Scheme] {
-				return nil, nil, fmt.Errorf("invalid or ambiguous credential profile %q", name)
-			}
-			schemes[profile.Scheme] = true
-			profiles = append(profiles, name)
-		}
-	}
-	return requirements, profiles, nil
-}
-
-func applyLegacySecurity(op map[string]any, source *sourceDoc, legacy *legacySecurity, allowed map[string]credentialProfile) error {
-	security, err := operationSecurity(op, *source)
-	if err != nil {
-		return err
-	}
-	target := make(securityRequirements, 0, len(legacy.Profiles))
-	for _, name := range legacy.Profiles {
-		if _, exists := allowed[name]; !exists {
-			return fmt.Errorf("unknown legacy credential profile %q", name)
-		}
-		target = append(target, map[string][]string{name: {}})
-	}
-	native := len(legacy.Profiles) != 0 && sameRequirementSet(security, target)
-	if !native && ((security == nil) != (legacy.Source == nil) || !sameRequirementSet(security, legacy.Source)) {
-		return errors.New("legacy source security changed")
-	}
-	if source.Components == nil {
-		source.Components = make(map[string]map[string]any)
-	}
-	if source.Components["securitySchemes"] == nil {
-		source.Components["securitySchemes"] = make(map[string]any)
-	}
-	schemes := source.Components["securitySchemes"]
-	if native {
-		// The service already emits the target security. Keep its operation and
-		// the schemes it declares, and only fill in a scheme it left out.
-		for _, name := range legacy.Profiles {
-			if _, declared := schemes[name]; !declared {
-				schemes[name] = map[string]any{"type": "http", "scheme": allowed[name].Scheme}
-			}
-		}
-		return nil
-	}
-	for _, name := range legacy.Profiles {
-		schemes[name] = map[string]any{"type": "http", "scheme": allowed[name].Scheme}
-	}
-	op["security"] = target
-	return nil
-}
-
-// sameRequirementSet compares security requirement objects as an unordered
-// set. A nil and an empty scope list are equal.
-func sameRequirementSet(a, b securityRequirements) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	same := func(x, y map[string][]string) bool {
-		if len(x) != len(y) {
-			return false
-		}
-		for name, scopes := range x {
-			other, exists := y[name]
-			if !exists || !slices.Equal(scopes, other) {
-				return false
-			}
-		}
-		return true
-	}
-	contains := func(set securityRequirements, item map[string][]string) bool {
-		return slices.ContainsFunc(set, func(other map[string][]string) bool { return same(item, other) })
-	}
-	for _, item := range b {
-		if !contains(a, item) {
-			return false
-		}
-	}
-	for _, item := range a {
-		if !contains(b, item) {
-			return false
-		}
-	}
-	return true
+	return requirements, true, nil
 }
 
 // Import only components referenced by a published operation. Prefix names
@@ -802,13 +745,13 @@ func parseOpenAPI(openAPI string) (sourceDoc, error) {
 // passthrough those the binding's operations leave unselected, so a selected
 // template cannot capture their paths.
 func readOperations(service string, source sourceDoc, binding serviceBinding, fallback operationVisibility, bindings upstreamBindings, native map[operationKey]sourceOperation, denied, passthrough *[]operationKey) error {
-	selected := make(map[operationKey]*legacySecurity, len(binding.Operations))
+	selected := make(map[operationKey]bool, len(binding.Operations))
 	for _, operation := range binding.Operations {
 		key := operationKey{operation.Method, operation.Path}
-		if _, exists := selected[key]; exists {
+		if selected[key] {
 			return fmt.Errorf("duplicate operation selection %s %s", key.method, key.path)
 		}
-		selected[key] = operation.Legacy
+		selected[key] = true
 	}
 	matched := 0
 	// shapes holds the first path of each method and path shape.
@@ -817,8 +760,7 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 		item := source.Paths[path]
 		for _, key := range slices.Sorted(maps.Keys(item)) {
 			value := item[key]
-			legacy, included := selected[operationKey{key, path}]
-			excluded := len(selected) != 0 && !included
+			excluded := len(selected) != 0 && !selected[operationKey{key, path}]
 			if key == "parameters" || key == "servers" || key == "summary" || key == "description" || strings.HasPrefix(key, "x-") {
 				continue
 			}
@@ -869,12 +811,7 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 				native[publicKey] = sourceOperation{visibility: visibilityInternal}
 				continue
 			}
-			if legacy != nil {
-				if err := applyLegacySecurity(op, &source, legacy, bindings.Authorization.Profiles); err != nil {
-					return fmt.Errorf("%s %s: %w", key, path, err)
-				}
-			}
-			requirements, profiles, err := effectiveSecurity(op, source, bindings.Authorization.Profiles)
+			requirements, protected, err := operationPolicy(op, source)
 			if err != nil {
 				return fmt.Errorf("%s %s: %w", key, path, err)
 			}
@@ -916,7 +853,7 @@ func readOperations(service string, source sourceDoc, binding serviceBinding, fa
 			native[publicKey] = sourceOperation{
 				service:      service,
 				path:         path,
-				credentials:  profiles,
+				protected:    protected,
 				visibility:   visibility,
 				operationID:  operationID,
 				doc:          contract,
@@ -950,6 +887,7 @@ type serviceUnit struct {
 	aliases       map[operationKey]aliasTarget
 	denied        []operationKey
 	passthrough   []operationKey
+	extras        []compiledOperation
 	// warnings lists operations a docs-only unit leaves out of the document
 	// because its direct route would refuse them.
 	warnings []string
@@ -1064,6 +1002,14 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 				unit.native[key] = op
 			}
 		}
+	}
+	for _, extra := range binding.ExtraRoutes {
+		base, subtree := strings.CutSuffix(extra.Path, "/*")
+		public, _ := binding.publicPath(base)
+		if subtree {
+			public, base = public+"/*", base+"/*"
+		}
+		unit.extras = append(unit.extras, compiledOperation{operationKey{extra.Method, public}, reg.serviceName, base, extra.Auth == extraAuthGateway})
 	}
 	for _, rule := range rules {
 		from := operationKey{rule.From.Method, rule.From.Path}
@@ -1420,6 +1366,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 			deny(key, name)
 		}
 		out.passthrough = append(out.passthrough, unit.passthrough...)
+		out.extras = append(out.extras, unit.extras...)
 	}
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
@@ -1503,13 +1450,16 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		update(&counts)
 		out.counts[owner] = counts
 	}
+	for _, extra := range out.extras {
+		count(extra.service, func(c *serviceCounts) { c.routes++ })
+	}
 	for _, key := range slices.SortedFunc(maps.Keys(published), compareOperationKeys) {
 		source := published[key]
 		if key.path == bindings.OpenAPI.YAMLPath || key.path == bindings.OpenAPI.JSONPath {
 			return out, &assemblyError{source.service, fmt.Errorf("OpenAPI endpoint conflicts with route %s %s", key.method, key.path)}
 		}
 		if !source.unrouted {
-			out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.credentials})
+			out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.protected})
 			count(keyOwners[key], func(c *serviceCounts) { c.routes++ })
 		}
 		operationComponents := components
@@ -1599,7 +1549,11 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		fmt.Fprintf(hash, "unrouted %s %x\n", name, unroutedDigests[name])
 	}
 	for _, route := range out.routes {
-		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.credentials)
+		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.protected)
+	}
+	slices.SortFunc(out.extras, func(a, b compiledOperation) int { return compareOperationKeys(a.key, b.key) })
+	for _, extra := range out.extras {
+		fmt.Fprintf(hash, "extra %s %s => %s %s %v\n", extra.key.method, extra.key.path, extra.service, extra.path, extra.protected)
 	}
 	slices.SortFunc(out.denied, compareOperationKeys)
 	out.denied = slices.Compact(out.denied)

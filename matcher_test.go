@@ -167,8 +167,8 @@ func TestDirectRouteGatesContractOperations(t *testing.T) {
 		{"/shop/items/a%2Fb", "", 404},
 		{"/shop/items//1/secret", "", 404},
 		{"/shop/items/1/x/../secret", "", 404},
-		// The direct route's path policy also gates contract operations.
-		{"/shop/items/9", "", 404},
+		// A routed service's contract, not the route's path rules, decides.
+		{"/shop/items/9", "GET /items/9", 418},
 		// An encoded prefix would match the contract operation for /shop
 		// without that policy.
 		{"/sh%6Fp/items/9", "", 404},
@@ -301,7 +301,9 @@ func TestInternalPartialTemplateOnDirectRoute(t *testing.T) {
 	)
 	// The internal pattern wins over the routed parameter. A path it does not
 	// match is still routed, or goes to the direct route.
-	for path, want := range map[string]int{"/shop/files/a.txt": 404, "/shop/files/a": 418, "/shop/logs/a.txt": 404, "/shop/logs/a": 418, "/shop/other": 418} {
+	// A path no operation names returns 404: nothing falls through to the
+	// direct route.
+	for path, want := range map[string]int{"/shop/files/a.txt": 404, "/shop/files/a": 418, "/shop/logs/a.txt": 404, "/shop/logs/a": 404, "/shop/other": 404} {
 		if code, _ := h.do("GET", path); code != want {
 			t.Errorf("GET %s = %d, want %d", path, code, want)
 		}
@@ -364,10 +366,9 @@ func TestSelectedTemplateDoesNotCaptureUnselectedOperations(t *testing.T) {
 	// On a direct route, an unselected operation keeps the route's own policy.
 	direct := shopBindings()
 	direct.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
-	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {AuthProfiles: []string{"account"}, PublicPaths: []string{"/items/special"}}}
-	direct.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {PublicPaths: []string{"/items/special"}}}
 	h := newTemplateHarness(t, direct, paths...)
-	for path, want := range map[string]int{"/shop/items/1": 418, "/shop/items/special": 418, "/shop/items/secret": 404, "/shop/items/other/x": 401} {
+	for path, want := range map[string]int{"/shop/items/1": 418, "/shop/items/special": 418, "/shop/items/secret": 404, "/shop/items/other/x": 404} {
 		if code, _ := h.do("GET", path); code != want {
 			t.Errorf("direct: GET %s = %d, want %d", path, code, want)
 		}
@@ -525,8 +526,7 @@ func TestUnselectedOperationsCountAsWritten(t *testing.T) {
 	selection := []operationSelection{{Method: "get", Path: "/v1/{collection}"}}
 	direct := shopBindings()
 	direct.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
-	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {AuthProfiles: []string{"account"}}}
-	direct.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	direct.ServiceRoutes = map[string]serviceRoute{"/shop": {}}
 	plain := isolationBindings("shop")
 	plain.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: selection}
 	// The selected template is anonymous. Unselected paths must not reach it:
@@ -667,8 +667,9 @@ func TestPassthroughPatternNeverShadowsAnAncestorInternalParameter(t *testing.T)
 func TestPassthroughPatternNeverSkipsASelectedOperationsAuthorization(t *testing.T) {
 	bindings := shopBindings()
 	bindings.Services["shop"] = serviceBinding{Prefix: "/shop", Operations: []operationSelection{{Method: "get", Path: "/v1/{c}"}}}
-	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {BackendAuth: true}}
-	bindings.Authorization.Profiles = map[string]credentialProfile{"account": {Scheme: "bearer"}}
+	// The route's own policy leaves /v1/* to the backend, so a passthrough
+	// would skip the gateway authorization the selected operation needs.
+	bindings.ServiceRoutes = map[string]serviceRoute{"/shop": {PublicPaths: []string{"/v1/*"}}}
 	h := newTemplateHarness(t, bindings,
 		"  /v1/{c}:\n    get:\n      operationId: c\n      security: [{account: []}]\n      responses: {'200': {description: OK}}\n",
 		anonymousOperation("get", "/v1/items{batch}", "batch"),

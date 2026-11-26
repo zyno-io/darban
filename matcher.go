@@ -63,7 +63,10 @@ type routeNode struct {
 	// it is never routed. Each template matches one or more characters.
 	patterns []routePattern
 	param    *routeNode
-	entry    *routeEntry
+	// rest holds an extra route's trailing /*, which matches any remaining
+	// segments, or none.
+	rest  *routeNode
+	entry *routeEntry
 }
 
 type routePattern struct {
@@ -91,7 +94,7 @@ type routeEntry struct {
 	params []string
 }
 
-func newRouteTable(routes map[operationKey]registeredRoute, denied, passthrough map[operationKey]bool) routeTable {
+func newRouteTable(routes, extras map[operationKey]registeredRoute, denied, passthrough map[operationKey]bool) routeTable {
 	table := make(routeTable)
 	// Denials first: compilation rejects two operations of one shape, and a
 	// denial wins wherever one could still overlap.
@@ -104,6 +107,11 @@ func newRouteTable(routes map[operationKey]registeredRoute, denied, passthrough 
 	}
 	for _, key := range slices.SortedFunc(maps.Keys(passthrough), compareOperationKeys) {
 		table.add(&routeEntry{key: key, kind: entryPassthrough})
+	}
+	// Extra routes last: an operation of the same shape keeps its path.
+	for _, key := range slices.SortedFunc(maps.Keys(extras), compareOperationKeys) {
+		route := extras[key]
+		table.add(&routeEntry{key: key, kind: entryRoute, route: &route})
 	}
 	return table
 }
@@ -120,6 +128,12 @@ func (t routeTable) add(entry *routeEntry) {
 	entry.params = make([]string, len(segments))
 	for i, segment := range segments {
 		switch {
+		case segment == "*" && i == len(segments)-1:
+			entry.params[i] = "*"
+			if node.rest == nil {
+				node.rest = &routeNode{}
+			}
+			node = node.rest
 		case parameterSegment(segment):
 			entry.params[i] = strings.Trim(segment, "{}")
 			if node.param == nil {
@@ -161,6 +175,9 @@ func (n *routeNode) match(segments []string, strict, patterned bool) (*routeEntr
 	}
 	if len(segments) == 0 {
 		if n.entry == nil || strict && patterned && n.entry.kind == entryPassthrough {
+			if n.rest != nil && n.rest.entry != nil {
+				return n.rest.entry, patterned
+			}
 			return nil, false
 		}
 		return n.entry, patterned
@@ -176,7 +193,12 @@ func (n *routeNode) match(segments []string, strict, patterned bool) (*routeEntr
 		}
 	}
 	if segments[0] != "" {
-		return n.param.match(segments[1:], strict, patterned)
+		if entry, via := n.param.match(segments[1:], strict, patterned); entry != nil {
+			return entry, via
+		}
+	}
+	if n.rest != nil && n.rest.entry != nil {
+		return n.rest.entry, patterned
 	}
 	return nil, false
 }
@@ -213,6 +235,8 @@ func (t routeTable) lookup(method string, segments []string) *routeEntry {
 // routeMatch is the outcome of matching a request against the snapshot.
 type routeMatch struct {
 	denied bool
+	// passthrough marks an operation the bindings leave unselected.
+	passthrough bool
 	// route is set for a routed operation, with its decoded parameters.
 	route  *registeredRoute
 	params map[string]string
@@ -242,13 +266,26 @@ func (t routeTable) matchRequest(method, raw, decoded, legacyPrefix string) rout
 	}
 	entry := t.lookup(method, segments)
 	switch {
-	case entry == nil || entry.kind == entryPassthrough:
+	case entry == nil:
 		return routeMatch{}
+	case entry.kind == entryPassthrough:
+		return routeMatch{passthrough: true}
 	case entry.kind == entryDenied:
 		return routeMatch{denied: true}
 	}
 	match := routeMatch{route: entry.route}
 	for i, name := range entry.params {
+		if name == "*" {
+			// The rest of the path, already canonical.
+			if match.params == nil {
+				match.params = make(map[string]string)
+			}
+			match.params[name] = ""
+			if i < len(segments) {
+				match.params[name] = strings.Join(segments[i:], "/")
+			}
+			continue
+		}
 		if name == "" {
 			continue
 		}
@@ -275,6 +312,12 @@ func upstreamPath(template string, params map[string]string) string {
 	for i, segment := range segments {
 		if value, ok := params[strings.Trim(segment, "{}")]; ok && parameterSegment(segment) {
 			segments[i] = value
+		}
+	}
+	if last := len(segments) - 1; segments[last] == "*" {
+		segments[last] = params["*"]
+		if segments[last] == "" {
+			segments = segments[:last]
 		}
 	}
 	return strings.Join(segments, "/")

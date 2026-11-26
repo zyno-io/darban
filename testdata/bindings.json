@@ -4,11 +4,7 @@
   "authorization": {
     "path": "/authorize",
     "responseHeaders": ["X-Auth-Subject", "X-Auth-Account", "X-Auth-Debug-Allowed"],
-    "stripHeaderPrefixes": ["X-Auth-"],
-    "profiles": {
-      "sessionBearer": {"scheme": "bearer", "requiredHeaders": ["X-Auth-Subject", "X-Auth-Account"]},
-      "clientBasic": {"scheme": "basic", "requiredHeaders": ["X-Auth-Subject"]}
-    }
+    "stripHeaderPrefixes": ["X-Auth-"]
   },
   "debug": {"requestHeader": "X-Debug-Backend", "requiredHeader": "X-Auth-Debug-Allowed", "requiredValue": "true"},
   "services": {

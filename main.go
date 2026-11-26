@@ -34,7 +34,14 @@ type operationKey struct {
 }
 
 type registeredRoute struct {
-	credentials []string
+	key operationKey
+	// service is the service whose upstream serves the route.
+	service string
+	// protected reports that the gateway authorizes the operation.
+	protected bool
+	// direct names the serviceRoutes prefix whose transport serves the route.
+	// Otherwise proxy does.
+	direct      string
 	proxy       *httputil.ReverseProxy
 	debugProxy  *httputil.ReverseProxy
 	debugOrigin string
@@ -174,11 +181,14 @@ func (g *gateway) reverseProxy(route compiledOperation, target *url.URL, transpo
 					r.Out.Header[header] = values
 				}
 			}
-			r.Out.Header.Del("Authorization")
 			r.Out.Header.Del(g.bindings.Debug.RequestHeader)
-			caller := r.In.Context().Value(identityKey{}).(identity)
-			for name, values := range caller.headers {
-				r.Out.Header[name] = values
+			// A request the gateway authorized carries the identity instead of
+			// the credentials. Any other keeps its Authorization.
+			if caller := r.In.Context().Value(identityKey{}).(identity); caller.authorized {
+				r.Out.Header.Del("Authorization")
+				for name, values := range caller.headers {
+					r.Out.Header[name] = values
+				}
 			}
 		},
 		ModifyResponse: func(response *http.Response) error {
@@ -202,20 +212,24 @@ type snapshot struct {
 	// services holds the effective binding of each served contract service.
 	services map[string]serviceBinding
 	unserved map[string]bool
-	// routes, denied and passthrough are keyed by public path template. table
-	// matches requests against them; it is built on first use.
+	// routes, extras, denied and passthrough are keyed by public path
+	// template. table matches requests against them; it is built on first use.
 	denied      map[operationKey]bool
 	passthrough map[operationKey]bool
 	routes      map[operationKey]registeredRoute
-	table       routeTable
-	tableOnce   sync.Once
-	revision    string
-	specYAML    []byte
-	specJSON    []byte
+	extras      map[operationKey]registeredRoute
+	// routed holds the prefixes of routed services with an accepted contract.
+	// Their contract and extra routes decide which requests pass.
+	routed    map[string]bool
+	table     routeTable
+	tableOnce sync.Once
+	revision  string
+	specYAML  []byte
+	specJSON  []byte
 }
 
 func (s *snapshot) routeTable() routeTable {
-	s.tableOnce.Do(func() { s.table = newRouteTable(s.routes, s.denied, s.passthrough) })
+	s.tableOnce.Do(func() { s.table = newRouteTable(s.routes, s.extras, s.denied, s.passthrough) })
 	return s.table
 }
 
@@ -285,23 +299,40 @@ func (g *gateway) build(compiled candidate) *snapshot {
 	for _, key := range compiled.passthrough {
 		active.passthrough[key] = true
 	}
-	for _, route := range compiled.routes {
+	active.routed = make(map[string]bool)
+	for _, binding := range compiled.services {
+		if binding.routed() && binding.Prefix != "" {
+			active.routed[binding.Prefix] = true
+		}
+	}
+	register := func(route compiledOperation) registeredRoute {
 		binding, found := compiled.services[route.service]
 		if !found {
 			binding = g.bindings.Services[route.service]
 		}
+		registered := registeredRoute{key: route.key, service: route.service, protected: route.protected}
+		// A service's own operations on its direct route use that route's
+		// transport. A rewrite from another prefix uses the target's origin.
+		if _, direct := g.bindings.ServiceRoutes[binding.Prefix]; direct && routePrefix(route.key.path) == binding.Prefix {
+			registered.direct = binding.Prefix
+			return registered
+		}
 		// Validated when the contract or the bindings were loaded.
 		target, _ := url.Parse(binding.Origin)
-		registered := registeredRoute{
-			credentials: route.credentials,
-			proxy:       g.reverseProxy(route, target, g.transport),
-		}
+		registered.proxy = g.reverseProxy(route, target, g.transport)
 		if binding.DebugOrigin != "" {
 			alternate, _ := url.Parse(binding.DebugOrigin)
 			registered.debugOrigin = binding.DebugOrigin
 			registered.debugProxy = g.reverseProxy(route, alternate, g.debugTransport)
 		}
-		active.routes[route.key] = registered
+		return registered
+	}
+	for _, route := range compiled.routes {
+		active.routes[route.key] = register(route)
+	}
+	active.extras = make(map[operationKey]registeredRoute, len(compiled.extras))
+	for _, extra := range compiled.extras {
+		active.extras[extra.key] = register(extra)
 	}
 	active.routeTable()
 	return active
@@ -352,8 +383,9 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
+	_, direct := g.bindings.ServiceRoutes[prefix]
 	servicePath := ""
-	if service, found := g.bindings.ServiceRoutes[prefix]; found {
+	if direct {
 		// The policy below checks path.Clean of the decoded path, but the route
 		// forwards the decoded path uncleaned, and backends resolve dot
 		// segments differently than path.Clean. Refuse any path where the two
@@ -362,56 +394,92 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
-		// Apply the same policy to alternate spellings of the same path.
 		cleaned := pathpkg.Clean(r.URL.Path)
 		if legacyPrefix != "" {
 			cleaned = prefix + cleaned
 		}
 		servicePath = stripServicePrefix(cleaned, prefix)
-		if routePrefix(cleaned) != prefix || !service.allowsPath(servicePath) {
+		if routePrefix(cleaned) != prefix {
 			writeStatus(w, http.StatusNotFound)
 			return
 		}
-		// A contract-bound service with no serving contract has no deny list, so
-		// do not proxy its prefix.
+		// A routed service with no accepted contract has no operations to
+		// allow, so do not proxy its prefix.
 		if active.unserved[prefix] {
 			writeStatus(w, http.StatusServiceUnavailable)
 			return
 		}
+		// Without a routed service, the route's own path policy decides.
+		if !active.routed[prefix] {
+			g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method)
+			return
+		}
 	}
+	// A routed service serves only its contract operations and extra routes.
 	match := active.match(method, path, r.URL.Path, legacyPrefix)
 	switch {
 	case match.denied || match.invalid:
 		writeStatus(w, http.StatusNotFound)
 		return
+	case match.passthrough && direct:
+		// An operation the bindings leave unselected keeps the route's own
+		// policy until the selection is removed.
+		g.serveByRoutePolicy(w, r, prefix, servicePath, preflight, method)
+		return
 	case match.route == nil:
-		g.serveService(w, r, prefix, servicePath, preflight, method)
+		writeStatus(w, http.StatusNotFound)
 		return
 	}
-	route := *match.route
+	registered := *match.route
+	upstreamMethod := ""
+	if r.Method == http.MethodHead && registered.key.method == http.MethodGet {
+		// Backends need not route HEAD, so send GET. The server drops the body
+		// for the HEAD caller.
+		upstreamMethod = http.MethodGet
+	}
+	if registered.direct != "" {
+		// Anonymous operations and backendAuth routes leave authorization to
+		// the backend, with the caller's Authorization.
+		backendAuthorization := !registered.protected || g.bindings.ServiceRoutes[registered.direct].BackendAuth
+		g.serveService(w, r, registered.direct, backendAuthorization, preflight, method, upstreamMethod)
+		return
+	}
 	if preflight {
 		g.servePreflight(w, r, method)
 		return
 	}
 	g.applyBrowserCORS(w, r)
-	caller, ok := g.authorizeRequest(w, r, route.credentials)
-	if !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-	proxy := route.proxy
-	debug := g.bindings.Debug
-	requested := r.Header.Values(debug.RequestHeader)
-	if route.debugProxy != nil && debug.RequestHeader != "" && len(requested) == 1 && requested[0] == "true" &&
-		caller.headers.Get(debug.RequiredHeader) == debug.RequiredValue {
-		state := g.endpoints.state(route.debugOrigin)
-		if state == endpointReady || state == endpointLocal {
-			proxy = route.debugProxy
+	var caller identity
+	if registered.protected {
+		var ok bool
+		if caller, ok = g.authorizeRequest(w, r); !ok {
+			return
 		}
 	}
-	ctx = context.WithValue(context.WithValue(ctx, identityKey{}, caller), routeParamsKey{}, match.params)
+	proxy := registered.proxy
+	debug := g.bindings.Debug
+	requested := r.Header.Values(debug.RequestHeader)
+	if registered.debugProxy != nil && debug.RequestHeader != "" && len(requested) == 1 && requested[0] == "true" &&
+		caller.headers.Get(debug.RequiredHeader) == debug.RequiredValue {
+		state := g.endpoints.state(registered.debugOrigin)
+		if state == endpointReady || state == endpointLocal {
+			proxy = registered.debugProxy
+		}
+	}
+	ctx := context.WithValue(context.WithValue(r.Context(), identityKey{}, caller), routeParamsKey{}, match.params)
 	proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// serveByRoutePolicy serves a direct route by its own path rules: deniedPaths
+// and allowedPaths gate the path, and publicPaths leave authorization to the
+// backend.
+func (g *gateway) serveByRoutePolicy(w http.ResponseWriter, r *http.Request, prefix, servicePath string, preflight bool, method string) {
+	route := g.bindings.ServiceRoutes[prefix]
+	if !route.allowsPath(servicePath) {
+		writeStatus(w, http.StatusNotFound)
+		return
+	}
+	g.serveService(w, r, prefix, route.BackendAuth || matchesServicePaths(route.PublicPaths, servicePath), preflight, method, "")
 }
 
 func main() {
