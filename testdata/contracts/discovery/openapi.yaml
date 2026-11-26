@@ -17,7 +17,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PublicResponse'
       security: []
-      x-gateway-policy: anonymous
+      x-darban-policy: anonymous
   /maintenance/snapshot:
     get:
       x-darban-visibility: internal

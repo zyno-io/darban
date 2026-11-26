@@ -153,12 +153,13 @@ type openAPIConfig struct {
 type operationVisibility string
 
 const (
-	visibilityPublic    operationVisibility = "public"
-	visibilityUnlisted  operationVisibility = "unlisted"
-	visibilityInternal  operationVisibility = "internal"
-	visibilityExtension                     = "x-darban-visibility"
-	policyExtension                         = "x-gateway-policy"
-	firstTagOnly                            = "firstOnly"
+	visibilityPublic       operationVisibility = "public"
+	visibilityUnlisted     operationVisibility = "unlisted"
+	visibilityInternal     operationVisibility = "internal"
+	visibilityExtension                        = "x-darban-visibility"
+	policyExtension                            = "x-darban-policy"
+	renamedPolicyExtension                     = "x-gateway-policy" // Pre-rename spelling; reported, not read.
+	firstTagOnly                               = "firstOnly"
 )
 
 func (v operationVisibility) valid() bool {
@@ -375,6 +376,9 @@ func effectiveSecurity(doc map[string]any, source sourceDoc, allowed map[string]
 		security, explicit := doc["security"].([]any)
 		if explicit && len(security) == 0 && doc[policyExtension] == "anonymous" {
 			return securityRequirements{}, nil, nil
+		}
+		if _, renamed := doc[renamedPolicyExtension]; renamed {
+			return nil, nil, fmt.Errorf("%s was renamed to %s", renamedPolicyExtension, policyExtension)
 		}
 		return nil, nil, errors.New("explicit credential policy required")
 	}

@@ -18,7 +18,7 @@ paths:
   /prices:
     get:
       security: []
-      x-gateway-policy: anonymous
+      x-darban-policy: anonymous
       responses:
         "200": {description: OK}
   /private/{id}:
@@ -55,7 +55,7 @@ func TestOmittedServiceFailsClosed(t *testing.T) {
 		return res.Code
 	}
 	good := registration{serviceName: "catalog", rewrites: "[]", openAPI: catalogGood}
-	bad := registration{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-gateway-policy: anonymous", "x-gateway-policy: bogus", 1)}
+	bad := registration{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-darban-policy: anonymous", "x-darban-policy: bogus", 1)}
 
 	// A fresh pod with only a bad contract becomes ready, but the direct route
 	// fails closed because the internal operations are unknown.
@@ -184,8 +184,8 @@ func TestCascadingUndoNeverOmitsEstablishedService(t *testing.T) {
 
 func TestAliasFaultAttributionIsDeterministic(t *testing.T) {
 	const bTwoOps = "openapi: 3.1.0\npaths:\n" +
-		"  /x:\n    get:\n      operationId: bx\n      security: []\n      x-gateway-policy: anonymous\n      responses: {'200': {description: OK}}\n" +
-		"  /y:\n    get:\n      operationId: by\n      security: []\n      x-gateway-policy: anonymous\n      responses: {'200': {description: OK}}\n"
+		"  /x:\n    get:\n      operationId: bx\n      security: []\n      x-darban-policy: anonymous\n      responses: {'200': {description: OK}}\n" +
+		"  /y:\n    get:\n      operationId: by\n      security: []\n      x-darban-policy: anonymous\n      responses: {'200': {description: OK}}\n"
 	bindings := isolationBindings("a", "b", "c")
 	c1 := contractFor("c", "/items", "c")
 	c1.rewrites = `[{from: {method: GET, path: /c/old}, to: {serviceName: b, path: /y}}]`

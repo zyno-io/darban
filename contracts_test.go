@@ -100,7 +100,7 @@ components:
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, hidden := range []string{"post:", "/observatory/alias", "/observatory/legacy-objects", "/observatory/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility", "operationId:"} {
+	for _, hidden := range []string{"post:", "/observatory/alias", "/observatory/legacy-objects", "/observatory/internal", "HiddenResponse", "sessionBearer", "x-darban-visibility", "x-darban-policy", "operationId:"} {
 		if strings.Contains(string(compiled.specYAML), hidden) {
 			t.Fatalf("combined OpenAPI exposed %s", hidden)
 		}
@@ -464,7 +464,7 @@ paths:
     get:
       operationId: listObjects
       security: []
-      x-gateway-policy: anonymous
+      x-darban-policy: anonymous
       responses: {'200': {description: OK}}
 `
 	regs := []registration{
@@ -478,6 +478,27 @@ paths:
 	_, err := compileStrict(regs, bindings)
 	if err == nil || !strings.Contains(err.Error(), `duplicate operationId "listObjects"`) {
 		t.Fatalf("expected duplicate upstream operationId to be rejected, got %v", err)
+	}
+}
+
+func TestAnonymousPolicyUsesDarbanExtension(t *testing.T) {
+	contract := func(extension string) string {
+		return "openapi: 3.1.0\npaths:\n  /objects:\n    get:\n      operationId: listObjects\n      security: []\n      " +
+			extension + ": anonymous\n      responses: {'200': {description: OK}}\n"
+	}
+	bindings := upstreamBindings{Services: map[string]serviceBinding{
+		"catalog": {Prefix: "/catalog", Origin: "http://catalog.fixtures.svc.cluster.local:80"},
+	}}
+	compiled, err := compileStrict([]registration{{serviceName: "catalog", openAPI: contract("x-darban-policy"), rewrites: "[]"}}, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(compiled.specYAML), "x-darban-policy") {
+		t.Fatal("combined OpenAPI exposed x-darban-policy")
+	}
+	_, err = compileStrict([]registration{{serviceName: "catalog", openAPI: contract("x-gateway-policy"), rewrites: "[]"}}, bindings)
+	if err == nil || !strings.Contains(err.Error(), "x-gateway-policy was renamed to x-darban-policy") {
+		t.Fatalf("expected the old x-gateway-policy name to be rejected, got %v", err)
 	}
 }
 

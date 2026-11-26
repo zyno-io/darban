@@ -119,7 +119,7 @@ func TestDirectRouteWithoutGoodContractFailsClosedOnly(t *testing.T) {
 	bindings.Services["other"] = serviceBinding{Prefix: "/other", Origin: origin}
 	for name, regs := range map[string][]registration{
 		"missing":  {contractFor("other", "/items", "listOther")},
-		"rejected": {{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-gateway-policy: anonymous", "x-gateway-policy: bogus", 1)}, contractFor("other", "/items", "listOther")},
+		"rejected": {{serviceName: "catalog", rewrites: "[]", openAPI: strings.Replace(catalogGood, "x-darban-policy: anonymous", "x-darban-policy: bogus", 1)}, contractFor("other", "/items", "listOther")},
 	} {
 		h := newSkipHarness(t, bindings)
 		h.apply(regs...)
