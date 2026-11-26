@@ -7,9 +7,10 @@ import (
 )
 
 // TestDirectRouteRefusesPathsItCouldGateDifferently checks that a direct route
-// never gates one path and forwards another. Its policy sees path.Clean of the
-// decoded path, while the backend resolves the path as sent: WHATWG and Node
-// keep empty segments when resolving .., and do not decode %2F.
+// never gates one path and forwards another. Its policy checks path.Clean of
+// the decoded path, while the route forwards the decoded path uncleaned, and
+// the backend resolves it its own way: WHATWG and Node keep empty segments
+// when resolving .., and do not decode %2F.
 func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 	var hits []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,10 +42,13 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 		// Normal paths, with and without a trailing slash, still work.
 		{"", "POST", "/denied/svc/method", 418, "POST /svc/method"},
 		{"", "GET", "/denied/svc/method/", 418, "GET /svc/method/"},
-		// The backend gets the path that was gated, escaped only where needed.
+		// The backend gets the decoded path that was gated, re-encoded by Go's
+		// url.URL path escaping.
 		{"", "GET", "/denied/svc/%6Dethod", 418, "GET /svc/method"},
 		{"", "GET", "/public/tabs/a%20b%3Ac", 418, "GET /tabs/a%20b:c"},
 		{"", "GET", "/public/tabs/a#b", 418, "GET /tabs/a%23b"},
+		{"", "GET", "/public/tabs/a(1)", 418, "GET /tabs/a%281%29"},
+		{"", "GET", "/public/tabs/caf%c3%a9", 418, "GET /tabs/caf%C3%A9"},
 		{legacyHost, "GET", "/svc/m%65", 418, "GET /svc/me"},
 		{"", "GET", "/allowed/open/x/", 418, "GET /open/x/"},
 		{"", "GET", "/public/tabs/x/", 418, "GET /tabs/x/"},
@@ -62,8 +66,8 @@ func TestDirectRouteRefusesPathsItCouldGateDifferently(t *testing.T) {
 		{legacyHost, "GET", "/authz//..", 404, ""},
 		{legacyHost, "GET", "//authz", 404, ""},
 		{legacyHost, "POST", "//zrpc/svc/m", 404, ""},
-		// Go keeps a raw # in the path and drops RawPath, so the check must
-		// use the path as sent.
+		// Go keeps a raw # in Path and RawPath, but EscapedPath ignores that
+		// RawPath, so the check must use the path as sent.
 		{"", "POST", "/denied/x#/../zrpc/m", 404, ""},
 		// Clean decodes %2F, the backend does not.
 		{"", "POST", "/denied/zrpc/a/b%2F..%2F..%2Fx", 404, ""},

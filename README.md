@@ -161,8 +161,9 @@ paths within it. A trailing `/*` matches a path subtree. The rules see the
 decoded path. A direct route returns `404` for a path that is not canonical:
 one with an empty, `.` or `..` segment (also when encoded), an encoded `/` or
 `\` (`%2F`, `%5C`), a `\`, or anything else `path.Clean` changes beyond one
-trailing `/`. It forwards the path it checked, escaped only where needed, not
-the caller's spelling, so `/sdk/m%65` reaches the backend as `/sdk/me`.
+trailing `/`. It forwards the decoded path, re-encoded by Go's `url.URL` path
+escaping, not the caller's spelling, so `/sdk/m%65` reaches the backend as
+`/sdk/me` and `/a(1)` as `/a%281%29`.
 Darban also returns `404` for a request whose first path segment is encoded.
 Registered operations
 and internal-route exclusions take precedence.

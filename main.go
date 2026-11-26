@@ -332,9 +332,10 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 	}
 	servicePath := ""
 	if service, found := g.bindings.ServiceRoutes[prefix]; found {
-		// The policy below sees the cleaned path, but the route forwards the
-		// path as sent, and backends resolve dot segments differently than
-		// path.Clean. Refuse any path where the two could disagree.
+		// The policy below checks path.Clean of the decoded path, but the route
+		// forwards the decoded path uncleaned, and backends resolve dot
+		// segments differently than path.Clean. Refuse any path where the two
+		// could disagree.
 		if !canonicalPath(path, r.URL.Path) {
 			writeStatus(w, http.StatusNotFound)
 			return
