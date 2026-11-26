@@ -574,7 +574,7 @@ func TestLoadBindingsAllowsPartialServiceEntries(t *testing.T) {
 	if err := write(`{"hostname": "api.example.net"}`); err != nil {
 		t.Fatalf("no services: %v", err)
 	}
-	if err := write(`{"hostname": "api.example.net", "services": {"a": {"registrationOnly": true}, "b": {"mount": "/b"}}}`); err != nil {
+	if err := write(`{"hostname": "api.example.net", "services": {"a": {"route": false, "publish": false}, "b": {"mount": "/b"}}}`); err != nil {
 		t.Fatalf("partial entries: %v", err)
 	}
 	for name, body := range map[string]string{
@@ -582,7 +582,7 @@ func TestLoadBindingsAllowsPartialServiceEntries(t *testing.T) {
 		"bad origin":    `{"hostname": "api.example.net", "services": {"a": {"origin": "http://example.com:80"}}}`,
 		"bad mount":     `{"hostname": "api.example.net", "services": {"a": {"mount": "/A/"}}}`,
 		"debug no pol.": `{"hostname": "api.example.net", "services": {"a": {"debugOrigin": "http://d.ns.svc.cluster.local:80"}}}`,
-		"reg-only ops":  `{"hostname": "api.example.net", "services": {"a": {"registrationOnly": true, "operations": [{"method": "GET", "path": "/x"}]}}}`,
+		"unrouted ops":  `{"hostname": "api.example.net", "services": {"a": {"route": false, "publish": false, "operations": [{"method": "GET", "path": "/x"}]}}}`,
 		"collision":     `{"hostname": "api.example.net", "services": {"a": {"prefix": "/x"}, "b": {"prefix": "/x"}}}`,
 	} {
 		if err := write(body); err == nil {

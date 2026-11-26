@@ -89,7 +89,7 @@ type reconciler struct {
 	// lastGood holds the units serving in the active snapshot, by service.
 	lastGood map[string]*serviceUnit
 	logged   map[string]string
-	// warned holds the last logged rewrite warning per service.
+	// warned holds the last logged warnings per service.
 	warned map[string]string
 	// overrides remembers the contract-over-binding messages already logged.
 	overrides map[string]string
@@ -107,7 +107,7 @@ func (r *reconciler) classify(report *compileReport) {
 		names[name] = true
 	}
 	for name, binding := range bindings.Services {
-		if !binding.RegistrationOnly && binding.Prefix != "" {
+		if binding.routed() && binding.Prefix != "" {
 			names[name] = true
 		}
 	}
@@ -125,7 +125,7 @@ func (r *reconciler) classify(report *compileReport) {
 		default:
 			outcome.state = stateNotInstalled
 			binding := bindings.Services[name]
-			if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && !binding.RegistrationOnly && binding.Prefix != "" {
+			if _, direct := bindings.ServiceRoutes[binding.Prefix]; direct && binding.routed() && binding.Prefix != "" {
 				outcome.state = stateDirectRouteClosed
 				reason += "; direct service route returns 503 until a good contract is seen"
 			}
@@ -191,13 +191,13 @@ func (r *reconciler) logRejections(report compileReport) {
 		r.warned = make(map[string]string)
 	}
 	for _, name := range slices.Sorted(maps.Keys(report.services)) {
-		warning := report.services[name].warning
-		if warning == "" {
+		warnings := report.services[name].warnings
+		if len(warnings) == 0 {
 			delete(r.warned, name)
 			continue
 		}
-		if r.warned[name] != warning {
-			log.Printf("contract rewrite denied: %s (service=%s)", strings.ReplaceAll(warning, "\n", " "), name)
+		if warning := strings.Join(warnings, "; "); r.warned[name] != warning {
+			log.Printf("contract warning: %s (service=%s)", strings.ReplaceAll(warning, "\n", " "), name)
 			r.warned[name] = warning
 		}
 	}

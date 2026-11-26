@@ -47,13 +47,23 @@ type rewriteRule struct {
 }
 
 type serviceBinding struct {
-	Origin           string
-	Prefix           string
-	Mount            string
-	DebugOrigin      string
-	Operations       []operationSelection
-	RegistrationOnly bool
+	Origin      string
+	Prefix      string
+	Mount       string
+	DebugOrigin string
+	Operations  []operationSelection
+	// Route and Publish default to true. Route false keeps the service's
+	// traffic on its serviceRoutes entry and makes the contract docs-only.
+	// Publish false keeps its operations out of the combined OpenAPI.
+	Route   *bool `json:",omitempty"`
+	Publish *bool `json:",omitempty"`
 }
+
+// routed reports whether the contract routes the service's traffic.
+func (b serviceBinding) routed() bool { return b.Route == nil || *b.Route }
+
+// published reports whether the service's operations are documented.
+func (b serviceBinding) published() bool { return b.Publish == nil || *b.Publish }
 
 // validate checks the fields of a service binding. Origins are optional
 // because a contract can supply them, so only present ones are checked. A
@@ -68,8 +78,14 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 			return fmt.Errorf("service %q: %w", name, err)
 		}
 	}
-	if b.RegistrationOnly && len(b.Operations) != 0 {
-		return fmt.Errorf("registration-only service %q cannot select operations", name)
+	if !b.routed() && len(b.Operations) != 0 {
+		return fmt.Errorf("service %q has route: false, so it cannot select operations", name)
+	}
+	if !b.routed() && b.published() {
+		// The document describes the direct route, which proxies <prefix>/X to X.
+		if _, direct := bindings.ServiceRoutes[b.Prefix]; b.Prefix == "" || !direct || b.Mount != "" {
+			return fmt.Errorf("service %q has route: false and publish: true, which requires a prefix with a serviceRoutes entry and no mount", name)
+		}
 	}
 	if checkOrigins && b.Origin != "" {
 		if _, err := upstreamOrigin(b.Origin, local); err != nil {
@@ -118,13 +134,35 @@ func (l *legacySecurity) validate() error {
 }
 
 // Some backends already mount routes under their module name. Map that
-// upstream mount to the public service prefix.
+// upstream mount to the public service prefix. A routed service needs literal
+// paths. A docs-only service (route: false) routes nothing, so its paths may
+// be templates.
 func (b serviceBinding) publicPath(path string) (string, bool) {
 	suffix, ok := strings.CutPrefix(path, b.Mount)
-	if !ok || !literalPath.MatchString(suffix) {
+	valid := literalPath.MatchString
+	if !b.routed() {
+		valid = templatePath
+	}
+	if !ok || !valid(suffix) {
 		return "", false
 	}
 	return b.Prefix + suffix, true
+}
+
+var pathSegment = regexp.MustCompile(`^([A-Za-z0-9._~@-]+|\{[A-Za-z_][A-Za-z0-9_.-]*\})$`)
+
+// templatePath reports whether every segment of path is a literal or a whole
+// {name} parameter.
+func templatePath(path string) bool {
+	if !strings.HasPrefix(path, "/") || path == "/" {
+		return false
+	}
+	for _, segment := range strings.Split(path[1:], "/") {
+		if segment == "." || segment == ".." || !pathSegment.MatchString(segment) {
+			return false
+		}
+	}
+	return true
 }
 
 type upstreamBindings struct {
@@ -244,6 +282,9 @@ type sourceOperation struct {
 	doc          map[string]any
 	requirements securityRequirements
 	source       *sourceDoc
+	// unrouted marks an operation of a docs-only service (route: false). It
+	// can be documented but is never routed.
+	unrouted bool
 }
 
 type compiledOperation struct {
@@ -251,6 +292,12 @@ type compiledOperation struct {
 	service     string
 	path        string
 	credentials []string
+}
+
+// serviceCounts is what the assembled snapshot does with one service's
+// public operation keys, including the rewrites it owns.
+type serviceCounts struct {
+	routes, documented, denied int
 }
 
 type candidate struct {
@@ -263,10 +310,12 @@ type candidate struct {
 	services map[string]serviceBinding
 	// aliasWarnings holds, by owning service, why a rewrite of that service is
 	// denied although its target is served. It never rejects a contract.
-	aliasWarnings map[string]string
-	specYAML      []byte
-	specJSON      []byte
-	revision      string
+	aliasWarnings map[string][]string
+	// counts holds, by service, its routed, documented and denied keys.
+	counts   map[string]serviceCounts
+	specYAML []byte
+	specJSON []byte
+	revision string
 }
 
 var (
@@ -697,13 +746,15 @@ type aliasTarget struct {
 // the unit of isolation: the compiler keeps, replaces or drops whole units.
 type serviceUnit struct {
 	// binding is the effective binding the unit was compiled with.
-	binding          serviceBinding
-	digest           [sha256.Size]byte
-	openAPIDigest    [sha256.Size]byte
-	registrationOnly bool
-	native           map[operationKey]sourceOperation
-	aliases          map[operationKey]aliasTarget
-	denied           []operationKey
+	binding       serviceBinding
+	digest        [sha256.Size]byte
+	openAPIDigest [sha256.Size]byte
+	native        map[operationKey]sourceOperation
+	aliases       map[operationKey]aliasTarget
+	denied        []operationKey
+	// warnings lists operations a docs-only unit leaves out of the document
+	// because its direct route would refuse them.
+	warnings []string
 }
 
 const (
@@ -727,9 +778,12 @@ type serviceOutcome struct {
 	// state and reason are set by the reconciler.
 	state  string
 	reason string
-	// warning describes a rewrite denied because its target is served but
-	// does not offer the rewritten operation.
-	warning string
+	// warnings describe rewrites denied although their target is served, and
+	// operations a docs-only service leaves out of the document.
+	warnings []string
+	// route and publish are the service's effective binding settings.
+	route, publish bool
+	counts         serviceCounts
 }
 
 // compileReport describes what compile did with each service. accepted holds
@@ -775,21 +829,43 @@ func compileService(reg registration, binding serviceBinding, bindings upstreamB
 		return nil, errors.New("requires a rewrites list")
 	}
 	unit := &serviceUnit{
-		binding:          binding,
-		digest:           registrationDigest(reg, binding),
-		openAPIDigest:    sha256.Sum256([]byte(reg.openAPI)),
-		registrationOnly: binding.RegistrationOnly,
-		native:           make(map[operationKey]sourceOperation),
-		aliases:          make(map[operationKey]aliasTarget),
+		binding:       binding,
+		digest:        registrationDigest(reg, binding),
+		openAPIDigest: sha256.Sum256([]byte(reg.openAPI)),
+		native:        make(map[operationKey]sourceOperation),
+		aliases:       make(map[operationKey]aliasTarget),
 	}
-	if binding.RegistrationOnly {
-		if len(rules) != 0 {
-			return nil, errors.New("registration-only service cannot define rewrites")
-		}
-		return unit, nil
+	if !binding.routed() && len(rules) != 0 {
+		return nil, errors.New("a service with route: false cannot define rewrites")
 	}
 	if err := readOperations(reg.serviceName, source, binding, fallback, bindings, unit.native, &unit.denied); err != nil {
 		return nil, err
+	}
+	if !binding.routed() {
+		// A docs-only contract has no traffic effect: no routes and no denials.
+		// Its service keeps its serviceRoutes entry. Only the operations it
+		// documents are kept, so its component references are imported, and
+		// checked, only when it publishes.
+		unit.denied = nil
+		for key, op := range unit.native {
+			if op.visibility != visibilityPublic || !binding.published() {
+				delete(unit.native, key)
+				continue
+			}
+			op.unrouted = true
+			unit.native[key] = op
+		}
+		if binding.published() {
+			unit.warnings = omitRefusedOperations(unit.native, bindings.ServiceRoutes[binding.Prefix])
+		}
+	}
+	if !binding.published() {
+		for key, op := range unit.native {
+			if op.visibility == visibilityPublic {
+				op.visibility = visibilityUnlisted
+				unit.native[key] = op
+			}
+		}
 	}
 	for _, rule := range rules {
 		from := operationKey{rule.From.Method, rule.From.Path}
@@ -897,7 +973,11 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 	out, accepted, conflicts := selectUnits(preferred, lastGood, created, effectiveBindings)
 	report.accepted = accepted
 	for name := range count {
-		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name], warning: out.aliasWarnings[name]}
+		binding, ok := resolved[name]
+		if !ok {
+			binding = bindings.Services[name]
+		}
+		outcome := serviceOutcome{serving: servingNone, rejection: rejected[name]}
 		if message, failed := conflicts[name]; failed {
 			outcome.rejection = message
 		}
@@ -906,18 +986,24 @@ func compile(regs []registration, bindings upstreamBindings, lastGood map[string
 			if unit == current[name] {
 				outcome.serving = servingCurrent
 			}
+			binding = unit.binding
+			outcome.counts = out.counts[name]
+			outcome.warnings = slices.Concat(slices.Sorted(slices.Values(out.aliasWarnings[name])), unit.warnings)
 		}
+		outcome.route, outcome.publish = binding.routed(), binding.published()
 		report.services[name] = outcome
 	}
 	// Only bindings entries declare that a service must have a contract and
 	// own a direct service route, so only they are reported missing or unserved.
+	// A service with route: false keeps its traffic on serviceRoutes, so its
+	// contract is optional.
 	for _, name := range slices.Sorted(maps.Keys(bindings.Services)) {
 		binding := bindings.Services[name]
-		if binding.RegistrationOnly {
+		if !binding.routed() {
 			continue
 		}
 		if count[name] == 0 {
-			report.services[name] = serviceOutcome{serving: servingNone, missing: true}
+			report.services[name] = serviceOutcome{serving: servingNone, missing: true, route: true, publish: binding.published()}
 		}
 		if binding.Prefix != "" && accepted[name] == nil {
 			out.unserved = append(out.unserved, binding.Prefix)
@@ -960,7 +1046,10 @@ func compileStrict(regs []registration, bindings upstreamBindings) (candidate, e
 // is the one being admitted, unless the failure lies in another unit that was
 // itself admitted in this pass (for example a rewrite owner), which is
 // rejected instead. A service with a last-good unit therefore ends up current
-// or last-good, never omitted. Among new contracts the older one wins. A pod
+// or last-good, never omitted. The exception is a docs-only service (route:
+// false): assemble blames it for any conflict with a routed service, and it
+// is then rejected even with its last-good unit, so it can never cost a routed
+// service its place. Among new contracts the older one wins. A pod
 // that already serves last-good units may differ from a fresh pod when an old
 // and a changed contract conflict.
 func selectUnits(preferred, lastGood map[string]*serviceUnit, created map[string]time.Time, bindings upstreamBindings) (candidate, map[string]*serviceUnit, map[string]string) {
@@ -1016,15 +1105,23 @@ restart:
 					delete(accepted, name)
 				}
 				culprit := faultService(err)
-				if other, present := accepted[culprit]; culprit != "" && culprit != name && present && other != lastGood[culprit] {
+				other, present := accepted[culprit]
+				blameCulprit := culprit != "" && culprit != name && present
+				switch {
+				case blameCulprit && other != lastGood[culprit]:
 					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
 					rejected[culprit] = true
-				} else {
-					if culprit != "" && culprit != name {
-						conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
-					} else {
-						conflicts[name] = fmt.Sprintf("service %s: %v", name, err)
-					}
+				case blameCulprit && !other.binding.routed() && unit.binding.routed():
+					// A docs-only service never holds its place against a routed
+					// one, not even with its last good contract.
+					conflicts[culprit] = fmt.Sprintf("service %s: %v", culprit, err)
+					rejected[culprit] = true
+					delete(seed, culprit)
+				case culprit != "" && culprit != name:
+					conflicts[name] = fmt.Sprintf("service %s: conflicts with service %s: %v", name, culprit, err)
+					rejected[name] = true
+				default:
+					conflicts[name] = fmt.Sprintf("service %s: %v", name, err)
 					rejected[name] = true
 				}
 				continue restart
@@ -1063,10 +1160,18 @@ func faultService(err error) string {
 // operationIds and component imports.
 func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer string) (candidate, error) {
 	var out candidate
-	registrationOnlyDigests := make(map[string][sha256.Size]byte)
+	unroutedDigests := make(map[string][sha256.Size]byte)
 	native := make(map[operationKey]sourceOperation)
 	aliases := make(map[operationKey]aliasTarget)
+	// owners maps each rewrite to the service that defines it, and keyOwners
+	// each public key to the service whose prefix it is under.
 	owners := make(map[operationKey]string)
+	keyOwners := make(map[operationKey]string)
+	deniedBy := make(map[operationKey]string)
+	deny := func(key operationKey, owner string) {
+		out.denied = append(out.denied, key)
+		deniedBy[key] = owner
+	}
 	components := make(map[string]map[string]any)
 	out.contractServices = slices.Sorted(maps.Keys(units))
 	out.services = make(map[string]serviceBinding, len(units))
@@ -1074,33 +1179,43 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	for _, name := range out.contractServices {
 		unit := units[name]
 		out.services[name] = unit.binding
-		if !unit.registrationOnly && unit.binding.Prefix != "" {
+		if unit.binding.Prefix != "" {
 			if other, taken := prefixOwners[unit.binding.Prefix]; taken {
-				// Blame the service being admitted, else the later one.
+				// A docs-only service never displaces a routed one. Otherwise blame
+				// the service being admitted, else the later one.
 				blamed, holder := name, other
-				if prefer == other {
+				if routed := unit.binding.routed(); routed != units[other].binding.routed() {
+					if routed {
+						blamed, holder = other, name
+					}
+				} else if prefer == other {
 					blamed, holder = other, name
 				}
 				return out, &assemblyError{blamed, fmt.Errorf("prefix %s is already used by service %s", unit.binding.Prefix, holder)}
 			}
 			prefixOwners[unit.binding.Prefix] = name
 		}
-		if unit.registrationOnly {
-			registrationOnlyDigests[name] = unit.openAPIDigest
-			continue
+		if !unit.binding.routed() {
+			unroutedDigests[name] = unit.openAPIDigest
 		}
 		maps.Copy(native, unit.native)
+		for key := range unit.native {
+			keyOwners[key] = name
+		}
 		maps.Copy(aliases, unit.aliases)
 		for from := range unit.aliases {
 			owners[from] = name
+			keyOwners[from] = name
 		}
-		out.denied = append(out.denied, unit.denied...)
+		for _, key := range unit.denied {
+			deny(key, name)
+		}
 	}
 
 	published := make(map[operationKey]sourceOperation, len(native)+len(aliases))
 	for key, op := range native {
 		if op.visibility == visibilityInternal {
-			out.denied = append(out.denied, key)
+			deny(key, keyOwners[key])
 		} else {
 			published[key] = op
 		}
@@ -1113,30 +1228,33 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	})
 	for _, from := range aliasKeys {
 		alias := aliases[from]
+		owner := owners[from]
 		targetUnit, serving := units[alias.service]
 		if !serving {
 			// The target service has no serving contract. Deny the alias path so
 			// it cannot reach a direct service route.
 			delete(published, from)
-			out.denied = append(out.denied, from)
+			deny(from, owner)
 			continue
 		}
 		// A rewrite that cannot reach its served target is denied and reported
 		// on its owner. It never faults a service, so the outcome does not
 		// depend on arrival order or on what was served before.
-		deny := func(format string, args ...any) {
+		warn := func(format string, args ...any) {
 			delete(published, from)
-			out.denied = append(out.denied, from)
-			if _, reported := out.aliasWarnings[owners[from]]; !reported {
-				if out.aliasWarnings == nil {
-					out.aliasWarnings = make(map[string]string)
-				}
-				out.aliasWarnings[owners[from]] = fmt.Sprintf(format, args...)
+			deny(from, owner)
+			if out.aliasWarnings == nil {
+				out.aliasWarnings = make(map[string][]string)
 			}
+			out.aliasWarnings[owner] = append(out.aliasWarnings[owner], fmt.Sprintf(format, args...))
+		}
+		if !targetUnit.binding.routed() {
+			warn("rewrite %s %s targets service %s, which has route: false", from.method, from.path, alias.service)
+			continue
 		}
 		destination, mapped := targetUnit.binding.publicPath(alias.key.path)
 		if !mapped {
-			deny("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)
+			warn("rewrite %s %s targets %s outside service %s", from.method, from.path, alias.key.path, alias.service)
 			continue
 		}
 		to := operationKey{alias.key.method, destination}
@@ -1144,15 +1262,17 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		target, exists := native[to]
 		if original.visibility == visibilityInternal || target.visibility == visibilityInternal {
 			delete(published, from)
-			out.denied = append(out.denied, from)
+			deny(from, owner)
 			continue
 		}
 		_, targetRewritten := aliases[to]
 		if !exists || targetRewritten {
-			deny("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)
+			warn("rewrite %s %s has missing or rewritten target %s", from.method, from.path, to.path)
 			continue
 		}
-		if original.visibility == visibilityUnlisted {
+		// An unlisted source, or an owner that does not publish, keeps the
+		// rewrite out of the document. An unlisted target already does.
+		if original.visibility == visibilityUnlisted || !units[owner].binding.published() {
 			target.visibility = visibilityUnlisted
 		}
 		// A rewrite keeps the SDK identity of the original public route.
@@ -1162,12 +1282,21 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	paths := make(map[string]map[string]any)
 	operationIDs := make(map[string]operationKey)
 	unlistedComponents := make(map[string]map[string]any)
+	out.counts = make(map[string]serviceCounts, len(units))
+	count := func(owner string, update func(*serviceCounts)) {
+		counts := out.counts[owner]
+		update(&counts)
+		out.counts[owner] = counts
+	}
 	for _, key := range slices.SortedFunc(maps.Keys(published), compareOperationKeys) {
 		source := published[key]
 		if key.path == bindings.OpenAPI.YAMLPath || key.path == bindings.OpenAPI.JSONPath {
 			return out, &assemblyError{source.service, fmt.Errorf("OpenAPI endpoint conflicts with route %s %s", key.method, key.path)}
 		}
-		out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.credentials})
+		if !source.unrouted {
+			out.routes = append(out.routes, compiledOperation{key, source.service, source.path, source.credentials})
+			count(keyOwners[key], func(c *serviceCounts) { c.routes++ })
+		}
 		operationComponents := components
 		if source.visibility == visibilityUnlisted {
 			operationComponents = unlistedComponents
@@ -1199,13 +1328,22 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		operation["security"] = security
 		if id := source.operationID; id != "" {
 			if other, exists := operationIDs[id]; exists {
-				// Both services are at fault, so name neither.
-				return out, &assemblyError{"", fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)}
+				// A docs-only service is at fault against a routed one. Otherwise
+				// both are, so name neither.
+				blamed := ""
+				if first := published[other]; first.unrouted != source.unrouted {
+					blamed = source.service
+					if first.unrouted {
+						blamed = first.service
+					}
+				}
+				return out, &assemblyError{blamed, fmt.Errorf("duplicate operationId %q on %s %s and %s %s", id, other.method, other.path, key.method, key.path)}
 			}
 			operationIDs[id] = key
 			operation["operationId"] = id
 		}
 		paths[key.path][strings.ToLower(key.method)] = operation
+		count(keyOwners[key], func(c *serviceCounts) { c.documented++ })
 	}
 
 	document := map[string]any{
@@ -1236,8 +1374,8 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 		binding := units[name].binding
 		fmt.Fprintf(hash, "upstream %s %s %s %s %s\n", name, binding.Origin, binding.Prefix, binding.Mount, binding.DebugOrigin)
 	}
-	for _, name := range slices.Sorted(maps.Keys(registrationOnlyDigests)) {
-		fmt.Fprintf(hash, "registered %s %x\n", name, registrationOnlyDigests[name])
+	for _, name := range slices.Sorted(maps.Keys(unroutedDigests)) {
+		fmt.Fprintf(hash, "unrouted %s %x\n", name, unroutedDigests[name])
 	}
 	for _, route := range out.routes {
 		fmt.Fprintf(hash, "%s %s => %s %s %v\n", route.key.method, route.key.path, route.service, route.path, route.credentials)
@@ -1246,6 +1384,7 @@ func assemble(units map[string]*serviceUnit, bindings upstreamBindings, prefer s
 	out.denied = slices.Compact(out.denied)
 	for _, key := range out.denied {
 		fmt.Fprintf(hash, "internal %s %s\n", key.method, key.path)
+		count(deniedBy[key], func(c *serviceCounts) { c.denied++ })
 	}
 	out.revision = hex.EncodeToString(hash.Sum(nil))
 	return out, nil

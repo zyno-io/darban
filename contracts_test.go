@@ -530,7 +530,7 @@ func TestTagOptions(t *testing.T) {
 	}
 }
 
-func TestRegistrationOnlyContractDoesNotChangePublishedRoutes(t *testing.T) {
+func TestUnroutedContractDoesNotChangeRoutesOrDocument(t *testing.T) {
 	bindings, err := loadBindings("testdata/bindings.json", true)
 	if err != nil {
 		t.Fatal(err)
@@ -540,9 +540,10 @@ func TestRegistrationOnlyContractDoesNotChangePublishedRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindings.Services["archive"] = serviceBinding{
-		Origin:           "http://localhost:9000",
-		Prefix:           "/archive",
-		RegistrationOnly: true,
+		Origin:  "http://localhost:9000",
+		Prefix:  "/archive",
+		Route:   new(false),
+		Publish: new(false),
 	}
 	before, err := compileStrict(registrations, bindings)
 	if err != nil {
@@ -555,9 +556,12 @@ paths:
   /private/{id}:
     get:
       x-darban-visibility: internal
-  /items:
+  /items/{id}:
     get:
       x-darban-visibility: public
+      security: []
+      x-darban-policy: anonymous
+      responses: {'200': {description: OK}}
 `,
 		rewrites: "[]",
 	}
@@ -568,21 +572,27 @@ paths:
 	if !reflect.DeepEqual(before.routes, after.routes) ||
 		!reflect.DeepEqual(before.denied, after.denied) ||
 		string(before.specYAML) != string(after.specYAML) {
-		t.Fatal("registration changed routing or the combined spec")
+		t.Fatal("an unrouted contract changed routing or the combined spec")
 	}
 	if !slices.Contains(after.contractServices, "archive") || before.revision == after.revision {
-		t.Fatal("the active snapshot does not account for the new registration")
+		t.Fatal("the active snapshot does not account for the unrouted contract")
 	}
 	if _, err := compileStrict([]registration{catalog}, bindings); err == nil {
 		t.Fatal("missing contract for an active route binding was accepted")
 	}
 	catalog.rewrites = "[{}]"
 	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
-		t.Fatal("registration-only rewrite was accepted")
+		t.Fatal("unrouted rewrite was accepted")
 	}
 	catalog.rewrites = "[]"
+	valid := catalog.openAPI
 	catalog.openAPI = "openapi: 3.0.0"
 	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
-		t.Fatal("invalid registration-only OpenAPI was accepted")
+		t.Fatal("invalid unrouted OpenAPI was accepted")
+	}
+	// The operations are validated in full, as they would be if routed.
+	catalog.openAPI = strings.Replace(valid, "      x-darban-policy: anonymous\n", "", 1)
+	if _, err := compileStrict(append(registrations, catalog), bindings); err == nil {
+		t.Fatal("an unrouted operation without a credential policy was accepted")
 	}
 }

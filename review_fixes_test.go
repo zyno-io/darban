@@ -186,7 +186,7 @@ func TestCAModeRejectsCertificateForAnotherNameOnIPTarget(t *testing.T) {
 // and that t is served.
 func assertAliasDenied(t *testing.T, label string, got candidate, report compileReport, wantT string) {
 	t.Helper()
-	if report.services["x"].serving != servingCurrent || report.services["x"].rejection != "" || report.services["x"].warning == "" {
+	if report.services["x"].serving != servingCurrent || report.services["x"].rejection != "" || len(report.services["x"].warnings) == 0 {
 		t.Errorf("%s: x = %+v", label, report.services["x"])
 	}
 	if report.services["t"].serving != servingCurrent || report.services["t"].rejection != "" {
@@ -223,7 +223,7 @@ func TestRewriteThatCannotMapNeverBlamesTargetOrOwner(t *testing.T) {
 	bindings = isolationBindings("t", "x")
 	plain := contractFor("t", "/items", "listT")
 	_, r1 := compile([]registration{plain, owner}, bindings, nil)
-	if len(r1.accepted) != 2 || r1.services["x"].warning != "" {
+	if len(r1.accepted) != 2 || len(r1.services["x"].warnings) != 0 {
 		t.Fatalf("setup: %+v", r1.services)
 	}
 	moved := clusterContract("t", "/api/items", "listT", "http://t."+testNamespace+".svc.cluster.local/api", "/t")
@@ -260,14 +260,11 @@ func TestRewriteApprovalDoesNotDependOnHowTargetFails(t *testing.T) {
 }
 
 func TestBindingsEntryWithoutPrefixReservesItsDefaultPrefix(t *testing.T) {
-	for _, registrationOnly := range []bool{false, true} {
+	for _, route := range []bool{true, false} {
 		bindings := contractOnlyBindings()
-		bindings.Services["foo"] = serviceBinding{Origin: "http://foo.zyno-alpha.svc.cluster.local:80", RegistrationOnly: registrationOnly}
+		bindings.Services["foo"] = serviceBinding{Origin: "http://foo.zyno-alpha.svc.cluster.local:80", Route: &route, Publish: &route}
 		evil := clusterContract("evil", "/items", "listEvil", "http://evil", "/foo")
 		foo := contractFor("foo", "/items", "listFoo")
-		if registrationOnly {
-			foo.rewrites = "[]"
-		}
 		for name, regs := range map[string][]registration{
 			"evil only":  {evil},
 			"evil first": {evil, foo},
@@ -275,10 +272,10 @@ func TestBindingsEntryWithoutPrefixReservesItsDefaultPrefix(t *testing.T) {
 		} {
 			_, report := compile(regs, bindings, nil)
 			if outcome := report.services["evil"]; outcome.serving != servingNone || !strings.Contains(outcome.rejection, "reserved") {
-				t.Errorf("registrationOnly=%v %s: evil = %+v", registrationOnly, name, outcome)
+				t.Errorf("route=%v %s: evil = %+v", route, name, outcome)
 			}
 			if _, has := report.services["foo"]; has && report.services["foo"].rejection != "" {
-				t.Errorf("registrationOnly=%v %s: foo = %+v", registrationOnly, name, report.services["foo"])
+				t.Errorf("route=%v %s: foo = %+v", route, name, report.services["foo"])
 			}
 		}
 	}

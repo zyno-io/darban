@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
@@ -381,4 +382,58 @@ func matchesPathTemplate(template, path string) bool {
 		}
 	}
 	return true
+}
+
+// omitRefusedOperations removes the documented operations of a docs-only
+// service that its direct route would refuse, so the document does not promise
+// them, and returns a warning for each. A template is judged against every
+// path it stands for: a denied pattern refuses it when it may match one of
+// them, and an allowed or public pattern admits it only when it covers all.
+func omitRefusedOperations(native map[operationKey]sourceOperation, route serviceRoute) []string {
+	var warnings []string
+	for _, key := range slices.SortedFunc(maps.Keys(native), compareOperationKeys) {
+		op := native[key]
+		if op.visibility != visibilityPublic {
+			continue
+		}
+		var reason string
+		switch {
+		case templateMatches(route.DeniedPaths, op.path, false):
+			reason = "the direct route's deniedPaths refuse its path"
+		case len(route.AllowedPaths) > 0 && !templateMatches(route.AllowedPaths, op.path, true):
+			reason = "the direct route's allowedPaths do not cover its path"
+		case len(op.requirements) == 0 && !route.BackendAuth && !templateMatches(route.PublicPaths, op.path, true):
+			reason = "it is anonymous, but the direct route's publicPaths do not cover its path"
+		default:
+			continue
+		}
+		delete(native, key)
+		warnings = append(warnings, fmt.Sprintf("%s %s omitted from the document: %s", key.method, key.path, reason))
+	}
+	return warnings
+}
+
+// templateMatches reports whether one of the service path patterns matches
+// every path the template stands for (all), or at least one of them.
+func templateMatches(patterns []string, template string, all bool) bool {
+	have := strings.Split(template[1:], "/")
+	for _, pattern := range patterns {
+		prefix, subtree := strings.CutSuffix(pattern, "/*")
+		want := strings.Split(prefix[1:], "/")
+		if len(have) < len(want) || !subtree && len(have) != len(want) {
+			continue
+		}
+		matched := true
+		for i, segment := range want {
+			parameter := strings.HasPrefix(have[i], "{")
+			if parameter && all || !parameter && have[i] != segment {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }

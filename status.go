@@ -25,7 +25,10 @@ type contractRejection struct {
 // contractStatus reports one service's contract. Serving is current,
 // last-good, or none. State is the explicit outcome: serving, serving_last_good,
 // not_installed or direct_route_closed, with the Reason. Rejected is true while the service's latest contract is
-// being rejected; LastRejection stays after the contract is fixed.
+// being rejected; LastRejection stays after the contract is fixed. Route and
+// Publish are the service's binding settings. Routes, Documented and Denied
+// count the public operation keys under the service's prefix that the active
+// snapshot routes, documents and denies.
 type contractStatus struct {
 	Service       string             `json:"service"`
 	Serving       string             `json:"serving"`
@@ -33,7 +36,12 @@ type contractStatus struct {
 	Missing       bool               `json:"missing,omitempty"`
 	State         string             `json:"state"`
 	Reason        string             `json:"reason,omitempty"`
-	Warning       string             `json:"warning,omitempty"`
+	Route         bool               `json:"route"`
+	Publish       bool               `json:"publish"`
+	Routes        int                `json:"routes"`
+	Documented    int                `json:"documented"`
+	Denied        int                `json:"denied"`
+	Warnings      []string           `json:"warnings,omitempty"`
 	LastRejection *contractRejection `json:"lastRejection,omitempty"`
 }
 
@@ -48,7 +56,9 @@ func (s *contractStatusStore) update(report compileReport, now time.Time) {
 	next := make(map[string]contractStatus, len(report.services))
 	for name, outcome := range report.services {
 		entry := contractStatus{Service: name, Serving: outcome.serving, Rejected: outcome.rejection != "", Missing: outcome.missing,
-			State: outcome.state, Reason: outcome.reason, Warning: outcome.warning}
+			State: outcome.state, Reason: outcome.reason, Route: outcome.route, Publish: outcome.publish,
+			Routes: outcome.counts.routes, Documented: outcome.counts.documented, Denied: outcome.counts.denied,
+			Warnings: outcome.warnings}
 		previous := s.services[name]
 		entry.LastRejection = previous.LastRejection
 		if entry.Rejected && !(previous.Rejected && previous.LastRejection != nil && previous.LastRejection.Message == outcome.rejection) {
