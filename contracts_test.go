@@ -531,7 +531,7 @@ func TestTagOptions(t *testing.T) {
 			if test.tags != nil {
 				operation["tags"] = test.tags
 			}
-			if err := applyTagOptions(operation, "night-sky", test.settings); err != nil {
+			if _, err := applyTagOptions(operation, "night-sky", test.settings); err != nil {
 				t.Fatal(err)
 			}
 			if actual := operation["tags"]; !reflect.DeepEqual(actual, test.want) {
