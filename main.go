@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -173,6 +172,9 @@ type snapshot struct {
 	revision    string
 	specYAML    []byte
 	specJSON    []byte
+	// specs holds the documents as served, compressed on first use.
+	specsOnce [2]sync.Once
+	specs     [2]specDocument
 	// gateway serves the snapshot with the bindings it was built from.
 	gateway *gateway
 }
@@ -308,21 +310,7 @@ func (g *gateway) serve(active *snapshot, w http.ResponseWriter, r *http.Request
 		}
 	}
 	if legacyPrefix == "" && path != "" && (path == g.bindings.OpenAPI.YAMLPath || path == g.bindings.OpenAPI.JSONPath) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			writeStatus(w, http.StatusMethodNotAllowed)
-			return
-		}
-		body, mediaType := active.specYAML, "application/yaml"
-		if path == g.bindings.OpenAPI.JSONPath {
-			body, mediaType = active.specJSON, "application/json"
-		}
-		w.Header().Set("Content-Type", mediaType)
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-		if r.Method == http.MethodGet {
-			w.Write(body)
-		}
+		g.serveSpec(active, w, r, path == g.bindings.OpenAPI.JSONPath)
 		return
 	}
 	method := r.Method

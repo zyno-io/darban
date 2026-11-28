@@ -261,7 +261,8 @@ components:
 		t.Fatal(err)
 	}
 	security := document.Paths["/zoo/items"]["get"].Security
-	if len(security) != 2 || len(security[0]) != 3 || len(security[1]) != 1 || security[1]["zoo.d"] == nil {
+	// One service defines each scheme once, so the names are unprefixed.
+	if len(security) != 2 || len(security[0]) != 3 || len(security[1]) != 1 || security[1]["d"] == nil {
 		t.Fatalf("security %v", security)
 	}
 }

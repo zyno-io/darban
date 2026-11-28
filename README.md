@@ -118,6 +118,7 @@ Every field is optional.
 | `mount` | path of `spec.upstream` | The upstream path that `prefix` stands for. |
 | `enabled` | `true` | `false` serves nothing, with `503`, and keeps the prefix. |
 | `publish` | `true` | `false` keeps the service out of the combined OpenAPI. |
+| `title` | the title-cased name | The service's tag group name in the combined OpenAPI. |
 | `operations` | every operation | Serve only the listed contract operations (see [Operation paths](#operation-paths)). |
 | `extraRoutes` | none | Paths the contract cannot declare (see [Extra routes](#extra-routes)). |
 | `debugOrigin` | none | An alternate backend (see [Debug routing](#authorization-and-debug-routing)). |
@@ -332,6 +333,31 @@ first tag and leave the rest as written. Set `openapi.populateEmptyTags` to
 `true` to add the service name as the tag when an operation has none. This
 setting defaults to `false`.
 
+Documentation renderers such as Scalar and Redoc get readable groups without
+any change to the tag names, which SDK generators use:
+
+- The document's top-level `tags` lists every published tag. Its
+  `x-displayName` is the contract's own tag name split into words at dots,
+  dashes, underscores and case changes, each capitalized: the contract tag
+  `billingCatalog` of `sales`, published as `salesBillingCatalog`, shows as
+  "Billing Catalog", and `crm.authPolicies` as "Crm Auth Policies". When two
+  tags of one group would read the same, as `admin` and `shopAdmin` can with
+  `prefixTags: firstOnly`, the later one shows its published name. A
+  `description` the contract gives the tag in its own `tags` list is kept.
+- `x-tagGroups` groups the tags by service, in service-name order. A group is
+  named by the service's `title` binding, by default its name title-cased, so
+  `book-catalog` is "Book Catalog". A name two services would share gets the
+  service name in parentheses on the second. A tag that two services
+  publish, which `prefixTags: firstOnly` allows, is listed once and appears in
+  both groups. A contract's `tags` list of an unexpected shape is ignored.
+
+Security schemes are imported per service, as `<service>.<name>`. When every
+service that uses a scheme defines it identically, the document publishes it
+once under its own name, such as `accountBearer`, and every operation's
+`security` names that. A scheme whose definitions differ between services
+keeps its prefixed names, as does one whose name equals another service's
+prefixed one.
+
 ## Operation paths
 
 An operation path below the mount is a sequence of segments. Each is a
@@ -435,6 +461,25 @@ Omit `openapi` to disable publication or configure either path independently.
 Configure `omitOperationExtensionPrefixes` to remove selected source vendor
 extensions from published operations.
 
+The documents are public and meant to be loaded by documentation sites on
+other origins:
+
+- **CORS.** Every response carries `Access-Control-Allow-Origin: *` and never
+  `Access-Control-Allow-Credentials`. An `OPTIONS` preflight is answered with
+  `204`, `GET, HEAD` as the allowed methods, the requested headers allowed,
+  and a one-day `Access-Control-Max-Age`. Any other method gets `405`.
+- **Compression.** A client whose `Accept-Encoding` allows gzip gets the gzip
+  form, with `Vary: Accept-Encoding`. Each document is compressed once per
+  snapshot, on its first request.
+- **Caching.** Each form has a strong `ETag` derived from its content. A
+  request whose `If-None-Match` names it gets `304`. `Cache-Control` is
+  `openapi.cacheControl`, by default `public, max-age=60`.
+
+`openapi.info` sets the document's `info`: `title` and `version` (by default
+`Darban` and `1`), `summary`, `description`, `termsOfService`, `contact` (`name`, `url`,
+`email`) and `license` (`name`, and an `identifier` or a `url`). URLs must be
+`http` or `https`, and `email` a bare address.
+
 The YAML document is written from the JSON one, with the same content.
 Characters YAML cannot hold as they are, such as DEL, C1 controls and U+FFFE,
 are escaped, and U+0085 is written as `\N`. Keys of any length are allowed;
@@ -445,7 +490,13 @@ a long or multi-line one is a YAML complex key (`? key`).
   "defaultVisibility": "public",
   "openapi": {
     "yamlPath": "/openapi.yaml",
-    "jsonPath": "/openapi.json"
+    "jsonPath": "/openapi.json",
+    "cacheControl": "public, max-age=60",
+    "info": {
+      "title": "Zyno API",
+      "version": "1",
+      "contact": {"name": "Zyno", "email": "api@example.net"}
+    }
   }
 }
 ```

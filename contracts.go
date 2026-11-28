@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/mail"
+	"net/url"
 	"os"
 	pathpkg "path"
 	"regexp"
@@ -73,6 +75,9 @@ type serviceBinding struct {
 	// Publish defaults to true. False keeps the service's operations out of
 	// the combined OpenAPI.
 	Publish *bool `json:",omitempty"`
+	// Title names the service's tag group in the document; it defaults to
+	// the title-cased service name.
+	Title string `json:",omitempty"`
 	// UpstreamHost replaces the Host header sent upstream. LegacyHosts are
 	// hostnames the service used to serve, which reach it without the prefix.
 	UpstreamHost string   `json:",omitempty"`
@@ -132,6 +137,9 @@ func (b serviceBinding) validate(name string, bindings upstreamBindings, local, 
 	}
 	if !b.BackendAuth && bindings.Authz == "" && b.protectedRoutes() {
 		return fmt.Errorf("service %q authorizes at the gateway, which needs authz (or set backendAuth)", name)
+	}
+	if b.Title != "" && (strings.TrimSpace(b.Title) != b.Title || strings.IndexFunc(b.Title, unicode.IsControl) >= 0) {
+		return fmt.Errorf("service %q: invalid title %q", name, b.Title)
 	}
 	if b.UpstreamHost != "" && !dnsName.MatchString(b.UpstreamHost) {
 		return fmt.Errorf("service %q: invalid upstreamHost %q", name, b.UpstreamHost)
@@ -268,6 +276,104 @@ type openAPIConfig struct {
 	PrefixTags                     string
 	PopulateEmptyTags              bool
 	OmitOperationExtensionPrefixes []string
+	// Info is the composed document's info object.
+	Info *openAPIInfo `json:",omitempty"`
+	// CacheControl is sent with the documents; it defaults to
+	// defaultSpecCacheControl.
+	CacheControl string `json:",omitempty"`
+}
+
+const defaultSpecCacheControl = "public, max-age=60"
+
+// openAPIInfo is the OpenAPI info object of the composed document.
+type openAPIInfo struct {
+	Title          string          `json:"title,omitempty"`
+	Summary        string          `json:"summary,omitempty"`
+	Version        string          `json:"version,omitempty"`
+	Description    string          `json:"description,omitempty"`
+	TermsOfService string          `json:"termsOfService,omitempty"`
+	Contact        *openAPIContact `json:"contact,omitempty"`
+	License        *openAPILicense `json:"license,omitempty"`
+}
+
+type openAPIContact struct {
+	Name  string `json:"name,omitempty"`
+	URL   string `json:"url,omitempty"`
+	Email string `json:"email,omitempty"`
+}
+
+type openAPILicense struct {
+	Name       string `json:"name"`
+	Identifier string `json:"identifier,omitempty"`
+	URL        string `json:"url,omitempty"`
+}
+
+// info returns the document's info object, with today's title and version
+// by default.
+func (c openAPIConfig) info() openAPIInfo {
+	info := openAPIInfo{Title: "Darban", Version: "1"}
+	if c.Info != nil {
+		info = *c.Info
+		if info.Title == "" {
+			info.Title = "Darban"
+		}
+		if info.Version == "" {
+			info.Version = "1"
+		}
+	}
+	return info
+}
+
+func (c openAPIConfig) cacheControl() string {
+	if c.CacheControl == "" {
+		return defaultSpecCacheControl
+	}
+	return c.CacheControl
+}
+
+func (c openAPIConfig) validate() error {
+	if c.CacheControl != "" && (strings.TrimSpace(c.CacheControl) == "" || !httpguts.ValidHeaderFieldValue(c.CacheControl)) {
+		return fmt.Errorf("invalid openapi.cacheControl %q", c.CacheControl)
+	}
+	if c.Info == nil {
+		return nil
+	}
+	if license := c.Info.License; license != nil {
+		if license.Name == "" {
+			return errors.New("openapi.info.license needs a name")
+		}
+		if license.Identifier != "" && license.URL != "" {
+			return errors.New("openapi.info.license takes an identifier or a url, not both")
+		}
+	}
+	for field, value := range map[string]string{"termsOfService": c.Info.TermsOfService, "contact.url": c.Info.Contact.url(), "license.url": c.Info.License.url()} {
+		if value == "" {
+			continue
+		}
+		if parsed, err := url.Parse(value); err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" {
+			return fmt.Errorf("openapi.info.%s must be an http or https URL", field)
+		}
+	}
+	if contact := c.Info.Contact; contact != nil && contact.Email != "" {
+		if address, err := mail.ParseAddress(contact.Email); err != nil || address.Address != contact.Email {
+			return fmt.Errorf("openapi.info.contact.email %q is not an email address", contact.Email)
+		}
+	}
+	return nil
+}
+
+func (c *openAPIContact) url() string {
+	if c == nil {
+		return ""
+	}
+	return c.URL
+}
+
+func (l *openAPILicense) url() string {
+	if l == nil {
+		return ""
+	}
+	return l.URL
 }
 
 type operationVisibility string
@@ -309,17 +415,23 @@ func readOperationID(op map[string]any) (string, error) {
 	return upstream, nil
 }
 
-func applyTagOptions(operation map[string]any, service string, settings openAPIConfig) error {
+// publishedTag is a tag as published, with the contract's own name for it.
+type publishedTag struct {
+	name, original string
+}
+
+func applyTagOptions(operation map[string]any, service string, settings openAPIConfig) ([]publishedTag, error) {
 	value := operation["tags"]
 	tags, ok := value.([]any)
 	if value != nil && !ok {
-		return errors.New("tags must be an array of strings")
+		return nil, errors.New("tags must be an array of strings")
 	}
 	if len(tags) == 0 {
 		if settings.PopulateEmptyTags {
 			operation["tags"] = []string{service}
+			return []publishedTag{{service, service}}, nil
 		}
-		return nil
+		return nil, nil
 	}
 
 	parts := strings.Split(service, "-")
@@ -329,16 +441,18 @@ func applyTagOptions(operation map[string]any, service string, settings openAPIC
 		prefix.WriteString(uppercaseFirst(part))
 	}
 	servicePrefix := prefix.String()
+	published := make([]publishedTag, 0, len(tags))
 	for i, tag := range tags {
 		name, ok := tag.(string)
 		if !ok || strings.TrimSpace(name) == "" {
-			return errors.New("each tag must be a non-empty string")
+			return nil, errors.New("each tag must be a non-empty string")
 		}
 		if i == 0 || settings.PrefixTags != firstTagOnly {
 			tags[i] = servicePrefix + uppercaseFirst(name)
 		}
+		published = append(published, publishedTag{tags[i].(string), name})
 	}
-	return nil
+	return published, nil
 }
 
 func uppercaseFirst(value string) string {
@@ -353,6 +467,25 @@ type sourceDoc struct {
 	Paths      map[string]map[string]any `json:"paths"`
 	Components map[string]map[string]any `json:"components"`
 	Security   securityRequirements      `json:"security"`
+	// Tags are read for their descriptions only, so any shape is accepted.
+	Tags json.RawMessage `json:"tags"`
+}
+
+// tagDescription returns the description the contract gives a tag in its
+// tags list, if the list has the usual shape.
+func (s sourceDoc) tagDescription(name string) string {
+	var tags []any
+	if json.Unmarshal(s.Tags, &tags) != nil {
+		return ""
+	}
+	for _, value := range tags {
+		if tag, ok := value.(map[string]any); ok && tag["name"] == name {
+			if description, ok := tag["description"].(string); ok {
+				return description
+			}
+		}
+	}
+	return ""
 }
 
 type sourceOperation struct {
@@ -494,6 +627,9 @@ func parseBindings(raw []byte, path string, local, readCA bool) (upstreamBinding
 	case "", "all", firstTagOnly:
 	default:
 		return bindings, errors.New("openapi.prefixTags must be firstOnly or all")
+	}
+	if err := bindings.OpenAPI.validate(); err != nil {
+		return bindings, err
 	}
 	if bindings.DefaultVisibility != nil && !bindings.DefaultVisibility.valid() {
 		return bindings, errors.New("defaultVisibility must be public, unlisted, or internal")
@@ -1605,6 +1741,7 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 		published[from] = target
 	}
 	paths := make(map[string]map[string]any)
+	tags := make(documentTags)
 	operationIDs := make(map[string]operationKey)
 	unlistedComponents := make(map[string]map[string]any)
 	documentedSources := make(map[string]*sourceDoc)
@@ -1640,8 +1777,12 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 			paths[key.path] = make(map[string]any)
 		}
 		operation := normalized.(map[string]any)
-		if err := applyTagOptions(operation, source.service, bindings.OpenAPI); err != nil {
+		operationTags, err := applyTagOptions(operation, source.service, bindings.OpenAPI)
+		if err != nil {
 			return out, &assemblyError{source.service, fmt.Errorf("%s %s: %w", key.method, key.path, err)}
+		}
+		for _, tag := range operationTags {
+			tags.add(source.service, tag, source.source.tagDescription(tag.original))
 		}
 		security := make(securityRequirements, 0, len(source.requirements))
 		// Each requirement keeps all its schemes, which must all be met, in a
@@ -1680,12 +1821,16 @@ func assembleUnits(units map[string]*serviceUnit, bindings upstreamBindings, pre
 	if !render {
 		return out, nil
 	}
+	mergeSecuritySchemes(components, paths)
 	document := map[string]any{
 		"openapi":    "3.1.0",
-		"info":       map[string]string{"title": "Darban", "version": "1"},
+		"info":       bindings.OpenAPI.info(),
 		"servers":    []map[string]string{{"url": "https://" + bindings.Hostname}},
 		"paths":      paths,
 		"components": components,
+	}
+	if len(tags) > 0 {
+		document["tags"], document["x-tagGroups"] = tags.render(func(service string) string { return units[service].binding.Title })
 	}
 	rawJSON, err := json.Marshal(document)
 	if err != nil {
