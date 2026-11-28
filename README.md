@@ -489,7 +489,7 @@ spec:
 - Scheme is `http` or `https`. The host must be a Service in the contract's own
   namespace: `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc` or
   `<svc>.<ns>.svc.cluster.local`, with `<ns>` equal to that namespace and `<svc>`
-  a DNS-1035 label. Darban normalises to the full form. The port defaults to
+  a DNS-1035 label. Darban normalizes to the full form. The port defaults to
   80 for `http` and 443 for `https`, and is stored explicitly.
 - A path is the upstream mount. It must be literal, and must not end with
   `/`. Query, fragment and userinfo are rejected.
