@@ -173,7 +173,7 @@ type snapshot struct {
 	specYAML    []byte
 	specJSON    []byte
 	// specs holds the documents as served, compressed on first use.
-	specsOnce sync.Once
+	specsOnce [2]sync.Once
 	specs     [2]specDocument
 	// gateway serves the snapshot with the bindings it was built from.
 	gateway *gateway

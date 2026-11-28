@@ -22,24 +22,20 @@ func newSpecDocument(body []byte, mediaType string) specDocument {
 	sum := sha256.Sum256(body)
 	tag := hex.EncodeToString(sum[:16])
 	var compressed bytes.Buffer
-	writer, _ := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
+	writer, _ := gzip.NewWriterLevel(&compressed, gzip.DefaultCompression)
 	writer.Write(body)
 	writer.Close()
 	return specDocument{body: body, gzipped: compressed.Bytes(), etag: `"` + tag + `"`, gzipETag: `"` + tag + `-gzip"`, mediaType: mediaType}
 }
 
-// spec returns the YAML or JSON document of the snapshot. Both are
-// compressed once per snapshot, on first use.
+// spec returns the YAML or JSON document of the snapshot, each compressed
+// once per snapshot, on its first request.
 func (s *snapshot) spec(json bool) specDocument {
-	s.specsOnce.Do(func() {
-		s.specs[0] = newSpecDocument(s.specYAML, "application/yaml")
-		if s.specJSON != nil {
-			s.specs[1] = newSpecDocument(s.specJSON, "application/json")
-		}
-	})
 	if json {
+		s.specsOnce[1].Do(func() { s.specs[1] = newSpecDocument(s.specJSON, "application/json") })
 		return s.specs[1]
 	}
+	s.specsOnce[0].Do(func() { s.specs[0] = newSpecDocument(s.specYAML, "application/yaml") })
 	return s.specs[0]
 }
 

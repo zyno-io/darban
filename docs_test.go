@@ -118,6 +118,52 @@ func TestDottedSchemeNamesMergeOnce(t *testing.T) {
 	}
 }
 
+func TestSchemeMergeNeverTakesAnotherServicesName(t *testing.T) {
+	// auth's scheme sales.bearer is published as auth.sales.bearer; sales's
+	// bearer as sales.bearer. Merging auth's under its own name would take
+	// sales's, so both keep their prefixes, on every run.
+	auth := strings.Replace(docsContract("Auth", "JWT"), "accountBearer", "sales.bearer", -1)
+	sales := strings.Replace(docsContract("Sales", "JWT"), "accountBearer", "bearer", -1)
+	bindings := docsBindings("auth", "sales")
+	regs := []registration{{serviceName: "auth", rewrites: "[]", openAPI: auth}, {serviceName: "sales", rewrites: "[]", openAPI: sales}}
+	first, document := compose(t, bindings, regs...)
+	if got := mapKeys(document.Components.SecuritySchemes); !reflect.DeepEqual(got, []string{"auth.sales.bearer", "bearer", "keys", "tenantApiKey"}) {
+		t.Fatalf("schemes %v", got)
+	}
+	if security := document.Paths["/auth/items"]["get"].Security; security[0]["auth.sales.bearer"] == nil {
+		t.Errorf("auth security %v", security)
+	}
+	for range 30 {
+		if again, _ := compose(t, bindings, regs...); string(again.specJSON) != string(first.specJSON) {
+			t.Fatal("the document depends on map order")
+		}
+	}
+}
+
+func TestMalformedTagsListsAreIgnored(t *testing.T) {
+	for _, tags := range []string{"tags: [billing, crm]", "tags: {}", "tags: 3", "tags: [{description: x}]"} {
+		contract := strings.Replace(docsContract("Auth", "JWT"), "tags:\n  - {name: billingCatalog, description: Products and prices.}", tags, 1)
+		_, document := compose(t, docsBindings("auth"), registration{serviceName: "auth", rewrites: "[]", openAPI: contract})
+		if len(document.Tags) != 2 || document.Tags[0]["description"] != nil {
+			t.Errorf("%s: tags %v", tags, document.Tags)
+		}
+	}
+}
+
+func TestGroupNamesAreDistinct(t *testing.T) {
+	bindings := docsBindings("auth", "identity")
+	identity := bindings.Services["identity"]
+	identity.Title = "Auth"
+	bindings.Services["identity"] = identity
+	_, document := compose(t, bindings,
+		registration{serviceName: "auth", rewrites: "[]", openAPI: docsContract("Auth", "JWT")},
+		registration{serviceName: "identity", rewrites: "[]", openAPI: docsContract("Identity", "JWT")},
+	)
+	if len(document.TagGroups) != 2 || document.TagGroups[0]["name"] != "Auth" || document.TagGroups[1]["name"] != "Auth (identity)" {
+		t.Errorf("groups %v", document.TagGroups)
+	}
+}
+
 func TestDifferentSecuritySchemesKeepTheirPrefixes(t *testing.T) {
 	bindings := docsBindings("auth", "sales", "talk")
 	_, document := compose(t, bindings,
@@ -202,6 +248,7 @@ func TestDisplayNames(t *testing.T) {
 		"oidcDiscovery":          "Oidc Discovery",
 		"ÉtatCivil":              "État Civil",
 		"already Readable Words": "Already Readable Words",
+		"--":                     "--",
 	} {
 		if got := displayName(tag); got != want {
 			t.Errorf("%q: %q, want %q", tag, got, want)
@@ -229,14 +276,17 @@ func TestDocumentInfo(t *testing.T) {
 		t.Errorf("valid: %v", err)
 	}
 	for name, body := range map[string]string{
-		"license name":  `"info": {"license": {"url": "https://example.net/l"}}`,
-		"license both":  `"info": {"license": {"name": "MIT", "identifier": "MIT", "url": "https://example.net/l"}}`,
-		"terms":         `"info": {"termsOfService": "terms.html"}`,
-		"contact url":   `"info": {"contact": {"url": "example"}}`,
-		"unknown field": `"info": {"logo": "x"}`,
-		"cache control": `"cacheControl": "public\nmax-age=1"`,
-		"blank cache":   `"cacheControl": "  "`,
-		"openapi field": `"x": 1`,
+		"license name":   `"info": {"license": {"url": "https://example.net/l"}}`,
+		"license both":   `"info": {"license": {"name": "MIT", "identifier": "MIT", "url": "https://example.net/l"}}`,
+		"terms":          `"info": {"termsOfService": "terms.html"}`,
+		"contact url":    `"info": {"contact": {"url": "example"}}`,
+		"javascript url": `"info": {"termsOfService": "javascript:alert(1)"}`,
+		"no host":        `"info": {"license": {"name": "MIT", "url": "https:///x"}}`,
+		"email":          `"info": {"contact": {"email": "Zyno <api@zyno.dev>"}}`,
+		"unknown field":  `"info": {"logo": "x"}`,
+		"cache control":  `"cacheControl": "public\nmax-age=1"`,
+		"blank cache":    `"cacheControl": "  "`,
+		"openapi field":  `"x": 1`,
 	} {
 		if err := writeBindings(t, fmt.Sprintf(base, body)); err == nil {
 			t.Errorf("%s accepted", name)

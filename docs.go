@@ -34,7 +34,7 @@ func (t documentTags) add(service string, tag publishedTag, description string) 
 // prefixTags: firstOnly allows, is listed once and appears in each group.
 func (t documentTags) render(title func(service string) string) ([]map[string]any, []map[string]any) {
 	var tags, groups []map[string]any
-	listed := make(map[string]bool)
+	listed, named := make(map[string]bool), make(map[string]bool)
 	for _, service := range slices.Sorted(maps.Keys(t)) {
 		names := slices.Sorted(maps.Keys(t[service]))
 		for _, name := range names {
@@ -53,6 +53,12 @@ func (t documentTags) render(title func(service string) string) ([]map[string]an
 		if group == "" {
 			group = titleCase(service)
 		}
+		// Two services with one title, as a title and another service's
+		// default can be, still get distinct groups.
+		if named[group] {
+			group += " (" + service + ")"
+		}
+		named[group] = true
 		groups = append(groups, map[string]any{"name": group, "tags": names})
 	}
 	return tags, groups
@@ -88,6 +94,9 @@ func displayName(tag string) string {
 		word = append(word, r)
 	}
 	flush()
+	if len(words) == 0 {
+		return tag
+	}
 	for i, w := range words {
 		words[i] = uppercaseFirst(w)
 	}
@@ -121,6 +130,11 @@ func mergeSecuritySchemes(components map[string]map[string]any, paths map[string
 	renamed := make(map[string]string)
 	for _, original := range slices.Sorted(maps.Keys(byOriginal)) {
 		names := byOriginal[original]
+		// A dotted name can equal another service's prefixed one, such as
+		// sales.bearer for auth's scheme sales.bearer; keep both prefixed.
+		if _, taken := schemes[original]; taken {
+			continue
+		}
 		first, err := json.Marshal(schemes[names[0]])
 		if err != nil {
 			continue

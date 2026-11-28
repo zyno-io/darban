@@ -344,14 +344,17 @@ any change to the tag names, which SDK generators use:
   gives the tag in its own `tags` list is kept.
 - `x-tagGroups` groups the tags by service, in service-name order. A group is
   named by the service's `title` binding, by default its name title-cased, so
-  `book-catalog` is "Book Catalog". A tag that two services publish, which
-  `prefixTags: firstOnly` allows, is listed once and appears in both groups.
+  `book-catalog` is "Book Catalog". A name two services would share gets the
+  service name in parentheses on the second. A tag that two services
+  publish, which `prefixTags: firstOnly` allows, is listed once and appears in
+  both groups. A contract's `tags` list of an unexpected shape is ignored.
 
 Security schemes are imported per service, as `<service>.<name>`. When every
 service that uses a scheme defines it identically, the document publishes it
 once under its own name, such as `accountBearer`, and every operation's
 `security` names that. A scheme whose definitions differ between services
-keeps its prefixed names.
+keeps its prefixed names, as does one whose name equals another service's
+prefixed one.
 
 ## Operation paths
 
@@ -473,7 +476,7 @@ other origins:
 `openapi.info` sets the document's `info`: `title` and `version` (by default
 `Darban` and `1`), `description`, `termsOfService`, `contact` (`name`, `url`,
 `email`) and `license` (`name`, and an `identifier` or a `url`). URLs must be
-absolute.
+`http` or `https`, and `email` a bare address.
 
 The YAML document is written from the JSON one, with the same content.
 Characters YAML cannot hold as they are, such as DEL, C1 controls and U+FFFE,

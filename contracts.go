@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/mail"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -348,8 +349,13 @@ func (c openAPIConfig) validate() error {
 		if value == "" {
 			continue
 		}
-		if parsed, err := url.Parse(value); err != nil || !parsed.IsAbs() {
-			return fmt.Errorf("openapi.info.%s must be an absolute URL", field)
+		if parsed, err := url.Parse(value); err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" {
+			return fmt.Errorf("openapi.info.%s must be an http or https URL", field)
+		}
+	}
+	if contact := c.Info.Contact; contact != nil && contact.Email != "" {
+		if address, err := mail.ParseAddress(contact.Email); err != nil || address.Address != contact.Email {
+			return fmt.Errorf("openapi.info.contact.email %q is not an email address", contact.Email)
 		}
 	}
 	return nil
@@ -460,14 +466,19 @@ type sourceDoc struct {
 	Paths      map[string]map[string]any `json:"paths"`
 	Components map[string]map[string]any `json:"components"`
 	Security   securityRequirements      `json:"security"`
-	// Tags are read for their descriptions only.
-	Tags []map[string]any `json:"tags"`
+	// Tags are read for their descriptions only, so any shape is accepted.
+	Tags json.RawMessage `json:"tags"`
 }
 
-// tagDescription returns the description the contract gives a tag.
+// tagDescription returns the description the contract gives a tag in its
+// tags list, if the list has the usual shape.
 func (s sourceDoc) tagDescription(name string) string {
-	for _, tag := range s.Tags {
-		if tag["name"] == name {
+	var tags []any
+	if json.Unmarshal(s.Tags, &tags) != nil {
+		return ""
+	}
+	for _, value := range tags {
+		if tag, ok := value.(map[string]any); ok && tag["name"] == name {
 			if description, ok := tag["description"].(string); ok {
 				return description
 			}
