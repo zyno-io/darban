@@ -338,10 +338,12 @@ any change to the tag names, which SDK generators use:
 
 - The document's top-level `tags` lists every published tag. Its
   `x-displayName` is the contract's own tag name split into words at dots,
-  dashes, underscores and case changes, each capitalized, so
-  `salesBillingCatalog` in `sales` shows as "Sales Billing Catalog" and
-  `crm.authPolicies` as "Crm Auth Policies". A `description` the contract
-  gives the tag in its own `tags` list is kept.
+  dashes, underscores and case changes, each capitalized: the contract tag
+  `billingCatalog` of `sales`, published as `salesBillingCatalog`, shows as
+  "Billing Catalog", and `crm.authPolicies` as "Crm Auth Policies". When two
+  tags of one group would read the same, as `admin` and `shopAdmin` can with
+  `prefixTags: firstOnly`, the later one shows its published name. A
+  `description` the contract gives the tag in its own `tags` list is kept.
 - `x-tagGroups` groups the tags by service, in service-name order. A group is
   named by the service's `title` binding, by default its name title-cased, so
   `book-catalog` is "Book Catalog". A name two services would share gets the
@@ -474,7 +476,7 @@ other origins:
   `openapi.cacheControl`, by default `public, max-age=60`.
 
 `openapi.info` sets the document's `info`: `title` and `version` (by default
-`Darban` and `1`), `description`, `termsOfService`, `contact` (`name`, `url`,
+`Darban` and `1`), `summary`, `description`, `termsOfService`, `contact` (`name`, `url`,
 `email`) and `license` (`name`, and an `identifier` or a `url`). URLs must be
 `http` or `https`, and `email` a bare address.
 

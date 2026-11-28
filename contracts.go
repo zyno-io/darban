@@ -1,7 +1,6 @@
 package main
 
 import (
-	"net/mail"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	pathpkg "path"
@@ -288,6 +288,7 @@ const defaultSpecCacheControl = "public, max-age=60"
 // openAPIInfo is the OpenAPI info object of the composed document.
 type openAPIInfo struct {
 	Title          string          `json:"title,omitempty"`
+	Summary        string          `json:"summary,omitempty"`
 	Version        string          `json:"version,omitempty"`
 	Description    string          `json:"description,omitempty"`
 	TermsOfService string          `json:"termsOfService,omitempty"`

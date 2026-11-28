@@ -34,20 +34,30 @@ func (t documentTags) add(service string, tag publishedTag, description string) 
 // prefixTags: firstOnly allows, is listed once and appears in each group.
 func (t documentTags) render(title func(service string) string) ([]map[string]any, []map[string]any) {
 	var tags, groups []map[string]any
-	listed, named := make(map[string]bool), make(map[string]bool)
+	entries, named := make(map[string]map[string]any), make(map[string]bool)
 	for _, service := range slices.Sorted(maps.Keys(t)) {
 		names := slices.Sorted(maps.Keys(t[service]))
 		for _, name := range names {
-			if listed[name] {
+			if entries[name] != nil {
 				continue
 			}
-			listed[name] = true
 			tag := t[service][name]
 			entry := map[string]any{"name": name, "x-displayName": displayName(tag.original)}
 			if tag.description != "" {
 				entry["description"] = tag.description
 			}
+			entries[name] = entry
 			tags = append(tags, entry)
+		}
+		// Two tags of a group can read the same, as admin and shopAdmin do
+		// with prefixTags: firstOnly; the later one shows its published name.
+		shown := make(map[string]bool, len(names))
+		for _, name := range names {
+			entry := entries[name]
+			if shown[entry["x-displayName"].(string)] {
+				entry["x-displayName"] = name
+			}
+			shown[entry["x-displayName"].(string)] = true
 		}
 		group := title(service)
 		if group == "" {

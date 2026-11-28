@@ -150,6 +150,23 @@ func TestMalformedTagsListsAreIgnored(t *testing.T) {
 	}
 }
 
+func TestDisplayNamesAreDistinctWithinAGroup(t *testing.T) {
+	bindings := docsBindings("shop")
+	bindings.OpenAPI.PrefixTags = firstTagOnly
+	contract := strings.Replace(docsContract("Shop", "JWT"), "tags: [billingCatalog, crm.authPolicies]", "tags: [orders, admin]", 1)
+	contract = strings.Replace(contract, "      operationId: keysShop\n", "      operationId: keysShop\n      tags: [admin]\n", 1)
+	_, document := compose(t, bindings, registration{serviceName: "shop", rewrites: "[]", openAPI: contract})
+	shown := map[string]any{}
+	for _, tag := range document.Tags {
+		shown[tag["name"].(string)] = tag["x-displayName"]
+	}
+	// shopAdmin (from keys) and admin (unprefixed, from items) both read
+	// "Admin"; the later in name order shows its published name.
+	if !reflect.DeepEqual(shown, map[string]any{"admin": "Admin", "shopAdmin": "shopAdmin", "shopOrders": "Orders"}) {
+		t.Errorf("display names %v", shown)
+	}
+}
+
 func TestGroupNamesAreDistinct(t *testing.T) {
 	bindings := docsBindings("auth", "identity")
 	identity := bindings.Services["identity"]
@@ -263,10 +280,10 @@ func TestDocumentInfo(t *testing.T) {
 	if !reflect.DeepEqual(document.Info, map[string]any{"title": "Darban", "version": "1"}) {
 		t.Errorf("default info %v", document.Info)
 	}
-	bindings.OpenAPI.Info = &openAPIInfo{Title: "Zyno API", Description: "All of Zyno.", TermsOfService: "https://zyno.dev/terms",
+	bindings.OpenAPI.Info = &openAPIInfo{Title: "Zyno API", Summary: "One API.", Description: "All of Zyno.", TermsOfService: "https://zyno.dev/terms",
 		Contact: &openAPIContact{Name: "Zyno", Email: "api@zyno.dev"}, License: &openAPILicense{Name: "Proprietary"}}
 	_, document = compose(t, bindings, reg)
-	want := map[string]any{"title": "Zyno API", "version": "1", "description": "All of Zyno.", "termsOfService": "https://zyno.dev/terms",
+	want := map[string]any{"title": "Zyno API", "summary": "One API.", "version": "1", "description": "All of Zyno.", "termsOfService": "https://zyno.dev/terms",
 		"contact": map[string]any{"name": "Zyno", "email": "api@zyno.dev"}, "license": map[string]any{"name": "Proprietary"}}
 	if !reflect.DeepEqual(document.Info, want) {
 		t.Errorf("info %v", document.Info)
