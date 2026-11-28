@@ -20,7 +20,7 @@ var (
 )
 
 // parseContractUpstream validates a GatewayContract spec.upstream URL and
-// returns the normalised origin, with the port explicit, and the upstream mount
+// returns the normalized origin, with the port explicit, and the upstream mount
 // taken from the URL path. In Kubernetes mode the Service must live in the
 // contract's own namespace. In local manifest mode (local) loopback hosts are
 // allowed and any namespace is accepted.
